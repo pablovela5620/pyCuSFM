@@ -1886,10 +1886,14 @@ def main(config: Config) -> None:
     # rig pose must come from cuSFM's own vehicle-frame output rather than being
     # derived from the (now stale) input extrinsics.
     refined: dict[str, Float64[ndarray, "4 4"]] | None = None
+    cusfm_pose_times_ns: Int[ndarray, "n"] = sequence.timestamps_ns[sample_indices]
+    cusfm_pose_stream: Float64[ndarray, "n 4 4"] = aligned_world_T_rig
     vehicle = read_cusfm_vehicle_poses(sparse_dir)
     if vehicle is not None and config.run.optimize_extrinsics:
         vehicle_times, vehicle_poses = vehicle
         refined, extrinsic_spread = refined_extrinsics(sequence, model, vehicle_times, vehicle_poses)
+        cusfm_pose_times_ns = vehicle_times
+        cusfm_pose_stream = alignment @ vehicle_poses
         print("\n─── extrinsic refinement ───")
         for name, matrix in refined.items():
             original: Float64[ndarray, "4 4"] = next(
@@ -1905,12 +1909,12 @@ def main(config: Config) -> None:
         print(f"  per-frame spread: {1e3 * extrinsic_spread:.2f} mm (near 0 = rig stayed rigid)")
 
     cusfm_rig: Rig = build_rig(
-        sequence, CUSFM_RIG_INDEX, aligned_world_T_rig, extrinsics_override=refined
+        sequence, CUSFM_RIG_INDEX, cusfm_pose_stream, extrinsics_override=refined
     )
     log_rig(
         cusfm_rig,
         sequence,
-        sequence.timestamps_ns[sample_indices],
+        cusfm_pose_times_ns,
         label=f"cuSFM refined (disagreement vs input {1e3 * rmse:.1f} mm RMSE)",
         frustum_color=CUSFM_RIG_COLOR,
     )
