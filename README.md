@@ -106,10 +106,15 @@ Note that top-level options come *before* the `dataset:` subcommand. Useful flag
 --run.model-dir data/cusfm_models/raco   # batched RaCo-ALIKED instead of stock ALIKED
 ```
 
-**Requirements.** Ubuntu 24.04 with an NVIDIA GPU. The prebuilt binaries link Ubuntu 24.04
-system C++ libraries that conda-forge cannot reproduce, so this is host-specific — see the
-"Non-hermetic" section of [NOTES.md](NOTES.md). Built and validated on an RTX 5090
-(Blackwell, `sm_120`) with driver 580.173 using the **CUDA 13** binaries.
+**Requirements.** **x86-64 (`linux-64`) Ubuntu 24.04** with an NVIDIA GPU — both parts are
+hard requirements. The prebuilt binaries are x86-64 ELF executables linking Ubuntu 24.04
+system C++ libraries (glibc 2.38, `libglog.so.1`, OpenCV `.so.406`) that conda-forge cannot
+reproduce, so this is host-specific — see the "Non-hermetic" section of [NOTES.md](NOTES.md).
+On Ubuntu 22.04 the binaries fail at the dynamic loader; on ARM/aarch64 pixi stops with
+`unsupported-platform` and will suggest `pixi workspace platform add linux-aarch64` — do
+**not** follow that suggestion, since no platform entry can make x86-64 binaries runnable.
+Built and validated on an RTX 5090 (Blackwell, `sm_120`) with driver 580.173 using the
+**CUDA 13** binaries.
 
 
 ## Installation

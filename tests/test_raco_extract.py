@@ -29,8 +29,10 @@ REPO_ROOT: Path = Path(__file__).resolve().parent.parent
 DESCRIPTOR_SET: Path = REPO_ROOT / "data" / "cusfm_schema" / "cusfm_protos.fdset"
 REFERENCE_INPUT_METADATA: Path = Path("data/cusfm_runs/robocap_full/input/frames_meta.json")
 REFERENCE_OUTPUT_METADATA: Path = Path("data/cusfm_runs/robocap_full/cusfm/keyframes/frames_meta.json")
-BATCHED_MODEL: Path = Path("/tmp/cusfm-writer/raco-aliked-b1-16.onnx")
-"""Exported by `pixi run -e raco raco-export`; absent on a fresh clone."""
+BATCHED_MODEL: Path = REPO_ROOT / "data" / "cusfm_models" / "raco-aliked-b1-16.onnx"
+"""Exported by `pixi run -e raco raco-export --batched-extractor-path
+data/cusfm_models/raco-aliked-b1-16.onnx`; absent on a fresh clone, so the
+dependent test skips."""
 
 #: Tests needing an artifact a fresh clone does not have, rather than the
 #: vendored schema, skip instead of failing.

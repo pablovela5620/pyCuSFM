@@ -52,8 +52,10 @@ class ExtractConfig:
     """Prepared cuSFM input containing camera image folders and frames_meta.json."""
     output_dir: Path = Path("data/cusfm_runs/robocap_raco_b8/cusfm/keyframes")
     """New cuSFM keyframe directory to populate without running feature_extractor_main."""
-    onnx_path: Path = Path("/tmp/cusfm-writer/raco-aliked-b1-16.onnx")
-    """Batch-dynamic RaCo-ALIKED ONNX graph."""
+    onnx_path: Path = REPO_ROOT / "data" / "cusfm_models" / "raco-aliked-b1-16.onnx"
+    """Batch-dynamic RaCo-ALIKED ONNX graph. Not committed (data/cusfm_models is
+    gitignored); produce it with `pixi run -e raco raco-export
+    --batched-extractor-path data/cusfm_models/raco-aliked-b1-16.onnx`."""
     precision: Literal["fp16", "fp8_qdq_with_fp16_fallback"] = "fp16"
     """TensorRT precision policy; FP8 comes from Q/DQ nodes and permits FP16 fallback."""
     descriptor_set_path: Path = REPO_ROOT / "data" / "cusfm_schema" / "cusfm_protos.fdset"
@@ -64,10 +66,10 @@ class ExtractConfig:
     to a scratch path made both the extractor and its contract tests fail
     anywhere but the machine that first produced it. See
     ``data/cusfm_schema/README.md``."""
-    engine_dir: Path = Path("/tmp/cusfm-writer/engines")
-    """Content-addressed TensorRT engine cache."""
-    result_path: Path = Path("/tmp/cusfm-writer/extraction.json")
-    """Machine-readable extraction or benchmark results."""
+    engine_dir: Path = REPO_ROOT / "data" / "cusfm_models" / "engines"
+    """Content-addressed TensorRT engine cache (gitignored; engines are per-GPU)."""
+    result_path: Path = REPO_ROOT / "data" / "cusfm_models" / "extraction.json"
+    """Machine-readable extraction or benchmark results (gitignored)."""
     batch_size: int = 8
     """Extraction batch size."""
     minimum_batch_size: int = 1

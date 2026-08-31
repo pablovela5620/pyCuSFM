@@ -15,6 +15,9 @@ import tyro
 from cuda.bindings import runtime as cudart
 
 from tools.trt_runtime import check_cuda, percentile, sha256_file
+
+REPO_ROOT: Path = Path(__file__).resolve().parent.parent
+"""Repo root, so defaults resolve regardless of the working directory."""
 from jaxtyping import Float32, UInt8
 from numpy import ndarray
 from numpy.typing import NDArray
@@ -38,10 +41,10 @@ class BenchmarkConfig:
     """Optional ModelOpt FP8 Q/DQ extractor ONNX model."""
     input_dir: Path = Path("data/cusfm_runs/robocap_full/input")
     """Image tree used by the measured RoboCap baseline."""
-    engine_dir: Path = Path("/tmp/cusfm-raco/engines")
-    """Content-addressed TensorRT engine cache."""
-    output: Path = Path("/tmp/cusfm-raco/extractor-benchmark.json")
-    """Machine-readable benchmark result."""
+    engine_dir: Path = REPO_ROOT / "data" / "cusfm_models" / "engines"
+    """Content-addressed TensorRT engine cache (gitignored; shared with raco_extract)."""
+    output: Path = REPO_ROOT / "data" / "cusfm_models" / "extractor-benchmark.json"
+    """Machine-readable benchmark result (gitignored)."""
     image_count: int = 4
     """Number of real images cycled through the timed iterations."""
     warmup_iterations: int = 30

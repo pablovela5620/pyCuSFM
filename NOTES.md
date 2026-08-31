@@ -125,7 +125,7 @@ keeps 5101 (71 % rejected), leaving ~7 points per registered image over 124 m.
 | galileo | 4938 / 28 = **176** |
 | robocap | 5101 / 694 = **7.4** |
 
-A tempting explanation was match-pair *downsampling*: `configs/isaac/match_pair_select_config.pb.txt`
+A tempting explanation was match-pair *downsampling*: `pycusfm/configs/isaac/match_pair_select_config.pb.txt`
 sets `max_keyframes_per_collection: 6` per `collection_time_interval_seconds: 10` with
 `use_downsampling: true`, and the runner defaults `downsampling_matches=True` — sensible for a
 vehicle driving past never-repeated scenery, plausibly starving a wearer who circles one room.
@@ -206,7 +206,7 @@ neighbourhood of its initialisation and drifts; it is not diverging wildly.
 **Is this the stock algorithm?** Effectively yes. Every cuSFM *algorithm* setting the demo passes
 matches upstream's default: `config_set=isaac`, `feature_type=aliked`, `optimize_extrinsics=False`,
 and `ba_frame_type=vehicle_rig` — which merely restates what
-`configs/isaac/vision_mapping_config.pb.txt:50` already sets (`ba_frame_type: VEHICLE_RIG`). The
+`pycusfm/configs/isaac/vision_mapping_config.pb.txt:50` already sets (`ba_frame_type: VEHICLE_RIG`). The
 only functional deviations are `min_inter_frame_distance` 0.5 -> 0.0 (which barely binds, since
 samples already sit ~0.53 m apart) and `skip_cuvslam=True` (substituting basalt's initialisation
 for cuVSLAM's, measured above at 88 m of vertical error — so that choice helps, not hurts).
