@@ -116,6 +116,18 @@ On Ubuntu 22.04 the binaries fail at the dynamic loader; on ARM/aarch64 pixi sto
 Built and validated on an RTX 5090 (Blackwell, `sm_120`) with driver 580.173 using the
 **CUDA 13** binaries.
 
+The binaries also resolve glog and OpenCV from the *host*, not from pixi (they need
+`libglog.so.1` and OpenCV `.so.406`, and the conda-forge equivalents either changed SONAME
+or pin an ffmpeg that conflicts with this workspace):
+
+```bash
+sudo apt install libgoogle-glog0v6t64 libopencv-core406t64 libopencv-calib3d406t64 \
+    libopencv-features2d406t64 libopencv-imgcodecs406t64 libopencv-imgproc406t64 \
+    libopencv-flann406t64
+```
+
+`pixi run check-libs` verifies every binary dependency resolves before you run anything.
+
 
 ## Installation
 

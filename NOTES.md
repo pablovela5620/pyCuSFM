@@ -286,6 +286,24 @@ follows the same loop but visibly jagged and with one large excursion.
 **None.** `git diff main -- '*.py'` shows only the added `demo_rerun.py`.
 Change set: `pixi.toml`, `pixi.lock`, `.gitignore`, `demo_rerun.py`, `NOTES.md`, one README section.
 
+
+### Why pixi deps cannot make the binaries portable
+
+Tempting: pin `glog=0.6` (SONAME `libglog.so.1`) and `libopencv=4.6` (`.so.406`) so
+`LD_LIBRARY_PATH` serves them from the env. Measured outcome:
+
+- `libopencv 4.6` requires `ffmpeg >=4.4,<6`, which conflicts with this workspace's
+  `ffmpeg 8` (and PyAV's `add_stream_from_template` needs a modern av, which needs
+  modern ffmpeg). The solve fails outright.
+- Even with libs served, the executables themselves demand `GLIBC_2.38` and
+  `GLIBCXX_3.4.32` symbol versions (checked with `objdump -T`), so Ubuntu 22.04
+  (glibc 2.35) fails in the dynamic loader regardless — observed verbatim on a
+  22.04 fleet machine. Fixing that needs `patchelf --set-interpreter` onto copies
+  of the binaries plus a `sysroot_linux-64=2.39` runtime tree: possible, invasive,
+  out of scope.
+
+Hence the README's apt line for the host libs and the hard Ubuntu 24.04 requirement.
+
 ## Gotchas found
 
 1. **`tensorrt-cu13==10.13.3.9` is broken on PyPI** — it depends on the retired
