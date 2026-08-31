@@ -48,6 +48,7 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
+from decimal import Decimal, ROUND_HALF_UP
 from fractions import Fraction
 from io import BytesIO
 from pathlib import Path
@@ -1277,7 +1278,7 @@ def read_colmap_model(sparse_dir: Path) -> ColmapModel:
     )
 
 
-def read_cusfm_vehicle_poses(sparse_dir: Path) -> tuple[Float64[ndarray, "n"], Float64[ndarray, "n 4 4"]] | None:
+def read_cusfm_vehicle_poses(sparse_dir: Path) -> tuple[Int[ndarray, "n"], Float64[ndarray, "n 4 4"]] | None:
     """Read cuSFM's own vehicle-frame (== rig-frame) trajectory, if it wrote one.
 
     ``extract_pose_from_map_main --export_pose_in_vehicle_frame=True`` emits
@@ -1289,12 +1290,28 @@ def read_cusfm_vehicle_poses(sparse_dir: Path) -> tuple[Float64[ndarray, "n"], F
     tum: Path = sparse_dir.parent / CUSFM_OUTPUT_POSES_DIR / CUSFM_MERGED_POSE_FILE
     if not tum.is_file():
         return None
-    raw: Float64[ndarray, "n 8"] = np.loadtxt(tum)
-    if raw.ndim == 1:
-        raw = raw[None, :]
-    times_ns: Float64[ndarray, "n"] = raw[:, 0] * 1e9
+    rows: list[list[str]] = [line.split() for line in tum.read_text().splitlines() if line.strip()]
+    if not rows:
+        return None
+    # cuSFM receives integer microseconds in frames_meta.json, converts them to
+    # floating-point seconds, then prints many decimal places in TUM. Parse the
+    # text directly and recover that integer-microsecond contract: float64 cannot
+    # retain nanoseconds at Galileo's ~1.7e9-second epoch, while rounding the
+    # printed seconds to nanoseconds would preserve conversion noise instead of
+    # the input timestamp.
+    times_ns: Int[ndarray, "n"] = np.asarray(
+        [
+            int((Decimal(row[0]) * Decimal(1_000_000)).to_integral_value(rounding=ROUND_HALF_UP))
+            * 1000
+            for row in rows
+        ],
+        dtype=np.int64,
+    )
+    raw: Float64[ndarray, "n 7"] = np.asarray(
+        [[float(value) for value in row[1:8]] for row in rows], dtype=np.float64
+    )
     poses: Float64[ndarray, "n 4 4"] = np.stack(
-        [compose(Rotation.from_quat(row[4:8]).as_matrix(), row[1:4]) for row in raw]
+        [compose(Rotation.from_quat(row[3:7]).as_matrix(), row[0:3]) for row in raw]
     )
     return times_ns, poses
 
@@ -1302,7 +1319,7 @@ def read_cusfm_vehicle_poses(sparse_dir: Path) -> tuple[Float64[ndarray, "n"], F
 def refined_extrinsics(
     sequence: PreparedSequence,
     model: ColmapModel,
-    rig_times_ns: Float64[ndarray, "n"],
+    rig_times_ns: Int[ndarray, "n"],
     rig_poses: Float64[ndarray, "n 4 4"],
 ) -> tuple[dict[str, Float64[ndarray, "4 4"]], float]:
     """Recover each camera's ``rig_T_cam`` as bundle adjustment left it.
@@ -1312,9 +1329,10 @@ def refined_extrinsics(
     across frames — near zero means the rig stayed rigid, which the exoego schema
     requires.
     """
-    lookup: dict[int, int] = {int(round(t)): i for i, t in enumerate(rig_times_ns)}
+    lookup: dict[int, int] = {int(timestamp_ns): i for i, timestamp_ns in enumerate(rig_times_ns)}
     out: dict[str, Float64[ndarray, "4 4"]] = {}
     worst: float = 0.0
+    matched_rows: int = 0
     for camera in sequence.sfm_cameras:
         estimates: list[Float64[ndarray, "4 4"]] = []
         for sample_index, timestamp in enumerate(sequence.timestamps_ns):
@@ -1324,9 +1342,14 @@ def refined_extrinsics(
             world_T_cam: Float64[ndarray, "4 4"] | None = model.world_T_cam.get(
                 f"{camera.name}/{image_path.name}"
             )
-            row: int | None = lookup.get(int(round(float(timestamp))))
+            # Match the exact timestamp contract handed to cuSFM. RoboCap keeps
+            # finer nanoseconds in its video names, but frames_meta.json carries
+            # integer microseconds; Galileo already starts at that precision.
+            timestamp_key_ns: int = (int(timestamp) // 1000) * 1000
+            row: int | None = lookup.get(timestamp_key_ns)
             if world_T_cam is None or row is None:
                 continue
+            matched_rows += 1
             estimates.append(np.linalg.inv(rig_poses[row]) @ world_T_cam)
         if not estimates:
             continue
@@ -1335,6 +1358,11 @@ def refined_extrinsics(
         worst = max(worst, float(np.linalg.norm(translations - translations.mean(axis=0), axis=1).max()))
         mean_rotation = Rotation.from_matrix(stack[:, :3, :3]).mean().as_matrix()
         out[camera.name] = compose(mean_rotation, translations.mean(axis=0))
+    if matched_rows == 0:
+        print(
+            "  WARNING: refined-extrinsics timestamp join matched zero rows; "
+            "no refined camera extrinsics can be recovered"
+        )
     return out, worst
 
 
