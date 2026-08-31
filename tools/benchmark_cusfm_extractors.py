@@ -26,7 +26,7 @@ ImageCHW: TypeAlias = Float32[ndarray, "3 h w"]
 ImagesBCHW: TypeAlias = Float32[ndarray, "batch 3 h w"]
 KeypointsN2: TypeAlias = Float32[ndarray, "num_keypoints 2"]
 DescriptorsND: TypeAlias = Float32[ndarray, "num_keypoints descriptor_dim"]
-ScoresN: TypeAlias = Float32[ndarray, "num_keypoints"]  # noqa: F821
+ScoresN: TypeAlias = Float32[ndarray, "num_keypoints"]
 
 
 @dataclass

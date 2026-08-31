@@ -1,8 +1,5 @@
 """Extract batched RaCo-ALIKED features into cuSFM keyframe protobufs."""
 
-# Ruff otherwise interprets jaxtyping shape strings as Python forward references.
-# ruff: noqa: F821, UP037
-
 from __future__ import annotations
 
 import copy
@@ -11,6 +8,7 @@ import statistics
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
+from functools import partial
 from itertools import batched
 from pathlib import Path
 from typing import Any, Self, TypeAlias, cast
@@ -736,24 +734,6 @@ def write_frames_metadata(output_dir: Path, collection: Message) -> None:
     _write_atomic_bytes(output_dir / "frames_meta.json", payload.encode())
 
 
-def _prepare_batch(
-    executor: ThreadPoolExecutor,
-    tasks: list[FrameTask],
-    network_width: int,
-    network_height: int,
-) -> list[PreparedFrame]:
-    """Decode and stretch one batch concurrently while preserving task order."""
-    prepared: list[PreparedFrame] = list(
-        executor.map(
-            prepare_frame,
-            tasks,
-            [network_width] * len(tasks),
-            [network_height] * len(tasks),
-        )
-    )
-    return prepared
-
-
 def _write_feature_batch(
     prepared: list[PreparedFrame], outputs: InferenceBatch, message_types: dict[str, type[Message]]
 ) -> int:
@@ -797,11 +777,15 @@ def run_benchmark(
     if largest_batch > config.maximum_batch_size:
         raise ValueError("A benchmark batch exceeds the TensorRT profile maximum")
     with ThreadPoolExecutor(max_workers=config.preprocessing_workers) as executor:
-        prepared: list[PreparedFrame] = _prepare_batch(
-            executor,
-            tasks[:largest_batch],
-            config.network_width,
-            config.network_height,
+        prepared: list[PreparedFrame] = list(
+            executor.map(
+                partial(
+                    prepare_frame,
+                    network_width=config.network_width,
+                    network_height=config.network_height,
+                ),
+                tasks[:largest_batch],
+            )
         )
     images_bchw: ImagesBCHW = np.stack([frame.network_chw for frame in prepared])
     results: list[BenchmarkResult] = extractor.benchmark(
@@ -855,11 +839,15 @@ def run_extraction(
     cv2.setNumThreads(1)
     with ThreadPoolExecutor(max_workers=config.preprocessing_workers) as executor:
         for batch_tasks in batched(pending, config.batch_size):
-            prepared: list[PreparedFrame] = _prepare_batch(
-                executor,
-                batch_tasks,
-                config.network_width,
-                config.network_height,
+            prepared: list[PreparedFrame] = list(
+                executor.map(
+                    partial(
+                        prepare_frame,
+                        network_width=config.network_width,
+                        network_height=config.network_height,
+                    ),
+                    batch_tasks,
+                )
             )
             images_bchw: ImagesBCHW = np.stack([frame.network_chw for frame in prepared])
             if extractor.fixed_batch_size is not None:

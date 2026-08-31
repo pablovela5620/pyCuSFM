@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Run cuSFM on a posed multi-camera sequence and visualise it in Rerun.
 
 Two datasets, one code path:
@@ -47,13 +46,11 @@ import json
 import shutil
 import subprocess
 import time
-from dataclasses import dataclass, field
-from decimal import Decimal, ROUND_HALF_UP
-from pathlib import Path
 from collections.abc import Sequence
+from dataclasses import dataclass, field
+from decimal import ROUND_HALF_UP, Decimal
+from pathlib import Path
 from typing import Annotated, Literal, TypeAlias, cast
-
-import pycusfm.constants as _cusfm_constants
 
 import numpy as np
 import pyarrow as pa
@@ -74,6 +71,8 @@ from simplecv.rerun_log_utils import RerunTyroConfig, mux_h264_to_mp4
 from simplecv.rerun_rig_logger import log_rig_pose_stream, log_rig_static
 from simplecv.rig import CameraSensor, Rig, RigCalibration, RigPoseStream, SensorKind, entity_id
 from simplecv.rrd_query_utils import first_valid_value, unwrap_singleton_lists
+
+import pycusfm.constants as _cusfm_constants
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -487,14 +486,14 @@ class PreparedSequence:
     video_samples: dict[str, list[tuple[int, bytes]]] = field(default_factory=dict)
     """Per-camera raw H.264 samples, re-emitted verbatim as a ``VideoStream``."""
     reference_name: str = "imu_00"
-    """Name of the sensor that IS the rig origin (its extrinsic is identity).
+    """True body-frame origin recorded in the rig metadata.
 
-    exoego:v2 defines ``reference`` as the sensor whose ``rig_T_cam`` is identity.
-    Here the rig frame is the body frame the supplied trajectory lives in — the IMU
-    for RoboCap (matching the catalog's own ``imu_00``), the vehicle frame for
-    galileo — *not* a camera. simplecv's ``RigCalibration.reference_index`` can only
-    name a camera, so this corrects the value after ``log_rig_static``; leaving it
-    as ``cam_00`` would claim an identity extrinsic that camera does not have."""
+    We deliberately follow `COLMAP's rig convention <https://colmap.github.io/rigs.html>`_
+    and give ``RigCalibration`` a camera reference sensor even though the physical
+    origin is RoboCap's IMU or Galileo's vehicle frame. The viewer therefore tints
+    ``cam_00`` as the reference camera; this value overrides the schema metadata
+    with the true origin instead. Do not make the tint and metadata agree by moving
+    the rig frame to the camera."""
 
     @property
     def sfm_cameras(self) -> list[PreparedCamera]:
@@ -504,14 +503,8 @@ class PreparedSequence:
         RoboCap those differ -- six on the rig, four to cuSFM -- and conflating
         them is silent: ``len(cameras)`` was once used as the divisor for cuSFM
         keyframe ids, scaling every loop-closure chord by 4/6 with nothing
-        visibly wrong. Prefer this property, and ``cusfm_camera_count`` when only
-        the size is needed."""
+        visibly wrong. Prefer this property."""
         return [camera for camera in self.cameras if camera.used_for_sfm]
-
-    @property
-    def cusfm_camera_count(self) -> int:
-        """Number of cameras cuSFM received; the stride of its global keyframe ids."""
-        return sum(camera.used_for_sfm for camera in self.cameras)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -649,7 +642,7 @@ def fetch_robocap_segment(rrd_path: Path, catalog_url: str = ROBOCAP_CATALOG_URL
         client = CatalogClient(catalog_url)
         dataset = client.get_dataset(name="robocap")
         recording = dataset.download_segment(ROBOCAP_SEGMENT)
-    except Exception as error:  # noqa: BLE001 - surface any catalog failure as guidance
+    except Exception as error:
         raise RuntimeError(
             f"could not fetch {ROBOCAP_SEGMENT} from {catalog_url} ({error}). "
             "Start the catalog, or point --dataset.rrd-path at an existing .rrd."
@@ -835,9 +828,8 @@ def extract_jpegs(
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
             "-i", str(mp4_path),
             "-vf", f"select='{wanted}'",
-            # `-fps_mode passthrough` (ffmpeg >= 5), NOT the older `-vsync 0`:
-            # ffmpeg 9 removed -vsync outright, and this env ships 9.0.1, so
-            # -vsync fails with "Unrecognized option 'vsync'" on a clean checkout.
+            # `-fps_mode passthrough` is the tested ffmpeg 8.x path. The project
+            # keeps that major pinned because this extraction is untested on 9.x.
             "-fps_mode", "passthrough", "-q:v", "2",
             str(staging / "f_%06d.jpg"),
         ],
@@ -937,7 +929,7 @@ def prepare_robocap(config: RobocapConfig, run: RunConfig) -> PreparedSequence:
             extract_jpegs(mp4_path, camera_dir, selected, timestamps)
             present = {path for path in expected_paths if path.is_file()}
         image_paths[name] = [
-            expected_paths[i] if i < len(expected_paths) and expected_paths[i] in present else None
+            expected_paths[i] if expected_paths[i] in present else None
             for i in range(len(canonical_times))
         ]
         # cuSFM resolves image_name relative to input_dir, so link the shared
@@ -1468,6 +1460,8 @@ def log_rig(
     log_rig_static(rig)
     log_rig_pose_stream(rig, timestamps_ns=timestamps_ns, timeline=TIMELINE)
     rig_path: str = f"world/{entity_id('rig', rig.index)}"
+    # Deliberate COLMAP convention: cam_00 stays the camera reference (and gets
+    # the viewer tint), while this override records the true IMU/vehicle origin.
     rr.log(
         rig_path,
         rr.AnyValues(source=label, dataset=sequence.name, reference=sequence.reference_name),

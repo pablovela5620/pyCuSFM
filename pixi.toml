@@ -17,7 +17,7 @@ scipy = "*"
 av = "*"
 pyarrow = "*"
 einops = "*"
-# ffmpeg 9 removed `-vsync`, which the frame extraction uses; 8.x still has it.
+# Keep the tested 8.x major until the JPEG extraction path is validated on 9.x.
 ffmpeg = "8.*"
 # simplecv -> pyserde<0.32 requires typing-extensions <4.16, but the conda solve
 # otherwise pins 4.16.0 and the pypi solve then has no solution. Documented in
@@ -76,6 +76,7 @@ tyro = ">=0.9.1"
 # points, reachable as `pixi run -e raco <task>`.
 [feature.raco.tasks]
 test = { cmd = "python -m pytest tests/ -q", description = "Run the test suite" }
+lint = { cmd = "ruff check demo_rerun.py tools tests", description = "Lint the demo, RaCo tools, and tests" }
 raco-export = { cmd = "python -m tools.export_cusfm_raco", description = "Export RaCo-ALIKED + LightGlue to ONNX for cuSFM" }
 raco-extract = { cmd = "python -m tools.raco_extract", description = "Write cuSFM keyframes with the batched RaCo extractor" }
 raco-benchmark = { cmd = "python -m tools.benchmark_cusfm_extractors", description = "Benchmark stock ALIKED against RaCo-ALIKED" }

@@ -352,11 +352,9 @@ Hence the README's apt line for the host libs and the hard Ubuntu 24.04 requirem
 12. **The catalog stores segments in memory** (`memory:///store/...`). A catalog restart loses
     all 40 RoboCap segments, so the demo freezes its segment to disk once and never reads the
     catalog again on subsequent runs.
-13. **Pin `ffmpeg = "8.*"`.** ffmpeg 9 removed `-vsync`, and an unpinned `ffmpeg = "*"` resolves
-    to 9.0.1, so frame extraction dies with `Unrecognized option 'vsync'`. This hid for a long
-    time because early runs shelled out to an older ffmpeg found on `PATH` outside the pixi env,
-    and later runs skipped extraction when frames already existed — a fresh clone would have
-    failed on the very first `pixi run demo-robocap`.
+13. **Pin `ffmpeg = "8.*"`.** The lock currently supplies 8.1.2, the major used to validate
+    explicit `select` plus `-fps_mode passthrough` JPEG extraction. Keep that tested major until
+    the same path has been exercised on ffmpeg 9; no removed `-vsync` option is used now.
 14. **Trimming must move image selection *and* pose selection together.** Adding the head/tail
     trim initially changed only `sample_indices`, leaving frame extraction at
     `range(0, n, stride)`. Poses started ~60 frames in while images still started at 0, pairing
