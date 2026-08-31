@@ -49,15 +49,14 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from decimal import Decimal, ROUND_HALF_UP
-from fractions import Fraction
-from io import BytesIO
 from pathlib import Path
 from collections.abc import Sequence
-from typing import Annotated, Literal, TypeAlias
+from typing import Annotated, Literal, TypeAlias, cast
 
 import pycusfm.constants as _cusfm_constants
 
 import numpy as np
+import pyarrow as pa
 import rerun as rr
 import rerun.blueprint as rrb
 import tyro
@@ -71,9 +70,10 @@ from simplecv.camera_parameters import (
     KannalaBrandtDistortion,
     PinholeParameters,
 )
-from simplecv.rerun_log_utils import RerunTyroConfig
+from simplecv.rerun_log_utils import RerunTyroConfig, mux_h264_to_mp4
 from simplecv.rerun_rig_logger import log_rig_pose_stream, log_rig_static
-from simplecv.rig import CameraSensor, Rig, RigCalibration, RigPoseStream, entity_id
+from simplecv.rig import CameraSensor, Rig, RigCalibration, RigPoseStream, SensorKind, entity_id
+from simplecv.rrd_query_utils import first_valid_value, unwrap_singleton_lists
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -378,6 +378,9 @@ def umeyama_rigid(
 ) -> tuple[Float64[ndarray, "3 3"], Float64[ndarray, "3"], float, float]:
     """Least-squares rigid (SE3, **no scale**) fit mapping ``source`` onto ``target``.
 
+    Kept local to preserve a float64 transform for millimetre-scale diagnostics;
+    simplecv's canonical ``umeyama_transform`` returns float32.
+
     Scale is deliberately held at 1: if cuSFM rescales the trajectory we want to
     see that as alignment error, not absorb it into the fit. The scale that
     *would* have been fitted is returned as a diagnostic.
@@ -447,7 +450,7 @@ class PreparedCamera:
     """Kannala-Brandt ``k1..k4`` for fisheye cameras; empty for pinhole."""
     used_for_sfm: bool = True
     """False for cameras logged as frusta but withheld from the reconstruction."""
-    kind: str = "rgb"
+    kind: SensorKind = "rgb"
     """Image content as recorded upstream (RoboCap's cameras are ``grayscale``)."""
 
 
@@ -628,7 +631,7 @@ class RrdCameraRecord:
     width: int
     height: int
     distortion: tuple[float, ...]
-    kind: str = "rgb"
+    kind: SensorKind = "rgb"
     samples: list[tuple[int, bytes]] = field(default_factory=list)
 
 
@@ -657,29 +660,6 @@ def fetch_robocap_segment(rrd_path: Path, catalog_url: str = ROBOCAP_CATALOG_URL
     return rrd_path
 
 
-def _column(record_batch, suffix: str):  # noqa: ANN001 - pyarrow RecordBatch
-    """Fetch a component column by name, or ``None``.
-
-    A *chunk* record batch names its columns with bare component names
-    (``name``, ``Transform3D:mat3x3``), unlike a catalog dataframe, which
-    prefixes them with the entity path (``/world/rig_00/cam_00:name``). Match
-    exactly first so a bare ``name`` is found, then fall back to a suffix match
-    so the same helper works against either shape.
-    """
-    names: list[str] = list(record_batch.schema.names)
-    if suffix in names:
-        return record_batch.column(suffix)
-    match: str | None = next((n for n in names if n.endswith(suffix)), None)
-    return record_batch.column(match) if match is not None else None
-
-
-def _first_value(column):  # noqa: ANN001 - pyarrow ChunkedArray
-    """First non-null value of a component column, unwrapped from its list cell."""
-    if column is None:
-        return None
-    return next((value for value in column.to_pylist() if value is not None), None)
-
-
 def read_robocap_rrd(rrd_path: Path) -> tuple[dict[int, RrdCameraRecord], Int[ndarray, "n"], Rotation, Float64[ndarray, "n 3"]]:
     """Read cameras, video samples, and the basalt trajectory from a frozen segment."""
     from rerun.experimental import RrdReader
@@ -705,21 +685,23 @@ def read_robocap_rrd(rrd_path: Path) -> tuple[dict[int, RrdCameraRecord], Int[nd
         if not entity_path.startswith("/world/rig_00"):
             continue
         record_batch = chunk.to_record_batch()
+        component_names: set[str] = set(record_batch.schema.names)
 
         if entity_path == "/world/rig_00":
-            quaternions = _column(record_batch, "Transform3D:quaternion")
-            translations = _column(record_batch, "Transform3D:translation")
-            times = _column(record_batch, TIMELINE)
-            if quaternions is None or translations is None or times is None:
+            required: set[str] = {"Transform3D:quaternion", "Transform3D:translation", TIMELINE}
+            if not required.issubset(component_names):
                 continue
+            quaternions: pa.Array = record_batch.column("Transform3D:quaternion")
+            translations: pa.Array = record_batch.column("Transform3D:translation")
+            times: pa.Array = record_batch.column(TIMELINE)
             for quaternion, translation, timestamp in zip(
                 quaternions.to_pylist(), translations.to_pylist(), times.to_pylist()
             ):
                 if quaternion is None or translation is None or timestamp is None:
                     continue
                 pose_times.append(int(getattr(timestamp, "value", timestamp)))
-                pose_quats.append(list(quaternion[0]))
-                pose_translations.append(list(translation[0]))
+                pose_quats.append(list(unwrap_singleton_lists(quaternion)))
+                pose_translations.append(list(unwrap_singleton_lists(translation)))
             continue
 
         index: int | None = camera_index(entity_path)
@@ -727,14 +709,15 @@ def read_robocap_rrd(rrd_path: Path) -> tuple[dict[int, RrdCameraRecord], Int[nd
             continue
 
         if entity_path.endswith("/pinhole/video"):
-            samples = _column(record_batch, "VideoStream:sample")
-            times = _column(record_batch, TIMELINE)
-            if samples is None or times is None:
+            if "VideoStream:sample" not in component_names or TIMELINE not in component_names:
                 continue
+            samples: pa.Array = record_batch.column("VideoStream:sample")
+            times = record_batch.column(TIMELINE)
             record: RrdCameraRecord | None = cameras.get(index)
             if record is None:
                 record = RrdCameraRecord(f"cam_{index:02d}", np.eye(4), np.eye(3), 0, 0, ())
                 cameras[index] = record
+            # simplecv's canonical RRD video reader needs rerun-sdk[datafusion], absent from this frozen runtime; keep direct Arrow reads for the exo path.
             # Read the H.264 blobs straight out of the Arrow buffer. The obvious
             # `samples.to_pylist()` boxes every byte of every sample into Python
             # objects: profiled at 65.7 s for this segment versus 0.4 s here, a
@@ -756,41 +739,56 @@ def read_robocap_rrd(rrd_path: Path) -> tuple[dict[int, RrdCameraRecord], Int[nd
         record = cameras.setdefault(index, RrdCameraRecord(f"cam_{index:02d}", np.eye(4), np.eye(3), 0, 0, ()))
 
         if entity_path.endswith("/pinhole"):
-            k_value = _first_value(_column(record_batch, "Pinhole:image_from_camera"))
-            if k_value is not None:
-                # Rerun Mat3x3 is column-major.
-                record.k_matrix = np.asarray(k_value[0], dtype=np.float64).reshape(3, 3).T
-            resolution_value = _first_value(_column(record_batch, "Pinhole:resolution"))
-            if resolution_value is not None:
-                record.width = int(resolution_value[0][0])
-                record.height = int(resolution_value[0][1])
-            distortion_value = _first_value(
-                _column(record_batch, "simplecv.components.DistortionCoefficients")
+            k_value: list[float] = first_valid_value(
+                record_batch.column("Pinhole:image_from_camera"), component_name="Pinhole:image_from_camera"
             )
-            if distortion_value is not None:
-                # Fisheye62 stores 8 slots; RoboCap populates only k1..k4.
-                record.distortion = tuple(float(c) for c in distortion_value[0][:4])
+            # Rerun Mat3x3 is column-major.
+            record.k_matrix = np.asarray(k_value, dtype=np.float64).reshape(3, 3).T
+            resolution_value: list[float] = first_valid_value(
+                record_batch.column("Pinhole:resolution"), component_name="Pinhole:resolution"
+            )
+            record.width = int(resolution_value[0])
+            record.height = int(resolution_value[1])
+            distortion_value: list[float] = first_valid_value(
+                record_batch.column("simplecv.components.DistortionCoefficients"),
+                component_name="simplecv.components.DistortionCoefficients",
+            )
+            # Fisheye62 stores 8 slots; RoboCap populates only k1..k4.
+            record.distortion = tuple(float(c) for c in distortion_value[:4])
             continue
 
         # Bare camera node: name/kind and the static rig_T_cam.
-        name_value = _first_value(_column(record_batch, "name"))
-        if name_value is not None:
+        if "name" in component_names:
+            name_value: list[str] = first_valid_value(record_batch.column("name"), component_name="name")
             record.name = str(name_value[0])
-        kind_value = _first_value(_column(record_batch, "kind"))
-        if kind_value is not None:
-            record.kind = str(kind_value[0])
-        mat_value = _first_value(_column(record_batch, "Transform3D:mat3x3"))
-        translation_value = _first_value(_column(record_batch, "Transform3D:translation"))
-        if mat_value is not None and translation_value is not None:
-            relation_value = _first_value(_column(record_batch, "Transform3D:relation"))
-            if relation_value is not None and int(relation_value[0]) != CHILD_FROM_PARENT:
+        if "kind" in component_names:
+            kind_value: list[str] = first_valid_value(record_batch.column("kind"), component_name="kind")
+            kind: str = str(kind_value[0])
+            if kind not in ("rgb", "grayscale", "depth", "imu"):
+                raise ValueError(f"{entity_path}: unsupported sensor kind {kind!r}")
+            record.kind = cast(SensorKind, kind)
+        transform_components: set[str] = {"Transform3D:mat3x3", "Transform3D:translation"}
+        if transform_components.issubset(component_names):
+            mat_value: list[float] = first_valid_value(
+                record_batch.column("Transform3D:mat3x3"), component_name="Transform3D:mat3x3"
+            )
+            translation_value: list[float] = first_valid_value(
+                record_batch.column("Transform3D:translation"), component_name="Transform3D:translation"
+            )
+            if "Transform3D:relation" in component_names:
+                relation_value: list[int] = first_valid_value(
+                    record_batch.column("Transform3D:relation"), component_name="Transform3D:relation"
+                )
+            else:
+                relation_value = []
+            if relation_value and int(relation_value[0]) != CHILD_FROM_PARENT:
                 raise ValueError(
                     f"{entity_path}: expected a ChildFromParent extrinsic "
                     f"(got relation={int(relation_value[0])}); the stored value would be "
                     f"rig_T_cam, not cam_T_rig, and inverting it would flip every frustum."
                 )
-            rotation: Float64[ndarray, "3 3"] = np.asarray(mat_value[0], dtype=np.float64).reshape(3, 3).T
-            record.cam_T_rig = compose(rotation, np.asarray(translation_value[0], dtype=np.float64))
+            rotation: Float64[ndarray, "3 3"] = np.asarray(mat_value, dtype=np.float64).reshape(3, 3).T
+            record.cam_T_rig = compose(rotation, np.asarray(translation_value, dtype=np.float64))
 
     if not pose_times:
         raise RuntimeError(f"{rrd_path} has no world_T_rig stream — is the `slam` layer present?")
@@ -804,36 +802,6 @@ def read_robocap_rrd(rrd_path: Path) -> tuple[dict[int, RrdCameraRecord], Int[nd
 
     print(f"  read {len(cameras)} cameras, {len(times_ns)} rig poses from {rrd_path.name}")
     return cameras, times_ns, Rotation.from_quat(quaternions_xyzw), translations
-
-
-def remux_to_mp4(samples: list[tuple[int, bytes]], output_path: Path) -> None:
-    """Repackage Annex-B H.264 samples into an MP4 without re-encoding.
-
-    Follows Rerun's documented remuxing recipe: concatenate the samples into one
-    elementary stream, let PyAV parse it, then rewrite packet timestamps from the
-    recording's own nanosecond times. Rerun's ``VideoStream`` has no B-frames, so
-    ``dts == pts``.
-    """
-    import av
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    elementary_stream: bytes = b"".join(raw for _, raw in samples)
-    input_container = av.open(BytesIO(elementary_stream), mode="r", format="h264")
-    input_stream = input_container.streams.video[0]
-    output_container = av.open(str(output_path), mode="w")
-    output_stream = output_container.add_stream_from_template(input_stream)
-
-    start_ns: int = samples[0][0]
-    for packet, (timestamp_ns, _) in zip(input_container.demux(input_stream), samples):
-        if packet.size == 0:
-            continue
-        packet.time_base = Fraction(1, 1_000_000_000)
-        packet.pts = int(timestamp_ns - start_ns)
-        packet.dts = packet.pts
-        packet.stream = output_stream
-        output_container.mux(packet)
-    input_container.close()
-    output_container.close()
 
 
 def extract_jpegs(
@@ -940,7 +908,17 @@ def prepare_robocap(config: RobocapConfig, run: RunConfig) -> PreparedSequence:
         record = by_name[name]
         mp4_path: Path = video_dir / f"{name}.mp4"
         if not mp4_path.is_file():
-            remux_to_mp4(record.samples, mp4_path)
+            mp4_path.parent.mkdir(parents=True, exist_ok=True)
+            sample_times: pa.ChunkedArray = pa.chunked_array(
+                [pa.array([timestamp for timestamp, _ in record.samples], type=pa.duration("ns"))]
+            )
+            sample_payload: bytes = b"".join(raw for _, raw in record.samples)
+            sample_offsets: Int[ndarray, "n+1"] = np.zeros(len(record.samples) + 1, dtype=np.int32)
+            np.cumsum([len(raw) for _, raw in record.samples], out=sample_offsets[1:])
+            sample_array: pa.ListArray = pa.ListArray.from_arrays(
+                pa.array(sample_offsets), pa.array(np.frombuffer(sample_payload, dtype=np.uint8))
+            )
+            mux_h264_to_mp4(sample_times, pa.chunked_array([sample_array]), str(mp4_path))
         camera_dir: Path = frames_dir / name
         timestamps: list[int] = [timestamp for timestamp, _ in record.samples]
         # MUST be the same indices as `sample_indices`, which are already trimmed.
@@ -1464,7 +1442,7 @@ def build_rig(
         else:
             parameters = PinholeParameters(name=camera.name, extrinsics=extrinsics, intrinsics=intrinsics)
         sensors.append(
-            CameraSensor(index=camera_index, name=camera.name, kind=camera.kind, pinhole=parameters)  # type: ignore[arg-type]
+            CameraSensor(index=camera_index, name=camera.name, kind=camera.kind, pinhole=parameters)
         )
 
     return Rig(
