@@ -43,3 +43,4 @@ data/cusfm_configs/epipolar-1e-3/
 data/cusfm_configs/epipolar-1e-4/
 data/cusfm_configs/pose-edge-gates-only/
 data/cusfm_configs/pose-graph-fixed-1e-4/
+data/lfs_datasets/
