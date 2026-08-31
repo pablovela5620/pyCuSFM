@@ -206,11 +206,6 @@ class RobocapConfig:
     6 min at the cost of the reconstruction above."""
     max_samples: int | None = None
     """Cap on samples after striding (``None`` = all)."""
-    image_stride: int = 1
-    """Log JPEG imagery every Nth *sample*. Default 1 = log **exactly** the images
-    cuSFM was given, which is the point of the recording: what the solver saw.
-    Raise it only to shrink the .rrd for embedding, accepting that the viewer then
-    shows a subset of the solver's input."""
     cameras: tuple[str, ...] = ROBOCAP_SFM_CAMERAS
     """World-facing cameras fed to cuSFM."""
     rig_adjacency_pairs: bool = False
@@ -1823,10 +1818,8 @@ def main(config: Config) -> None:
     dataset: DatasetConfig = config.dataset
     if isinstance(dataset, RobocapConfig):
         sequence: PreparedSequence = prepare_robocap(dataset, config.run)
-        image_stride: int = dataset.image_stride
     else:
         sequence = prepare_galileo(dataset, config.run)
-        image_stride = dataset.image_stride
 
     sparse_dir: Path = run_cusfm(sequence, config.run)
     model: ColmapModel = read_colmap_model(sparse_dir)
@@ -1981,8 +1974,8 @@ def main(config: Config) -> None:
             f"(full rate); {int(sequence.keyframe_mask.sum())} marked as cuSFM keyframes"
         )
     else:
-        logged_images: int = log_images(sequence, INPUT_RIG_INDEX, image_stride)
-        print(f"  logged {logged_images} images (every {image_stride} samples)")
+        logged_images: int = log_images(sequence, INPUT_RIG_INDEX, dataset.image_stride)
+        print(f"  logged {logged_images} images (every {dataset.image_stride} samples)")
     print()
 
 
