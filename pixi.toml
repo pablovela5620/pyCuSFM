@@ -1,0 +1,122 @@
+[workspace]
+name = "pycusfm"
+version = "0.1.8"
+description = "Pixi environment for the CUDA 13 pyCuSFM binaries"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = "3.12.*"
+pyyaml = "*"
+pillow = "*"
+setuptools = "<78"
+# ── Rerun demo side (demo_rerun.py) ──
+rerun-sdk = ">=0.33"
+numpy = "*"
+scipy = "*"
+av = "*"
+pyarrow = "*"
+einops = "*"
+# ffmpeg 9 removed `-vsync`, which the frame extraction uses; 8.x still has it.
+ffmpeg = "8.*"
+# simplecv -> pyserde<0.32 requires typing-extensions <4.16, but the conda solve
+# otherwise pins 4.16.0 and the pypi solve then has no solution. Documented in
+# the add-model skill's fork-and-pixify reference.
+typing-extensions = ">=4.1,<4.16"
+cuda-version = "13.0.*"
+cuda-cudart = "*"
+libcublas = "*"
+libcusparse = "*"
+libcusolver = "*"
+
+[pypi-dependencies]
+pycusfm = { path = ".", editable = true }
+tensorrt-cu13 = "==10.13.3.9.post1"
+# simplecv supplies RerunTyroConfig, the camera dataclasses, and the exoego:v2
+# rig logger. It is taken from the monorepo (public) rather than the standalone
+# pablovela5620/simplecv, which predates rerun_rig_logger.py / rig.py.
+# NOTE: never write `simplecv = "*"` — PyPI's `simplecv` is an unrelated 2013
+# machine-vision package and would install silently in its place.
+simplecv = { git = "https://github.com/rerun-io/examples-monorepo.git", subdirectory = "packages/simplecv" }
+tyro = ">=0.9.1"
+jaxtyping = "*"
+beartype = "*"
+
+[pypi-options.dependency-overrides]
+tensorrt-cu12 = "==10.13.3.9.post1"
+cuda-toolkit = ">=13,<14"
+
+# RaCo-ALIKED export and TensorRT 10.13 benchmarking.  PyTorch is CPU-only:
+# ONNX export does not need a GPU, and keeping CUDA PyTorch out of this feature
+# avoids changing the CUDA/TensorRT libraries used by the frozen cuSFM binaries.
+[feature.raco.dependencies]
+python = "3.12.*"
+onnx = "1.22.*"
+cuda-python = "13.0.*"
+cuda-version = "13.0.*"
+cuda-cudart = "*"
+libcublas = "*"
+numpy = "==2.5.1"
+pytest = "*"
+ruff = "*"
+setuptools = "*"
+
+[feature.raco.pypi-dependencies]
+lightglue-onnx = { git = "https://github.com/fabio-sim/LightGlue-ONNX.git", rev = "d12b4ba1632f558234e3f084e1f3d8bdf9147890" }
+jaxtyping = "*"
+onnxscript = "==0.7.1"
+tensorrt-cu13 = "==10.13.3.9.post1"
+torch = { version = "==2.13.0", index = "https://download.pytorch.org/whl/cpu" }
+torchvision = { version = "==0.28.0", index = "https://download.pytorch.org/whl/cpu" }
+tyro = ">=0.9.1"
+
+# The suite and the RaCo tools live in the `raco` environment, which is
+# `no-default-feature`; `pixi run python -m pytest` from the default env fails
+# with "No module named pytest". Feature-scoped tasks are the supported entry
+# points, reachable as `pixi run -e raco <task>`.
+[feature.raco.tasks]
+test = { cmd = "python -m pytest tests/ -q", description = "Run the test suite" }
+raco-export = { cmd = "python -m tools.export_cusfm_raco", description = "Export RaCo-ALIKED + LightGlue to ONNX for cuSFM" }
+raco-extract = { cmd = "python -m tools.raco_extract", description = "Write cuSFM keyframes with the batched RaCo extractor" }
+raco-benchmark = { cmd = "python -m tools.benchmark_cusfm_extractors", description = "Benchmark stock ALIKED against RaCo-ALIKED" }
+
+[environments]
+raco = { features = ["raco"], no-default-feature = true, solve-group = "raco" }
+
+[activation.env]
+LD_LIBRARY_PATH = "${PIXI_PROJECT_ROOT}/pycusfm/x86_cuda13/lib:${CONDA_PREFIX}/lib/python3.12/site-packages/tensorrt_libs:${CONDA_PREFIX}/lib:/usr/lib/x86_64-linux-gnu"
+
+[tasks]
+select-tensorrt-cu13 = "pixi reinstall tensorrt-cu13-libs tensorrt-cu13-bindings --no-progress"
+setup-cuda13-bin = { cmd = "ln -sfn x86_cuda13/bin pycusfm/bin", depends-on = ["select-tensorrt-cu13"] }
+setup-cuda13-lib = { cmd = "ln -sfn x86_cuda13/lib pycusfm/lib", depends-on = ["select-tensorrt-cu13"] }
+setup-cuda13 = { depends-on = ["setup-cuda13-bin", "setup-cuda13-lib"] }
+check-libs = { cmd = """bash -ec '
+status=0
+for binary in pycusfm/x86_cuda13/bin/*; do
+    missing="$(ldd "$binary" | awk "/not found/")"
+    if [ -n "$missing" ]; then
+        printf "%s\n%s\n" "$binary" "$missing"
+        status=1
+    fi
+done
+if [ "$status" -eq 0 ]; then
+    echo "All CUDA 13 binary dependencies found."
+fi
+exit "$status"
+'""", depends-on = ["setup-cuda13"] }
+cusfm-help = { cmd = "cusfm_cli --help", depends-on = ["setup-cuda13"] }
+
+
+# ── Rerun demos ──
+# demo_rerun.py auto-fetches the RoboCap segment from the catalog when
+# data/robocap/s00000021.rrd is absent, so there is no separate fetch task.
+demo = { cmd = "python demo_rerun.py dataset:galileo", depends-on = ["setup-cuda13"], description = "cuSFM on the bundled r2b_galileo sample, shown in Rerun" }
+demo-robocap = { cmd = "python demo_rerun.py dataset:robocap", depends-on = ["setup-cuda13"], description = "cuSFM on the RoboCap fisheye segment, shown in Rerun" }
+prepare-galileo-output = "mkdir -p data/cusfm_runs/galileo"
+demo-upstream = { cmd = """bash -o pipefail -ec '
+/usr/bin/time -f "wall_seconds=%e" python -u -m pycusfm.cusfm_cli \
+    --input_dir data/r2b_galileo \
+    --cusfm_base_dir data/cusfm_runs/galileo 2>&1 \
+    | tee data/cusfm_runs/galileo/demo-upstream.log
+'""", depends-on = ["setup-cuda13", "prepare-galileo-output"] }

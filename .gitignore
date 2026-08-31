@@ -16,3 +16,30 @@ pycusfm/bin
 pycusfm/lib
 # MkDocs build output
 site/
+data/cusfm_runs/
+data/robocap/
+.pixi/
+
+# ONNX/TensorRT export leftovers. onnxruntime's symbolic shape inference and
+# torch.onnx.export drop these in the working directory; they are regenerated
+# on every export and belong to no run.
+sym_shape_infer_temp.onnx
+*.data
+# Exported ONNX + generated engines for the RaCo extractor (~60 MB, rebuilt by
+# tools/export_cusfm_raco.py).
+data/cusfm_models/
+
+# Dead-end FP8 experiment: a nested pixi manifest whose pins contradict the root
+# solve (tensorrt-cu12 vs cu13) and which nothing in the repo calls. FP8 is
+# settled -- TensorRT compiled the Q/DQ graph entirely to FP16 (825 Half edges,
+# zero FP8 edges, 98 unsupported convolutions) and ran 2.4x slower than plain
+# FP16. Kept on disk as evidence, excluded so nobody adopts it.
+tools/cusfm_raco_fp8/
+
+# Loop-closure investigation residue. The findings are written up in NOTES.md;
+# only `loop-closure-fixed` is referenced by demo_rerun.py.
+data/cusfm_configs/depth4/
+data/cusfm_configs/epipolar-1e-3/
+data/cusfm_configs/epipolar-1e-4/
+data/cusfm_configs/pose-edge-gates-only/
+data/cusfm_configs/pose-graph-fixed-1e-4/

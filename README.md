@@ -66,6 +66,52 @@ The need for initial trajectory guess depends on your input data type:
 
 > **Note:** Support for un-posed sequential monocular images will be added in future release.
 
+## Run with pixi
+
+> This section is specific to the [pixified fork](https://github.com/pablovela5620/pyCuSFM);
+> it is not part of upstream pyCuSFM. See [NOTES.md](NOTES.md) for decisions and gotchas.
+
+One command, no `pip`/`uv`/`conda`, and no `./setup.bash`:
+
+```bash
+git clone https://github.com/pablovela5620/pyCuSFM && cd pyCuSFM
+git lfs pull
+pixi run demo
+```
+
+`demo` runs cuSFM on the bundled `data/r2b_galileo` sample (8 pinhole cameras) and opens
+[Rerun](https://rerun.io) showing the sparse cloud plus **two camera rigs** — the input
+trajectory and the cuSFM-refined one — so the bundle-adjustment correction is visible.
+
+```bash
+pixi run demo                      # bundled r2b_galileo sample (needs no network)
+pixi run demo-robocap              # RoboCap fisheye segment (needs a Rerun catalog once)
+pixi run demo-upstream             # upstream's own cusfm_cli, unmodified
+pixi run check-libs                # ldd gate over the CUDA 13 binaries
+```
+
+Headless, writing an `.rrd` instead of opening a viewer:
+
+```bash
+pixi run -- python demo_rerun.py --rr-config.headless --rr-config.save out.rrd dataset:galileo
+```
+
+Note that top-level options come *before* the `dataset:` subcommand. Useful flags:
+
+```bash
+--run.skip-reconstruction          # re-log an existing COLMAP model, no cuSFM re-run
+--dataset.frame-stride 20          # robocap: coarser sampling, ~6 min instead of ~20,
+                                   # but a visibly worse reconstruction (default: 4)
+--run.feature-type superpoint      # aliked (default) | superpoint | sift_cv_cuda
+--run.model-dir data/cusfm_models/raco   # batched RaCo-ALIKED instead of stock ALIKED
+```
+
+**Requirements.** Ubuntu 24.04 with an NVIDIA GPU. The prebuilt binaries link Ubuntu 24.04
+system C++ libraries that conda-forge cannot reproduce, so this is host-specific — see the
+"Non-hermetic" section of [NOTES.md](NOTES.md). Built and validated on an RTX 5090
+(Blackwell, `sm_120`) with driver 580.173 using the **CUDA 13** binaries.
+
+
 ## Installation
 
 ### Prerequisites
