@@ -14,7 +14,6 @@ from jaxtyping import Float32, UInt8
 from numpy import ndarray
 
 from tools.raco_extract import (
-    ExtractConfig,
     FrameTask,
     _pad_images_to_batch,
     build_message_types,
@@ -43,15 +42,6 @@ requires_reference_run = pytest.mark.skipif(
     not REFERENCE_OUTPUT_METADATA.is_file(),
     reason="needs a completed cuSFM run under data/cusfm_runs/robocap_full",
 )
-
-
-def test_extract_config_exposes_precision_policy_at_cli_seam() -> None:
-    """The CLI distinguishes plain FP16 from FP8 Q/DQ with FP16 fallback."""
-    default_config: ExtractConfig = ExtractConfig()
-    fp8_config: ExtractConfig = ExtractConfig(precision="fp8_qdq_with_fp16_fallback")
-
-    assert default_config.precision == "fp16"
-    assert fp8_config.precision == "fp8_qdq_with_fp16_fallback"
 
 
 def test_normalized_to_pixels_matches_cusfm_align_corners_mapping() -> None:

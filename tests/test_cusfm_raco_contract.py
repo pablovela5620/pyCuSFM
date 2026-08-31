@@ -10,11 +10,8 @@ from onnx import TensorProto
 
 from tools.export_cusfm_raco import CusfmExtractor, ExportConfig, static_output_names
 
-MODEL_DIRECTORIES: tuple[Path, ...] = (
-    Path("data/cusfm_models/raco/aliked_lightglue"),
-    Path("data/cusfm_models/raco_fp8/aliked_lightglue"),
-)
-"""FP16 and FP8 directories below the cuSFM model-root compatibility layer."""
+MODEL_DIRECTORY: Path = Path("data/cusfm_models/raco/aliked_lightglue")
+"""FP16 directory below the cuSFM model-root compatibility layer."""
 
 
 def test_extractor_can_select_native_deformable_convolution() -> None:
@@ -28,13 +25,6 @@ def test_extractor_can_select_native_deformable_convolution() -> None:
     ]
 
     assert portable_flags == [False, False, False, False]
-
-
-def test_export_config_accepts_a_fixed_unrolled_batch() -> None:
-    """A static writer graph can avoid TensorRT's dynamic batch fusion."""
-    config: ExportConfig = ExportConfig(static_batch_size=8)
-
-    assert config.static_batch_size == 8
 
 
 def test_static_output_names_keep_branches_separate() -> None:
@@ -62,9 +52,9 @@ def _dimensions(value: onnx.ValueInfoProto) -> tuple[int | str | None, ...]:
     return tuple(dimensions)
 
 
-@pytest.mark.parametrize("model_directory", MODEL_DIRECTORIES)
-def test_extractor_matches_cusfm_contract(model_directory: Path) -> None:
+def test_extractor_matches_cusfm_contract() -> None:
     """cuSFM can load the replacement extractor without an adapter."""
+    model_directory: Path = MODEL_DIRECTORY
     if not (model_directory / "aliked.onnx").is_file():
         pytest.skip(f"no exported model at {model_directory}; run `pixi run -e raco raco-export`")
     model: onnx.ModelProto = onnx.load(model_directory / "aliked.onnx")
@@ -86,9 +76,9 @@ def test_extractor_matches_cusfm_contract(model_directory: Path) -> None:
     assert operation_types.count("TopK") >= 3
 
 
-@pytest.mark.parametrize("model_directory", MODEL_DIRECTORIES)
-def test_matcher_matches_cusfm_contract(model_directory: Path) -> None:
+def test_matcher_matches_cusfm_contract() -> None:
     """cuSFM can load the RaCo-trained LightGlue matcher without an adapter."""
+    model_directory: Path = MODEL_DIRECTORY
     if not (model_directory / "lightglue_aliked.onnx").is_file():
         pytest.skip(f"no exported model at {model_directory}; run `pixi run -e raco raco-export`")
     model: onnx.ModelProto = onnx.load(model_directory / "lightglue_aliked.onnx")

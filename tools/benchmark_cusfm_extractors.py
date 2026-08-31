@@ -37,8 +37,6 @@ class BenchmarkConfig:
     """Frozen cuSFM ALIKED ONNX model."""
     optimized: Path = Path("data/cusfm_models/raco/aliked_lightglue/aliked.onnx")
     """RaCo-ALIKED replacement ONNX model."""
-    fp8: Path | None = None
-    """Optional ModelOpt FP8 Q/DQ extractor ONNX model."""
     input_dir: Path = Path("data/cusfm_runs/robocap_full/input")
     """Image tree used by the measured RoboCap baseline."""
     engine_dir: Path = REPO_ROOT / "data" / "cusfm_models" / "engines"
@@ -177,8 +175,7 @@ def _benchmark_engine(
     images_bchw: ImagesBCHW,
     warmup_iterations: int,
     iterations: int,
-    precision: str,
-) -> tuple[ModelResult, dict[str, NDArray[Any]]]:
+) -> ModelResult:
     """Measure device-only execution with CUDA events and inspect final outputs."""
     logger: trt.Logger = trt.Logger(trt.Logger.WARNING)
     runtime: trt.Runtime = trt.Runtime(logger)
@@ -291,7 +288,7 @@ def _benchmark_engine(
         onnx_sha256=sha256_file(model_path),
         engine_path=str(engine_path),
         engine_bytes=engine_path.stat().st_size,
-        precision=precision,
+        precision="fp16",
         batch_size=1,
         warmup_iterations=warmup_iterations,
         timed_iterations=iterations,
@@ -305,38 +302,7 @@ def _benchmark_engine(
         score_min=float(scores_n.min()),
         score_max=float(scores_n.max()),
     )
-    return result, {name: output.copy() for name, output in output_arrays.items()}
-
-
-def _compare_raco_outputs(
-    reference: dict[str, NDArray[Any]], candidate: dict[str, NDArray[Any]]
-) -> dict[str, float | int]:
-    """Compare an FP8 RaCo output to FP16 using nearest pixel coordinates."""
-    reference_keypoints: KeypointsN2 = reference["keypoints"]
-    candidate_keypoints: KeypointsN2 = candidate["keypoints"]
-    scale_xy: NDArray[np.float32] = np.asarray([1920.0 / 2.0, 1200.0 / 2.0], dtype=np.float32)
-    differences_mnr: NDArray[np.float32] = (
-        candidate_keypoints[:, None, :] - reference_keypoints[None, :, :]
-    ) * scale_xy
-    squared_distances_mn: NDArray[np.float32] = np.sum(differences_mnr**2, axis=2)
-    nearest_indices_m: NDArray[np.int64] = np.argmin(squared_distances_mn, axis=1)
-    nearest_distances_m: NDArray[np.float32] = np.sqrt(
-        squared_distances_mn[np.arange(len(candidate_keypoints)), nearest_indices_m]
-    )
-    aligned_reference_descriptors: DescriptorsND = reference["descriptors"][nearest_indices_m]
-    descriptor_cosines_m: ScoresN = np.sum(
-        aligned_reference_descriptors * candidate["descriptors"], axis=1
-    )
-    within_one_pixel_m: NDArray[np.bool_] = nearest_distances_m <= 1.0
-    matched_cosines_m: ScoresN = descriptor_cosines_m[within_one_pixel_m]
-    return {
-        "nearest_keypoint_distance_median_pixels": float(np.median(nearest_distances_m)),
-        "keypoints_within_one_pixel": int(np.count_nonzero(within_one_pixel_m)),
-        "keypoint_overlap_within_one_pixel_fraction": float(np.mean(within_one_pixel_m)),
-        "descriptor_cosine_median_for_one_pixel_matches": (
-            float(np.median(matched_cosines_m)) if len(matched_cosines_m) else float("nan")
-        ),
-    }
+    return result
 
 
 def main(config: BenchmarkConfig) -> None:
@@ -346,28 +312,23 @@ def main(config: BenchmarkConfig) -> None:
     images_bchw: ImagesBCHW = np.stack(images)
     print(f"Loaded {len(image_paths)} images: {[str(path) for path in image_paths]}")
 
-    models: list[tuple[str, Path, str]] = [
-        ("baseline_fp16", config.baseline, "fp16"),
-        ("raco_fp16", config.optimized, "fp16"),
+    models: list[tuple[str, Path]] = [
+        ("baseline_fp16", config.baseline),
+        ("raco_fp16", config.optimized),
     ]
-    if config.fp8 is not None:
-        models.append(("raco_fp8", config.fp8, "fp8_qdq_with_fp16_fallback"))
 
     results: list[ModelResult] = []
-    output_snapshots: dict[str, dict[str, NDArray[Any]]] = {}
-    for label, model_path, precision in models:
+    for label, model_path in models:
         engine_path: Path = _build_engine(model_path, config.engine_dir, label, config.workspace_gib)
-        result, output_snapshot = _benchmark_engine(
+        result: ModelResult = _benchmark_engine(
             label,
             model_path,
             engine_path,
             images_bchw,
             config.warmup_iterations,
             config.iterations,
-            precision,
         )
         results.append(result)
-        output_snapshots[label] = output_snapshot
         print(
             f"[{label}] median={result.median_ms:.3f} ms, "
             f"throughput={result.images_per_second:.2f} images/s, "
@@ -379,10 +340,6 @@ def main(config: BenchmarkConfig) -> None:
         "images": [str(path) for path in image_paths],
         "results": [asdict(result) for result in results],
     }
-    if "raco_fp8" in output_snapshots:
-        payload["raco_fp8_vs_fp16"] = _compare_raco_outputs(
-            output_snapshots["raco_fp16"], output_snapshots["raco_fp8"]
-        )
     config.output.parent.mkdir(parents=True, exist_ok=True)
     config.output.write_text(json.dumps(payload, indent=2) + "\n")
     print(f"Wrote {config.output}")

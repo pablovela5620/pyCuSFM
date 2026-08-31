@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from itertools import batched
 from pathlib import Path
-from typing import Any, Literal, Self, TypeAlias, cast
+from typing import Any, Self, TypeAlias, cast
 
 import cv2
 import numpy as np
@@ -56,8 +56,6 @@ class ExtractConfig:
     """Batch-dynamic RaCo-ALIKED ONNX graph. Not committed (data/cusfm_models is
     gitignored); produce it with `pixi run -e raco raco-export
     --batched-extractor-path data/cusfm_models/raco-aliked-b1-16.onnx`."""
-    precision: Literal["fp16", "fp8_qdq_with_fp16_fallback"] = "fp16"
-    """TensorRT precision policy; FP8 comes from Q/DQ nodes and permits FP16 fallback."""
     descriptor_set_path: Path = REPO_ROOT / "data" / "cusfm_schema" / "cusfm_protos.fdset"
     """FileDescriptorSet holding cuSFM's own protobuf schema.
 
@@ -324,7 +322,7 @@ def prepare_metadata_collection(
 
 
 def build_fp16_engine(config: ExtractConfig) -> Path:
-    """Build or reuse a content-addressed TensorRT engine for the selected policy."""
+    """Build or reuse a content-addressed FP16 TensorRT engine."""
     if not config.onnx_path.is_file():
         raise FileNotFoundError(config.onnx_path)
     if not (
@@ -336,7 +334,7 @@ def build_fp16_engine(config: ExtractConfig) -> Path:
     digest: str = sha256_file(config.onnx_path)
     config.engine_dir.mkdir(parents=True, exist_ok=True)
     engine_path: Path = config.engine_dir / (
-        f"raco-aliked-{digest[:16]}-trt-{trt.__version__}-{config.precision}-"
+        f"raco-aliked-{digest[:16]}-trt-{trt.__version__}-fp16-"
         f"b{config.minimum_batch_size}-{config.optimal_batch_size}-{config.maximum_batch_size}-"
         f"o{config.builder_optimization_level}.engine"
     )
@@ -387,10 +385,6 @@ def build_fp16_engine(config: ExtractConfig) -> Path:
     builder_config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, config.workspace_gib << 30)
     builder_config.profiling_verbosity = trt.ProfilingVerbosity.DETAILED
     builder_config.set_flag(trt.BuilderFlag.FP16)
-    if config.precision == "fp8_qdq_with_fp16_fallback":
-        if not hasattr(trt.BuilderFlag, "PREFER_PRECISION_CONSTRAINTS"):
-            raise RuntimeError("TensorRT cannot preserve the FP8 Q/DQ precision constraints")
-        builder_config.set_flag(trt.BuilderFlag.PREFER_PRECISION_CONSTRAINTS)
     if not 0 <= config.builder_optimization_level <= 5:
         raise ValueError("TensorRT builder optimization level must be in [0, 5]")
     builder_config.builder_optimization_level = config.builder_optimization_level
@@ -404,7 +398,7 @@ def build_fp16_engine(config: ExtractConfig) -> Path:
         profile.set_shape("image", minimum_shape, optimal_shape, maximum_shape)
         builder_config.add_optimization_profile(profile)
     print(
-        f"[engine] building TensorRT {trt.__version__} policy={config.precision} "
+        f"[engine] building TensorRT {trt.__version__} FP16 "
         + (
             f"profile {minimum_shape} / {optimal_shape} / {maximum_shape}"
             if dynamic_input
@@ -822,7 +816,7 @@ def run_benchmark(
         "engine_path": str(engine_path),
         "engine_bytes": engine_path.stat().st_size,
         "tensorrt_version": trt.__version__,
-        "precision": config.precision,
+        "precision": "fp16",
         "images": [str(frame.task.image_path) for frame in prepared],
         "results": [asdict(result) for result in results],
     }
@@ -891,7 +885,7 @@ def run_extraction(
         "onnx_sha256": sha256_file(config.onnx_path),
         "engine_path": str(engine_path),
         "engine_bytes": engine_path.stat().st_size,
-        "precision": config.precision,
+        "precision": "fp16",
         "batch_size": config.batch_size,
         "total_keyframes": len(tasks),
         "existing_keyframes": completed_before_start,
