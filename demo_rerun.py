@@ -1736,10 +1736,12 @@ def log_video_references(sequence: PreparedSequence, source_rig: int, target_rig
     frames are geometrically valid on both rigs because nothing is rectified:
     both log the raw fisheye under a ``Pinhole`` with distortion coefficients.
 
-    One reference per source sample, on the same timeline as the stream. A single
-    static reference is *not* used: measured on 0.37.1, it resolved to a different
-    frame than the stream at the same cursor, whereas per-frame references track
-    it exactly.
+    One reference per source sample, on the same timeline as the stream. Measured
+    on 0.37.1: a ``VideoFrameReference`` into a stream shows the frame at the
+    reference's *own* ``timestamp``, not at the viewer cursor -- a single static
+    reference therefore pins one frame forever (and ``0`` clamps to the first
+    sample). Per-sample references whose timestamps equal the stream's are what
+    make the reference follow the cursor.
 
     Returns the number of references logged.
     """

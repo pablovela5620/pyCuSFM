@@ -316,11 +316,16 @@ free: `log_video_references` puts `VideoFrameReference` columns under
 `rig_01/cam_NN/pinhole/video` pointing at `rig_00`'s streams — 72,436 references cost 0.3 MB
 (306.74 -> 307.05 MB), pixel-verified identical frames on both rigs at the same cursor.
 
-Two gotchas: (1) a single *static* reference (`nanoseconds=0`) rendered a **different**
-frame than the stream at the same cursor on 0.37.1 — use one reference per source sample on
-the stream's timeline, which tracks exactly; (2) the viewer opens on `log_time`, where the
-video has no data, so validation screenshots need the time cursor moved onto `video_time`
-(viewer MCP `set_time`) or they are black. Nothing here is rectified — raw fisheye under a
+Three gotchas, isolated with a five-pane A/B (stream; static ts=0; static ts=MID;
+temporal-at-MID ts=0; per-sample columns) at two cursor positions:
+(1) a stream reference shows the frame at the **reference's own timestamp**, not the viewer
+cursor — `static` is irrelevant; ts=MID stays pinned on MID at every cursor, and ts=0 clamps
+to the first sample. Only per-sample references with the stream's timestamps follow the
+cursor, which is what `log_video_references` logs. (2) Even those showed a late frame after a
+*backward* seek (correct after forward seeks) — plausibly a decoder-seek issue in 0.37.1 for
+reference-driven decoding; worth reporting upstream. (3) The viewer opens on `log_time`,
+where the video has no data, so validation screenshots need the cursor moved onto
+`video_time` (viewer MCP `set_time`) or they are black. Nothing here is rectified — raw fisheye under a
 `Pinhole` with distortion coefficients — so the same frames are valid on both rigs.
 
 ## Gotchas found
