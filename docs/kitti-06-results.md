@@ -629,3 +629,46 @@ reprojection error (0.582 against the 0.500 ceiling that 1.1x the blob's 0.454 s
 at 363.5 s and 0.736 m. RaCo native + Ceres (203.2 s, 0.878 m) is the middle point. The
 RaCo descriptor gap to the blob's ALIKED (0.878/0.937 against 0.736) remains the open
 accuracy question; CASPAR does not change it.
+
+
+## 11. Mixing the backends under CASPAR
+
+Section 10 put CASPAR under RaCo and paid 0.06 m against Ceres. Two more runs, same
+flags as section 10 with only the two `--*-backend` values changed, ask where the
+remaining gap to the TensorRT run's 0.736 m lives: in the RaCo descriptors, or in the
+LightGlue+ matcher. Both matching engines take 128-dim descriptors, so the mix runs
+mechanically; the caveat is that the blob's LightGlue was trained on stock ALIKED
+descriptors and RaCo's come from a different network. ATE from one `evaluate_kitti`
+invocation over all six rows (`data/bench/kitti_06_mix_ate.json`).
+
+| Run (all `--loop-closure --match-cap-mode fixed`) | extraction (s) | matching (s) | loop stage (s) | mapping (s) | total (s) | points | reprojection (px) | Sim(3) RMSE (m) | SE(3) RMSE (m) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| TensorRT features + TensorRT matching, Ceres (§8) | 62.2 | 25.2 | 62.3 | 209.9 | 363.5 | 174 319 | 0.534 | 0.736 | 1.111 |
+| **TensorRT features + TensorRT matching, CASPAR + polish** | 55.9 | 21.3 | 47.2 | 62.3 | **189.7** | 175 271 | 0.542 | **0.732** | **1.105** |
+| RaCo features + RaCo matching, Ceres (§10) | 10.1 | 21.8 | 50.8 | 117.6 | 203.2 | 133 784 | 0.580 | 0.878 | 1.423 |
+| RaCo features + RaCo matching, CASPAR + polish (§10) | 9.7 | 20.2 | 47.0 | 63.0 | 142.8 | 134 884 | 0.582 | 0.937 | 1.461 |
+| RaCo features + TensorRT matching, CASPAR + polish | 9.6 | 21.6 | 47.3 | 65.7 | 147.0 | 146 176 | 0.705 | 0.826 | 1.372 |
+
+**The blob's own engines with CASPAR are the best run of the study on accuracy, and
+close to the fastest.** 0.732 m Sim(3) and 1.105 m SE(3) both edge the Ceres run
+(0.736 / 1.111), so on this backend CASPAR plus one Ceres round costs nothing; the
+0.06 m penalty in section 10 is a RaCo-specific interaction, not a property of the GPU
+solver. Total wall clock is 189.7 s, 1.9x faster than the same features under Ceres and
+8.4x faster than the blob, with the mapping stage falling from 209.9 s to 62.3 s on a
+175 271-point map. The remaining 56 s of extraction is the fixed-shape engine stretching
+1226x370 frames to 1920x1200; that stage alone is the whole gap to the RaCo runs.
+
+**The gap is in RaCo's descriptors, and partly in its matcher.** Feeding RaCo's
+descriptors to the blob's LightGlue improves the trajectory from 0.937 to 0.826 m Sim(3)
+at the same speed (147.0 s), while raising the mean reprojection error from 0.582 to
+0.705 px and the point count from 134 884 to 146 176: the mismatched matcher accepts
+noisier correspondences, and the mapper gets more of them, which on this sequence helps
+the trajectory and hurts the per-point fit. That reads as LightGlue+ being too selective
+for the SfM use rather than as the blob's matcher being a good fit for RaCo descriptors.
+Either way, RaCo descriptors under either matcher stay 0.09 to 0.2 m short of the blob's
+ALIKED.
+
+**Recommendation on KITTI 06.** TensorRT features and matching with `--ba-backend caspar`:
+189.7 s at 0.732 m, both bounds better than any earlier run except pure wall clock. RaCo
+buys 47 s more, at 0.1 to 0.2 m. Every row here fails the blob's 0.500 px reprojection
+ceiling and passes the other three acceptance bounds.
