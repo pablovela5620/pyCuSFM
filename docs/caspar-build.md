@@ -708,3 +708,106 @@ remaining explanations cleanly:
 
 Either way, do not spend more on CASPAR's solver: the sweep above shows that
 budget buys nothing.
+
+## § Ceres polish experiment
+
+The experiment the section above asked for, run: take the finished CASPAR fp32
+KITTI 06 model, hand it to Ceres for **one** global bundle adjustment with
+colsfm's own settings — `data/kitti/config`'s Cauchy loss at scale 4.0, 200
+iterations, `SPARSE_SCHUR`, extrinsics and intrinsics fixed, and the single
+constant rig frame `run_mapping` picks (the frame owning the lowest registered
+image id, frame 1 here) — and then stop. No re-triangulation, no merge, no
+complete, no filter: 2156 images, 97 224 points and 709 950 observations go in
+and the same ones come out, so everything below is the solve's doing.
+
+```bash
+pixi run -e colsfm python -m tools.audit.caspar_polish --label caspar-polish
+pixi run -e colsfm python -m tools.audit.caspar_polish --label ceres-polish \
+    --sparse-dir /tmp/colsfm_runs/kitti/cap500_loops/cusfm/sparse \
+    --output-dir data/kitti/06_colsfm_loops_polish/cusfm
+pixi run -e colsfm python -m tools.kitti.evaluate_kitti --sequence-dir data/kitti/06 \
+    --trajectories caspar <...>/06_colsfm_caspar/cusfm/output_poses/merged_pose_file.tum \
+                   caspar-polished <...>/06_colsfm_caspar_polish/cusfm/output_poses/merged_pose_file.tum \
+                   ceres /tmp/colsfm_runs/kitti/cap500_loops/cusfm/output_poses/merged_pose_file.tum \
+                   ceres-polished <...>/06_colsfm_loops_polish/cusfm/output_poses/merged_pose_file.tum
+```
+
+`tools/audit/caspar_polish.py` re-exports the polished model the way the pipeline
+does — `sparse/`, `kpmap/keyframes/frames_meta.json` off the source run's own
+collection as the template, and the TUM trajectories — so the scoring is
+`evaluate_kitti` exactly as §8 of `docs/kitti-06-results.md` runs it, against
+`data/kitti/06/poses_gt_06.txt`, from the cuVSLAM-SLAM initialisation, 1078 of
+1078 rig poses matched.
+
+| Model | Sim(3) RMSE (m) | SE(3) RMSE (m) | mean reproj (px) | Ceres iters | initial cost | final cost | cost cut | solve (s) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| CASPAR fp32, as the mapper left it | 1.299 | 1.601 | 0.7147 | — | — | — | — | — |
+| **CASPAR + one Ceres BA (Cauchy)** | **0.890** | **1.117** | 0.6924 | 22 | 3.3279e5 | 3.2115e5 | 3.50 % | 18.2 |
+| CASPAR + one Ceres BA (TRIVIAL, ablation) | 0.903 | 1.115 | 0.7050 | 18 | 3.9627e5 | 3.8720e5 | 2.29 % | 12.7 |
+| Ceres cap 500 + loops (the baseline) | 0.895 | 1.118 | 0.6741 | — | — | — | — | — |
+| Ceres + one Ceres BA (the control) | 0.895 | 1.118 | 0.6741 | 1 | 2.9909e5 | 2.9909e5 | 0.00 % | 2.0 |
+
+What the polish moved, in the model's own frame:
+
+| Model | rig displacement RMSE (m) | max (m) | residual after a Sim(3) fit, RMSE (m) | max (m) | fitted scale |
+|---|---:|---:|---:|---:|---:|
+| CASPAR + Ceres BA | 2.381 | 5.302 | 0.927 | 2.184 | 0.99810 |
+| Ceres + Ceres BA (control) | 2.5e-14 | 3.3e-13 | 2.5e-14 | 3.3e-13 | 1.000000 |
+
+**The control is exact.** Ceres' own model is a fixed point of Ceres: one
+iteration, no cost change at all, and the rig moves 25 femtometres. The
+instrument does not manufacture motion, so every number in the CASPAR row is
+CASPAR's.
+
+**ATE snaps back.** 1.299 m to **0.890 m** Sim(3) and 1.601 m to **1.117 m**
+SE(3) — the Ceres baseline, 0.895 m and 1.118 m, to within 5 mm. One solve, 18 s,
+recovers the whole 0.4 m gap. CASPAR and Ceres are in the same basin, the
+correspondences CASPAR mapped with are the ones Ceres wants, and round 0's 25 px
+gate did not decide anything: had the tracks parted, no amount of solving on
+CASPAR's own observation set could have reached Ceres' score, and it reaches it
+exactly.
+
+**But it is not gauge freedom either.** The gauge hypothesis of the section above
+predicted that Ceres would agree on the cost and only disagree on the point; it
+does not agree on the cost. From CASPAR's answer Ceres finds another 3.50 % of
+Cauchy cost (2.29 % of plain least squares, which is the objective CASPAR
+actually minimises) and 0.022 px of reprojection error, and it does so in 22
+iterations from a `CONVERGENCE` start. CASPAR's stopping point is not a
+stationary point of its own objective. The displacement confirms the reading: of
+the 2.381 m rms the rig moves, a Sim(3) fit absorbs the part that is pure gauge
+and **0.927 m rms of shape change survives it** — and Sim(3)-aligned ATE only
+sees that surviving part, which is why the score moves.
+
+**The TRIVIAL ablation kills the last alternative.** Polishing under `TRIVIAL`
+— the objective with no robust loss, the one CASPAR itself solves — lands at
+0.903 m, statistically the Cauchy polish's 0.890 m. So the recovery is not the
+Cauchy reweighting doing something CASPAR could not do; it is plain optimisation
+that CASPAR left on the table.
+
+**This re-reads the sweep's own evidence.** §"Where the gap is actually made"
+measured CASPAR as 0.007 px behind Ceres on the TRIVIAL objective and concluded
+the objectives agreed. The polish moves CASPAR by 0.0097 px on that same
+objective and 0.409 m on the ground: at 1078 frames over 1.2 km, one hundredth of
+a pixel of residual suboptimality *is* 0.4 m of trajectory. A cost gap of 2 % is
+not a rounding difference on this problem, and "CASPAR minimises the same
+objective to within 1 %" was never evidence that it lands in the same place.
+
+### What to do with this
+
+1. **Ship the polish.** `--ba-backend caspar` plus one Ceres global BA is 31.5 s
+   of mapping + 18 s of polish against the Ceres mapper's 148.5 s, at 0.890 m
+   against 0.895 m. That is the accuracy of Ceres at 1/3 of its bundle-adjustment
+   time, and it needs no CASPAR change at all. Worth wiring into `run_mapping` as
+   a final round on the Ceres backend when `ba_backend == "caspar"`.
+2. **Do not spend the effort on more gauge constraints.** Two constant frames or
+   a scale prior would remove the 2.4 m of gauge motion the polish also produces,
+   but the ATE is measured after a Sim(3) fit, which already removes it; the
+   0.927 m that the fit cannot absorb came from solving further, not from
+   anchoring differently.
+3. **If CASPAR itself is to be fixed, the target is now specific.** It is not the
+   iteration budget (the sweep bought nothing with 176 s), it is that
+   `CONVERGED_DIAG_EXIT` — the damping blow-up — fires while 2 % of the cost is
+   still reachable, and CASPAR has no gradient, step or function tolerance to fire
+   instead. The test is one line of instrumentation: log the gradient norm at
+   CASPAR's exit on this model, and compare it against the norm at Ceres'
+   converged point.
