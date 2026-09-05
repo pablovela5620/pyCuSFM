@@ -11,7 +11,7 @@ pyyaml = "*"
 pillow = "*"
 setuptools = "<78"
 # ── Rerun demo side (demo_rerun.py) ──
-rerun-sdk = ">=0.33"
+# rerun-sdk comes from PyPI (below): 0.37.1 is not on conda-forge yet (0.37.0 is).
 numpy = "*"
 scipy = "*"
 av = "*"
@@ -32,6 +32,9 @@ libcusolver = "*"
 [pypi-dependencies]
 pycusfm = { path = ".", editable = true }
 tensorrt-cu13 = "==10.13.3.9.post1"
+# Pinned exact: conda-forge lags PyPI for rerun (0.37.0 vs 0.37.1 at pin time), and the
+# viewer that validates must be >= the SDK that wrote the data, so the pin is deliberate.
+rerun-sdk = "==0.37.1"
 # simplecv supplies RerunTyroConfig, the camera dataclasses, and the exoego:v2
 # rig logger. It is taken from the monorepo (public) rather than the standalone
 # pablovela5620/simplecv, which predates rerun_rig_logger.py / rig.py.
