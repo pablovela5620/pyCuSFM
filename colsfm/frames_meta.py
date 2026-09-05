@@ -266,6 +266,31 @@ class FramesMeta:
             ].number
         return parse_message(message)
 
+    def with_extrinsics(self, vehicle_T_cam_by_camera_params_id: Mapping[int, pycolmap.Rigid3d]) -> FramesMeta:
+        """Replace rig extrinsics, keeping every other field byte-identical.
+
+        This is what `keypoints_mapper_main --optimize_extrinsics=True` writes back:
+        the same collection with each camera's
+        `sensor_meta_data.sensor_to_vehicle_transform` swapped
+        (keypoints_mapper_main.md §6.3). Cameras missing from the mapping keep
+        their original extrinsic; `camera_to_world` is **not** re-derived here, so a
+        caller refining extrinsics passes the matching poses to
+        `with_camera_to_world` as well.
+
+        Args:
+            vehicle_T_cam_by_camera_params_id: New `vehicle_T_cam` per `camera_params_id`.
+
+        Returns:
+            A new `FramesMeta`.
+        """
+        message: Message = copy.deepcopy(self.message)
+        for camera_params_id, camera_sensor in message.camera_params_id_to_camera_params.items():
+            pose: pycolmap.Rigid3d | None = vehicle_T_cam_by_camera_params_id.get(int(camera_params_id))
+            if pose is None:
+                continue
+            _write_rigid_transform(camera_sensor.sensor_meta_data.sensor_to_vehicle_transform, pose)
+        return parse_message(message)
+
     def filtered(
         self,
         keyframe_ids: Sequence[int] | set[int],

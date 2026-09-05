@@ -15,18 +15,34 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pycolmap
 import pytest
 from serde.json import from_json
 
+from colsfm.benchmark import rig_rigidity_spread_millimeters
 from colsfm.export import RUNTIME_CSV_NAME, RuntimeRecord, read_runtime_records
-from colsfm.pipeline import STAGE_NAMES, PipelineOptions, PipelineSummary, run_pipeline
+from colsfm.frames_meta import FramesMeta, read_frames_meta
+from colsfm.pipeline import (
+    STAGE_NAMES,
+    ExtrinsicChange,
+    PipelineOptions,
+    PipelineSummary,
+    run_pipeline,
+    stage_names,
+)
 
 SMOKE_MIN_INTER_FRAME_DISTANCE_M: float = 0.5
 """`feature_extractor_main`'s own default gate; keeps 34 of Galileo's 226 keyframes."""
 
 MIN_REGISTERED_IMAGES: int = 30
 """Of the 34 selected keyframes, at least this many must end up registered."""
+
+RIG_RIGIDITY_TOLERANCE_MM: float = 1e-6
+"""How far the eight cameras of one rig instant may disagree on `world_T_vehicle`.
+
+Pure algebra once the export is self-consistent: every pose is derived from the
+same rig, so the only spread is float rounding."""
 
 MIN_OBSERVING_FRACTION: float = 0.7
 """Fraction of the selected keyframes that must observe at least one point.
@@ -113,3 +129,117 @@ def test_the_pose_graph_stage_writes_a_pose_per_rig_frame(galileo_run: PipelineS
     lines: list[str] = (galileo_run.output_dir / "pose_graph" / "vehicle_pose.tum").read_text().splitlines()
     assert len(lines) == galileo_run.num_rig_frames
     assert all(len(line.split()) == 8 for line in lines)
+
+
+# ── `--optimize-extrinsics`: the blob's second mapping pass ──────────────────────────
+
+
+@pytest.fixture(scope="module")
+def galileo_refined_run(repo_root: Path, tmp_path_factory: pytest.TempPathFactory) -> PipelineSummary:
+    """The same smoke run with `--optimize-extrinsics`, into its own workspace.
+
+    Args:
+        repo_root: Repository root, from the shared conftest.
+        tmp_path_factory: pytest's per-module temporary directory factory.
+
+    Returns:
+        The summary the run produced.
+    """
+    input_dir: Path = repo_root / "data" / "r2b_galileo"
+    if not (input_dir / "frames_meta.json").is_file():
+        pytest.skip(f"missing {input_dir / 'frames_meta.json'}")
+    options: PipelineOptions = PipelineOptions(
+        input_dir=input_dir,
+        output_dir=tmp_path_factory.mktemp("galileo_colsfm_ext"),
+        min_inter_frame_distance=SMOKE_MIN_INTER_FRAME_DISTANCE_M,
+        optimize_extrinsics=True,
+    )
+    return run_pipeline(options)
+
+
+def test_the_refined_run_records_a_second_mapping_pass(galileo_refined_run: PipelineSummary) -> None:
+    """`runtime.csv` gains one row, `extrinsic_refinement`, between mapping and export."""
+    expected: list[str] = list(stage_names(optimize_extrinsics=True))
+    assert expected == [*STAGE_NAMES[:-1], "extrinsic_refinement", "export"]
+    records: list[RuntimeRecord] = read_runtime_records(galileo_refined_run.output_dir / RUNTIME_CSV_NAME)
+    assert [record.command for record in records] == expected
+    assert list(galileo_refined_run.stage_seconds) == expected
+
+
+def test_the_refinement_moves_the_extrinsics_and_says_by_how_much(galileo_refined_run: PipelineSummary) -> None:
+    """`summary.json` carries one movement record per camera, and they are not all zero."""
+    assert galileo_refined_run.optimize_extrinsics is True
+    changes: tuple[ExtrinsicChange, ...] = galileo_refined_run.extrinsic_changes
+    assert len(changes) > 1
+    print(
+        "[colsfm] galileo smoke refinement: "
+        + ", ".join(
+            f"{change.sensor_name}={change.translation_change_mm:.2f} mm/{change.rotation_change_deg:.3f} deg"
+            for change in changes
+        )
+    )
+    references: list[ExtrinsicChange] = [change for change in changes if change.is_reference]
+    assert len(references) == 1, "exactly one camera is the rig origin"
+    assert references[0].translation_change_mm == pytest.approx(0.0, abs=1e-9)
+    assert references[0].rotation_change_deg == pytest.approx(0.0, abs=1e-9)
+    moved: list[ExtrinsicChange] = [change for change in changes if not change.is_reference]
+    assert all(change.translation_change_mm > 0.0 for change in moved), "every free extrinsic moved"
+
+
+def test_the_refined_extrinsics_reach_the_exported_metadata(galileo_refined_run: PipelineSummary) -> None:
+    """`kpmap/keyframes/frames_meta.json` carries the refined `sensor_to_vehicle_transform`.
+
+    Read back through `colsfm.frames_meta` rather than out of the summary, so
+    this is the file a downstream consumer would see.
+    """
+    exported: FramesMeta = read_frames_meta(
+        galileo_refined_run.output_dir / "kpmap" / "keyframes" / "frames_meta.json"
+    )
+    source: FramesMeta = read_frames_meta(galileo_refined_run.output_dir / "pose_graph" / "frames_meta.json")
+    by_camera_params_id: dict[int, ExtrinsicChange] = {
+        change.camera_params_id: change for change in galileo_refined_run.extrinsic_changes
+    }
+    for camera_params_id, camera in exported.cameras.items():
+        written_mm: float = (
+            float(
+                np.linalg.norm(
+                    np.asarray(camera.vehicle_T_cam.translation)
+                    - np.asarray(source.cameras[camera_params_id].vehicle_T_cam.translation)
+                )
+            )
+            * 1e3
+        )
+        assert written_mm == pytest.approx(by_camera_params_id[camera_params_id].translation_change_mm, abs=1e-9)
+
+
+def test_the_exported_camera_poses_agree_with_the_refined_extrinsics(
+    galileo_refined_run: PipelineSummary,
+) -> None:
+    """`camera_to_world` and `sensor_to_vehicle_transform` in the export describe one rig.
+
+    Every camera of a `synced_sample_id` must imply the same `world_T_vehicle`;
+    if the export wrote refined extrinsics next to poses derived from the input
+    ones, that spread would open up.
+    """
+    exported: FramesMeta = read_frames_meta(
+        galileo_refined_run.output_dir / "kpmap" / "keyframes" / "frames_meta.json"
+    )
+    spread_mm: float = rig_rigidity_spread_millimeters(exported)
+    print(f"[colsfm] galileo smoke refinement: rig rigidity spread {spread_mm:.4f} mm")
+    assert spread_mm < RIG_RIGIDITY_TOLERANCE_MM
+
+
+def test_the_refined_summary_round_trips_through_pyserde(galileo_refined_run: PipelineSummary) -> None:
+    """The nested `ExtrinsicChange` records survive `summary.json` and come back."""
+    restored: PipelineSummary = from_json(
+        PipelineSummary, (galileo_refined_run.output_dir / "summary.json").read_text()
+    )
+    assert restored == galileo_refined_run
+    assert restored.extrinsic_changes == galileo_refined_run.extrinsic_changes
+
+
+def test_a_run_without_the_flag_records_nothing_about_extrinsics(galileo_run: PipelineSummary) -> None:
+    """With the flag off the summary and the stage list are exactly what they were."""
+    assert galileo_run.optimize_extrinsics is False
+    assert galileo_run.extrinsic_changes == ()
+    assert stage_names(optimize_extrinsics=False) == STAGE_NAMES

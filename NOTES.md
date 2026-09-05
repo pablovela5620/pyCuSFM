@@ -539,7 +539,7 @@ shipped configs, and A/B re-runs of the real binaries. `colsfm/` implements the 
 | 2 | **No clean room** | The repo is Apache 2.0 and the binaries carry no separate EULA. Reading the disassembly directly is allowed, so one worker both reads the blob and writes the port. A clean-room split would double the cost and buy nothing. |
 | 3 | **pycolmap-native `ALIKED_N16ROT` + LightGlue, not the TensorRT engines** | COLMAP 4.2 ships `FeatureExtractorType.ALIKED_N16ROT` and `FeatureMatcherType.ALIKED_LIGHTGLUE` as ONNX and downloads the graphs itself into `~/.cache/colmap/`. The blob's `aliked.onnx` carries a 32-channel SDDH offset convolution, so `M = 16`, the ALIKED-n16 architecture; `ALIKED_N16ROT` is the closest COLMAP variant. A thin typed driver replaces a TensorRT runner and its engine cache. The weights are trained with rotation augmentation, so descriptors are not the blob's bit for bit. The plan never asked for that. |
 | 4 | **Pose graph on pyceres with a Python cost** | pycolmap has no pose-graph optimiser: `pycolmap.PoseGraph` is a container with no `optimize`, and `PoseGraphEdge` carries no information matrix. `pycolmap.cost_functions` advertises `RelativePosePriorCost` and friends, but every factory raises `TypeError: Unregistered type` against the standalone `pyceres`, because conda-forge's pycolmap embeds a cut-down pyceres in its own pybind11 registry. The cost functions cannot cross into pyceres, so the residual is written in Python. Measured on 1000 nodes: pyceres converges in 24.6 s (cost 9.563 to 4.704e-06), scipy `least_squares` does not converge and was killed after 40 minutes. The sparse Cholesky solve is 40 ms of that 24.6 s, so all the headroom sits in the residual. |
-| 5 | **One pose per rig frame, vehicle body as reference sensor** | cuSFM's `VEHICLE_RIG` mode carries one pose per `synced_sample_id` in the vehicle FLU frame. COLMAP forces a rig's reference sensor to identity (`rig.h:200 Check failed: sensor_id != ref_sensor_id_`), so no camera can be the reference without moving the rig origin onto it. The vehicle body is registered as `sensor_t(SensorType.IMU, 0)` and owns no images. Triangulation, `ObservationManager` and `create_default_bundle_adjuster` all accept that. The two models then compare pose to pose with no change of basis. |
+| 5 | **One pose per rig frame, vehicle body as reference sensor — except when refining extrinsics** | cuSFM's `VEHICLE_RIG` mode carries one pose per `synced_sample_id` in the vehicle FLU frame. COLMAP forces a rig's reference sensor to identity (`rig.h:200 Check failed: sensor_id != ref_sensor_id_`), so no camera can be the reference without moving the rig origin onto it. The vehicle body is registered as `sensor_t(SensorType.IMU, 0)` and owns no images. Triangulation, `ObservationManager` and `create_default_bundle_adjuster` all accept that, and the two models then compare pose to pose with no change of basis. **But that rig cannot have its extrinsics refined** (gotcha 13), so `build_reconstruction(..., reference_camera_params_id=...)` puts the rig origin on the gauge camera for the `--optimize-extrinsics` pass, and `RigReference` owns the one place the change of basis is inverted. |
 | 6 | **`loss_function_scale = 4.0`** | cuSFM divides the reprojection residual by `reprojection_error_standard_deviation = 4.0 px` and then applies `CauchyLoss(1.0)`. COLMAP does not whiten. `CauchyLoss(a)` is `a^2 log(1 + s/a^2)`, so evaluating it at `s/sigma^2` with `a = 1` equals evaluating it at `s` with `a = sigma`, up to a constant that cannot move the minimum. Setting the scale to sigma reproduces the blob's robustifier without touching the residual. |
 | 7 | **A 500-match spatial cap in place of the blob's SSC NMS** | The blob thins each pair to a spatially uniform top 500 using the LightGlue score as the keypoint response. pycolmap exposes no per-match score: `Database.read_matches` and `FeatureMatcher.match` both return bare `uint32[m, 2]` index pairs. `subsample_matches_by_coverage` lays a grid of about `match_top_k` cells over image 0 and keeps one match per occupied cell, after verification, so every survivor is an inlier of the same RANSAC. Measured over the 331 Galileo pairs: uncapped 1300 matches per pair, 1.80 px, 5.39 mm ATE; capped 156 matches per pair, 1.33 px, 4.32 mm; the blob 430 matches, 1.55 px, 5.00 mm. The cap also takes bundle adjustment from 27.7 s to 2.8 s. |
 | 8 | **Relative acceptance bounds, not absolute ones** | The first bounds were absolute: registered >= 220, ATE <= 5 mm, reprojection <= 1.7 px. The ATE and reprojection figures came from the older NOTES table above (3.9 mm, 1.54 px), measured by the demo. When `colsfm.benchmark` measures the blob itself it gets **5.00 mm** and **1.550 px**. So the absolute 5 mm bound told the port to beat the binary it reproduces, and would have failed a bit-perfect clone. Absolute figures also break on a new machine or a re-run of A. Every bound is now a ratio against run A as this harness measures it. |
@@ -683,7 +683,35 @@ revisits, turn it on.
    COLMAP's own default.
 8. **No BoW artifacts.** Nothing downstream reads the word ids, the tree, the IDF values or the
    file formats, so `colsfm.retrieval` keeps only the ranked candidate list.
-9. **The LightGlue score threshold is 0.1, not 0.3.** The blob's 0.3 is calibrated for its own
+9. **Extrinsic refinement is unregularised, and it shows.** cuSFM regularises its second
+   `keypoints_mapper_main` pass with absolute-extrinsic priors (the paper's Eq. 14, 8
+   `absolute_extrinsic` blocks on Galileo) and relative-extrinsic constraints between
+   cameras (Eq. 6, 777 `relative_extrinsic` blocks), so its refined extrinsics stay near the
+   factory calibration. pycolmap's `BundleAdjuster` can express neither, and its Ceres
+   problem cannot be extended from standalone pyceres (the registry split, decision 4), so
+   colsfm optimises reprojection alone. Measured on the 226-keyframe Galileo run, relative
+   extrinsics `cam0_T_cam_i` against `data/r2b_galileo/frames_meta.json`:
+
+   | | blob | colsfm | cosine of the two shift directions |
+   |---|---|---|---|
+   | worst translation | 10.9 mm | **234.5 mm** | |
+   | worst rotation | 1.40 deg | **2.55 deg** | |
+   | `back_stereo_camera_right` | 1.6 mm | 9.3 mm | -0.91 |
+   | `front_stereo_camera_left` | 10.9 mm | 68.0 mm | -0.49 |
+   | `left_stereo_camera_left` | 1.7 mm | 234.5 mm | +0.12 |
+   | `right_stereo_camera_right` | 1.1 mm | 116.3 mm | +0.98 |
+
+   The two disagree in direction as well as in size: no camera's shift is both large and
+   aligned. What the free extrinsics buy is reprojection error, 1.331 px down to **0.861 px**;
+   what they cost is trajectory accuracy, ATE against ground truth 4.33 mm up to **5.70 mm**,
+   which is the only acceptance bound the refined run fails. On Galileo's 0.66 m sweep only a
+   stereo pair's own relative extrinsic is well determined — the reference camera's partner
+   moves 4.4 mm, the six cameras facing other directions 64 to 127 mm — and at the 34-keyframe
+   spacing, with a third of the observations, the front pair walks **2.17 m**. The flag stays
+   and stays off by default. The follow-up is a pyceres refinement pass carrying the
+   configuration's own extrinsic priors
+   (`data/cusfm_configs/loop-closure-fixed/vision_mapping_config.pb.txt`, spec §7).
+10. **The LightGlue score threshold is 0.1, not 0.3.** The blob's 0.3 is calibrated for its own
    engine. Against COLMAP's graph, 0.3 makes the low-texture `left_stereo_*` pairs collapse:
    22 of 331 Galileo pairs come back empty (6.6 %) against the blob's 8 (2.4 %).
 
@@ -746,7 +774,26 @@ revisits, turn it on.
     the session). The shipped Galileo sequence lasts **0.933 s** end to end, so the fixed gate
     kills everything and only the ratio gate (0.075 s, about two rig frames) is live.
     `LoopClosureDiagnostics.min_time_gap_seconds` reports which gap was applied.
-12. **Brute-force retrieval collapses at 4528 images.** The cost is
+13. **`refine_sensor_from_rig = True` is a silent no-op on a rig whose reference sensor owns
+    no images.** COLMAP's `ParameterizeRigsAndFrames`
+    (`src/colmap/estimators/bundle_adjustment_ceres.cc`) ends with "Set the rig poses as
+    constant, if the reference sensor is not part of the problem. Otherwise, the relative
+    pose between the sensors is not well constrained", and calls
+    `SetParameterBlockConstant` on **every** non-reference `sensor_from_rig` of such a rig.
+    colsfm's vehicle-body reference (`sensor_t(IMU, 0)`, decision 5) is never among the
+    parameterised sensors, so `--optimize-extrinsics` did nothing at all: a 20 mm
+    perturbation of camera 1's extrinsic came out of five bundle-adjustment rounds having
+    moved **0.0000 mm**. Nothing warns; the solve converges and the reprojection error
+    improves, because the poses and points absorb the error. COLMAP's own rig documentation
+    (<https://colmap.github.io/rigs.html>) describes the supported shape — "one camera would
+    be defined as the reference sensor and have an identity `sensor_from_rig` pose, whereas
+    the second camera would be posed relative to the reference camera" — so
+    `build_reconstruction` now takes a `reference_camera_params_id`, and `run_mapping`
+    raises rather than accepting a refinement request it cannot honour. With the rig origin
+    on the gauge camera the same 20 mm perturbation comes back to **0.70 mm / 0.0024 deg**.
+    The pycolmap probe suite missed this because its synthetic rig already has a camera
+    reference.
+14. **Brute-force retrieval collapses at 4528 images.** The cost is
     `(n_images * n_descriptors)^2 * 128` inner products, so `max_total_descriptors` divides a
     fixed budget across the images. Galileo's 226 images get 256 descriptors each and the
     retrieval works (9.4 s). RoboCap's 4528 images get 22 each, the largest off-diagonal score
@@ -774,7 +821,7 @@ Both tasks call `python -m colsfm run`, which takes the same `--input-dir` as
 --no-use-gpu                   # force the ONNX CPU provider
 --max-matches-per-pair 500     # verified matches kept per pair; None keeps every inlier
 --ba-num-threads 1             # a bit-reproducible Ceres solve
---optimize-extrinsics          # refine sensor_from_rig during bundle adjustment
+--optimize-extrinsics          # second mapping pass with sensor_from_rig free (deviation 9)
 ```
 
 `python -m colsfm stage --stage pair_selection` runs a metadata-only stage. It needs neither

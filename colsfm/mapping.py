@@ -28,6 +28,27 @@ Two cuSFM behaviours are known defects and are left out (§9.5):
    carrying depth. pycolmap's bundle adjuster is 2-D only, and Galileo sets
    `keypoint_feature_has_depth: false`.
 
+## Extrinsic refinement is real but unregularised
+
+`optimize_extrinsics` needs a **camera-referenced** rig; on the default
+vehicle-referenced one COLMAP freezes every `sensor_from_rig` and the refinement
+is a silent no-op, so `run_mapping` raises instead (see `colsfm.reconstruction`).
+Given one, it does refine: a 20 mm perturbation of a Galileo camera comes back to
+0.70 mm.
+
+What it cannot reproduce is cuSFM's **regularisation**. The blob's refinement
+pass adds absolute-extrinsic priors (the paper's Eq. 14, one block per camera)
+and relative-extrinsic constraints between cameras (Eq. 6, 777 blocks on
+Galileo), both with sigmas from `vision_mapping_config.pb.txt` (§7).
+`pycolmap.BundleAdjustmentOptions` exposes neither, and the Ceres problem
+`create_default_bundle_adjuster` builds cannot be extended from standalone
+pyceres (the pybind11 registry split, pycolmap-capabilities.md §8). colsfm
+therefore optimises reprojection alone, and on Galileo that trades trajectory
+accuracy for pixels: 0.861 px against 1.334 px, but 5.70 mm ATE against 4.33 mm,
+with extrinsics moving up to 234 mm where the blob moves 11 mm. Only a stereo
+pair's own relative extrinsic is well determined by a 0.66 m sweep. The flag is
+off by default; NOTES.md deviation 9 carries the table.
+
 ## Overrides forced on pycolmap, and why
 
 | Setting | pycolmap default | Here | Reason |
@@ -39,7 +60,7 @@ Two cuSFM behaviours are known defects and are left out (§9.5):
 | `refine_focal_length` | True | False | `--optimize_intrinsics=false` |
 | `refine_extra_params` | True | False | same |
 | `refine_principal_point` | False | False | same; already off |
-| `refine_sensor_from_rig` | True | `MappingOptions.optimize_extrinsics` (False) | `--optimize_extrinsics=false` |
+| `refine_sensor_from_rig` | True | `MappingOptions.optimize_extrinsics` (False) | `--optimize_extrinsics=false`; needs a camera-referenced rig, see below |
 | `ceres.loss_function_type` | TRIVIAL | `loss_type` (CAUCHY) | config §3.2 |
 | `ceres.loss_function_scale` | 1.0 | `sigma * loss_function_scale` (4.0) | see below |
 | `ceres.auto_select_solver_type` | True | False | otherwise the explicit solver choice is ignored |
@@ -109,6 +130,7 @@ from jaxtyping import Bool, Float64
 from numpy import ndarray
 
 from colsfm.config import BundleAdjustmentConfig, LossFunctionType, VisionMappingConfig
+from colsfm.reconstruction import RIG_ID, RigReference, camera_sensor_id
 
 LinearSolver: TypeAlias = Literal["SPARSE_SCHUR", "SPARSE_NORMAL_CHOLESKY"]
 """The two linear solvers cuSFM uses: SPARSE_SCHUR on the CPU, the other on the cuDSS path."""
@@ -254,6 +276,10 @@ class MappingResult:
     """Time spent inside `BundleAdjuster.solve`, summed over the rounds."""
     total_seconds: float
     """Wall-clock seconds for the whole call."""
+    refined_extrinsics: dict[int, pycolmap.Rigid3d] | None = None
+    """`vehicle_T_cam` per `camera_params_id` after the solve, or None when
+    `optimize_extrinsics` was off. The reference camera's entry is the input one
+    exactly: it is the rig origin, so bundle adjustment holds no block for it."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -630,7 +656,7 @@ def _solve(
     reconstruction: pycolmap.Reconstruction,
     ba_options: pycolmap.BundleAdjustmentOptions,
     gauge_frame_id: int,
-    options: MappingOptions,
+    fixed_camera_params_id: int | None,
 ) -> tuple[pycolmap.BundleAdjustmentSummary, float]:
     """Run one global bundle adjustment over every registered image.
 
@@ -643,7 +669,10 @@ def _solve(
         reconstruction: The model to adjust, in place.
         ba_options: Solver and refinement options.
         gauge_frame_id: Frame whose `rig_from_world` stays constant.
-        options: Command-line style knobs.
+        fixed_camera_params_id: Camera whose `sensor_from_rig` stays constant while
+            the others are refined, or None to leave every extrinsic as the options
+            say. Ignored when it names the rig's reference sensor, which COLMAP
+            already fixes to identity.
 
     Returns:
         The solver summary and the seconds the solve took.
@@ -652,10 +681,10 @@ def _solve(
     for image_id in _registered_image_ids(reconstruction):
         config.add_image(image_id)
     config.set_constant_rig_from_world_pose(gauge_frame_id)
-    if options.optimize_extrinsics and options.fixed_camera_params_id is not None:
-        config.set_constant_sensor_from_rig_pose(
-            pycolmap.sensor_t(pycolmap.SensorType.CAMERA, options.fixed_camera_params_id)
-        )
+    if fixed_camera_params_id is not None:
+        fixed_sensor: pycolmap.sensor_t = camera_sensor_id(fixed_camera_params_id)
+        if not reconstruction.rig(RIG_ID).is_ref_sensor(fixed_sensor):
+            config.set_constant_sensor_from_rig_pose(fixed_sensor)
     adjuster: pycolmap.BundleAdjuster = pycolmap.create_default_bundle_adjuster(ba_options, config, reconstruction)
     started: float = time.perf_counter()
     summary: pycolmap.BundleAdjustmentSummary = adjuster.solve()
@@ -697,6 +726,43 @@ def _images_with_observations(reconstruction: pycolmap.Reconstruction) -> int:
     return sum(1 for image in reconstruction.images.values() if image.num_points3D > 0)
 
 
+def _check_extrinsics_are_refinable(
+    reconstruction: pycolmap.Reconstruction, rig_reference: RigReference | None
+) -> None:
+    """Refuse an extrinsic refinement COLMAP would silently turn into a no-op.
+
+    COLMAP's `ParameterizeRigsAndFrames` fixes every non-reference
+    `sensor_from_rig` of a rig whose reference sensor is not itself among the
+    parameterised sensors — "otherwise, the relative pose between the sensors is
+    not well constrained". A vehicle-body reference owns no images, so it never
+    is, and `refine_sensor_from_rig = True` then moves nothing at all.
+
+    Args:
+        reconstruction: The model about to be adjusted.
+        rig_reference: How its rig was built, or None.
+
+    Raises:
+        ValueError: When the rig's reference sensor is not a camera, or when the
+            caller gave no `rig_reference` to invert the bookkeeping with.
+    """
+    reference_sensor: pycolmap.sensor_t = reconstruction.rig(RIG_ID).ref_sensor_id
+    if reference_sensor.type != pycolmap.SensorType.CAMERA:
+        raise ValueError(
+            "Cannot refine rig extrinsics: this rig's reference sensor is "
+            f"{reference_sensor}, which owns no images. COLMAP holds every "
+            "`sensor_from_rig` constant when the reference sensor is not part of the "
+            "problem, so the refinement would be a silent no-op. Build the "
+            "reconstruction with `build_reconstruction(..., reference_camera_params_id=...)` "
+            "to put the rig origin on a camera."
+        )
+    if rig_reference is None:
+        raise ValueError(
+            "Cannot refine rig extrinsics without a `rig_reference`: the input "
+            "`vehicle_T_cam_ref` is what turns the adjusted `sensor_from_rig` "
+            "transforms back into `sensor_to_vehicle_transform`."
+        )
+
+
 def run_mapping(
     reconstruction: pycolmap.Reconstruction,
     database_path: Path,
@@ -704,6 +770,7 @@ def run_mapping(
     ba_config: BundleAdjustmentConfig,
     options: MappingOptions | None = None,
     gauge_frame_id: int | None = None,
+    rig_reference: RigReference | None = None,
 ) -> MappingResult:
     """Triangulate and bundle-adjust, cuSFM's `keypoints_mapper_main` §5.3-§5.6.
 
@@ -729,14 +796,21 @@ def run_mapping(
         options: Command-line style knobs; the defaults when None.
         gauge_frame_id: Frame held constant for gauge; the frame owning the
             lowest image id when None, which is cuSFM's own choice (§6.3).
+        rig_reference: How the reconstruction's rig was built, from
+            `colsfm.reconstruction.rig_reference`. Required when
+            `options.optimize_extrinsics` is set, because the input
+            `vehicle_T_cam_ref` it carries is the only way back from the adjusted
+            `sensor_from_rig` transforms to `sensor_to_vehicle_transform`.
 
     Returns:
-        The adjusted reconstruction with per-round statistics and timings.
+        The adjusted reconstruction with per-round statistics and timings, plus
+        `refined_extrinsics` when extrinsics were refined.
 
     Raises:
         FileNotFoundError: When the database does not exist.
         ValueError: When the database and the reconstruction disagree on image
-            ids, or when no frame is registered.
+            ids, when no frame is registered, or when extrinsic refinement is
+            asked for on a rig COLMAP would silently freeze.
     """
     resolved_options: MappingOptions = MappingOptions() if options is None else options
     started: float = time.perf_counter()
@@ -746,6 +820,16 @@ def run_mapping(
     resolved_gauge_frame_id: int = (
         reconstruction.image(min(image_ids)).frame_id if gauge_frame_id is None else gauge_frame_id
     )
+    fixed_camera_params_id: int | None = None
+    if resolved_options.optimize_extrinsics:
+        _check_extrinsics_are_refinable(reconstruction, rig_reference)
+        # cuSFM's constant keyframe is the lowest id in the map (§6.3), and
+        # `--fixed_camera_name` pins that keyframe's camera when extrinsics move.
+        fixed_camera_params_id = (
+            reconstruction.image(min(image_ids)).camera_id
+            if resolved_options.fixed_camera_params_id is None
+            else resolved_options.fixed_camera_params_id
+        )
 
     correspondence_started: float = time.perf_counter()
     correspondences: Correspondences = load_correspondences(
@@ -788,7 +872,7 @@ def run_mapping(
             (num_merged + num_completed + filtered.total()) / num_observations if num_observations else 0.0
         )
 
-        summary, solve_seconds = _solve(reconstruction, ba_options, resolved_gauge_frame_id, resolved_options)
+        summary, solve_seconds = _solve(reconstruction, ba_options, resolved_gauge_frame_id, fixed_camera_params_id)
         bundle_adjustment_seconds += solve_seconds
         # The guards run on both sides of the solve. Before it, so Ceres never linearises a
         # NaN; after it, because a *converged* solve can still walk a weakly-constrained
@@ -844,4 +928,9 @@ def run_mapping(
         triangulation_seconds=triangulation_seconds,
         bundle_adjustment_seconds=bundle_adjustment_seconds,
         total_seconds=time.perf_counter() - started,
+        refined_extrinsics=(
+            rig_reference.vehicle_T_cam_by_camera_params_id(reconstruction)
+            if resolved_options.optimize_extrinsics and rig_reference is not None
+            else None
+        ),
     )

@@ -112,6 +112,15 @@ reimplemented on pyceres with a Python residual and matches the blob's archived 
 Galileo run to 0.28 mm. Retrieval has two backends and the vocabulary tree recovers all 90
 of the blob's RoboCap loop pairs.
 
+`--optimize-extrinsics` runs the blob's second `keypoints_mapper_main` pass — the same
+matches and the same pose-graph poses again, with `sensor_from_rig` free — and writes the
+refined `sensor_to_vehicle_transform` into `kpmap/keyframes/frames_meta.json` and into
+`summary.json`. It is measured (`data/bench/galileo_ext_compare.md`) and **off by default**:
+without cuSFM's absolute and relative extrinsic priors, which pycolmap's bundle adjuster
+cannot express, it trades trajectory accuracy for reprojection error — 0.861 px against
+1.334 px, but 5.70 mm ATE against 4.33 mm, and extrinsics moving 234 mm where the blob moves
+11 mm. See NOTES.md, colsfm deviation 9.
+
 **Acceptance, Galileo** (`data/bench/galileo_compare.md`), B relative to A:
 
 | Check | Bound | Value | Result |
@@ -138,7 +147,16 @@ blob's 334.10 mm.
 2. **Matching is about 3x the blob.** 3.63x on Galileo (8.15 s against 2.25 s) and 2.89x on
    RoboCap (152.03 s against 52.53 s). It is the only stage that is slower, and it is now the
    largest single term in a colsfm run.
-3. **RoboCap with loop closure: measured.** With the rig-resection estimator (74 edges),
+3. **Extrinsic priors for the refinement pass.** `--optimize-extrinsics` now really moves the
+   rig extrinsics (it was a silent no-op; NOTES.md gotcha 13), but only reprojection
+   constrains them. cuSFM adds absolute-extrinsic residuals (paper Eq. 14) and
+   relative-extrinsic constraints between cameras (Eq. 6), whose sigmas are in
+   `data/cusfm_configs/loop-closure-fixed/vision_mapping_config.pb.txt`. pycolmap's
+   `BundleAdjuster` takes neither and its Ceres problem cannot be extended from standalone
+   pyceres, so this needs a pyceres refinement pass in the shape of `colsfm.pose_graph`:
+   read the adjusted model out of pycolmap, solve extrinsics and rig poses against the
+   reprojection residual plus the two priors, write them back.
+4. **RoboCap with loop closure: measured.** With the rig-resection estimator (74 edges),
    colsfm's disagreement with the input trajectory drops from 461 mm to 313 mm (blob: 334 mm)
    and its rig poses land 146 mm RMSE from the blob's, at 1.52x the blob's runtime. Loop
    closure stays off by default; the estimator's rotation gap (item 1) and the loop stage's

@@ -5,7 +5,7 @@ the images the triangulator and the bundle adjuster then work on
 (keypoints_mapper_main.md §9.1). No triangulation happens here — see
 `colsfm.mapping`.
 
-## The rig frame is the vehicle, not a camera
+## Two reference sensors, and which one each job needs
 
 cuSFM's `VEHICLE_RIG` mode carries one pose per rig instant (`synced_sample_id`)
 in the **vehicle** FLU frame, plus one shared `sensor_to_vehicle_transform` per
@@ -16,17 +16,42 @@ metadata's `vehicle_T_cam` — and a `Frame` per rig instant whose
 
 COLMAP forces the rig's **reference** sensor to identity
 (`rig.h:200 Check failed: sensor_id != ref_sensor_id_`), so no camera can be the
-reference without moving the rig origin onto that camera. The vehicle body is
-therefore registered as a non-camera reference sensor,
-`sensor_t(SensorType.IMU, 0)`, which owns no data. Measured: triangulation,
-`ObservationManager` and `create_default_bundle_adjuster` all accept a rig whose
-reference sensor has no images.
+reference without moving the rig origin onto that camera. With
+`reference_camera_params_id=None` the vehicle body is therefore registered as a
+non-camera reference sensor, `sensor_t(SensorType.IMU, 0)`, which owns no data.
+Measured: triangulation, `ObservationManager` and
+`create_default_bundle_adjuster` all accept a rig whose reference sensor has no
+images, and `frame.rig_from_world` is then literally `vehicle_T_world`, which
+keeps every comparison against cuSFM's vehicle poses a direct one.
 
-The alternative — making the lowest-id keyframe's camera the reference and
-folding the extrinsic into every other sensor — gives the same bundle adjustment
-problem up to a fixed change of basis, but then `frame.rig_from_world` is a
-camera pose and every comparison against cuSFM's vehicle poses needs an extra
-composition. The vehicle rig keeps the two models directly comparable.
+**That rig cannot have its extrinsics refined.** COLMAP's
+`ParameterizeRigsAndFrames` (`estimators/bundle_adjustment_ceres.cc`) ends with
+"Set the rig poses as constant, if the reference sensor is not part of the
+problem. Otherwise, the relative pose between the sensors is not well
+constrained": for every rig whose reference sensor is absent from the
+parameterised sensors it calls `SetParameterBlockConstant` on **every**
+non-reference `sensor_from_rig`. A data-less IMU reference is never
+parameterised, so `refine_sensor_from_rig = True` silently does nothing — a
+20 mm perturbation of one camera survives bundle adjustment untouched
+(NOTES.md's colsfm gotchas). COLMAP's own rig documentation
+(<https://colmap.github.io/rigs.html>) describes the intended shape: "one camera
+would be defined as the reference sensor and have an identity `sensor_from_rig`
+pose, whereas the second camera would be posed relative to the reference
+camera", refined through `--Mapper.ba_refine_sensor_from_rig`.
+
+Passing a `reference_camera_params_id` therefore builds exactly that rig:
+
+```
+sensor_from_rig(cam_i) = cam_i_T_cam_ref = cam_i_T_vehicle * vehicle_T_cam_ref
+frame.rig_from_world   = cam_ref_T_world = cam_ref_T_vehicle * vehicle_T_world
+```
+
+Every `cam_T_world` is unchanged — it is the same problem under a fixed change
+of basis — but the reference camera is now a real, parameterised sensor, so the
+other seven extrinsics move. `RigReference` owns the inverse bookkeeping: given
+the adjusted reconstruction and the input `vehicle_T_cam_ref` (which bundle
+adjustment never sees, and which the mapper's fixed camera holds still), it
+returns `vehicle_T_cam` per camera and `world_T_vehicle` per frame.
 
 ## Identifiers are cuSFM's own, verbatim
 
@@ -43,6 +68,7 @@ stages address the same images by id.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Final
 
 import pycolmap
@@ -78,27 +104,136 @@ def camera_sensor_id(camera_params_id: int) -> pycolmap.sensor_t:
     return pycolmap.sensor_t(pycolmap.SensorType.CAMERA, camera_params_id)
 
 
-def build_rig(frames_meta: FramesMeta) -> pycolmap.Rig:
-    """Build the vehicle rig: one sensor per `camera_params_id`, extrinsics inverted.
+@dataclass(frozen=True, slots=True)
+class RigReference:
+    """Which sensor the rig origin sits on, and the fixed bridge back to the vehicle.
+
+    Built by `rig_reference`; the inverse of what `build_rig` and
+    `build_reconstruction` do, and the only place that inversion is written.
+    """
+
+    camera_params_id: int | None
+    """Reference camera, or None when the vehicle body is the reference sensor."""
+    vehicle_T_reference: pycolmap.Rigid3d
+    """`vehicle_T_cam_ref` as the input metadata declared it; identity for the vehicle
+    reference. Bundle adjustment never holds a parameter block for it — the reference
+    sensor's `sensor_from_rig` is identity by construction — so it stays exactly as the
+    input had it and is what turns adjusted rig quantities back into vehicle-frame ones."""
+
+    def sensor_id(self) -> pycolmap.sensor_t:
+        """The rig's reference `sensor_t`.
+
+        Returns:
+            The reference camera's sensor id, or the vehicle body's.
+        """
+        return vehicle_sensor_id() if self.camera_params_id is None else camera_sensor_id(self.camera_params_id)
+
+    def sensor_from_rig(self, camera_params_id: int, reconstruction: pycolmap.Reconstruction) -> pycolmap.Rigid3d:
+        """One camera's `sensor_from_rig`, identity for the reference camera.
+
+        `Rig.sensor_from_rig` raises on the reference sensor rather than returning
+        the identity it is fixed to (`rig.h:200`), so that case is answered here.
+
+        Args:
+            camera_params_id: The camera to read.
+            reconstruction: The model holding the rig.
+
+        Returns:
+            `cam_T_rig` for that camera.
+        """
+        if camera_params_id == self.camera_params_id:
+            return pycolmap.Rigid3d()
+        return reconstruction.rig(RIG_ID).sensor_from_rig(camera_sensor_id(camera_params_id))
+
+    def vehicle_T_cam_by_camera_params_id(self, reconstruction: pycolmap.Reconstruction) -> dict[int, pycolmap.Rigid3d]:
+        """Read every camera's `sensor_to_vehicle_transform` back out of the rig.
+
+        `vehicle_T_cam_i = vehicle_T_cam_ref * cam_ref_T_cam_i`, which for the
+        vehicle reference degenerates to `sensor_from_rig(cam_i)^-1`.
+
+        Args:
+            reconstruction: The model, adjusted or not.
+
+        Returns:
+            `vehicle_T_cam` per `camera_params_id`.
+        """
+        return {
+            camera_params_id: self.vehicle_T_reference * self.sensor_from_rig(camera_params_id, reconstruction).inverse()
+            for camera_params_id in sorted(reconstruction.cameras)
+        }
+
+    def world_T_vehicle_by_frame_id(self, reconstruction: pycolmap.Reconstruction) -> dict[int, pycolmap.Rigid3d]:
+        """Read every rig frame's vehicle pose back out of the frames.
+
+        `world_T_vehicle = world_T_cam_ref * cam_ref_T_vehicle`, which for the
+        vehicle reference degenerates to `rig_from_world^-1`.
+
+        Args:
+            reconstruction: The model, adjusted or not.
+
+        Returns:
+            `world_T_vehicle` per `frame_id`, for every frame carrying a pose.
+        """
+        reference_T_vehicle: pycolmap.Rigid3d = self.vehicle_T_reference.inverse()
+        return {
+            frame_id: frame.rig_from_world.inverse() * reference_T_vehicle
+            for frame_id, frame in reconstruction.frames.items()
+            if frame.has_pose
+        }
+
+
+def rig_reference(frames_meta: FramesMeta, reference_camera_params_id: int | None = None) -> RigReference:
+    """Describe the rig origin a reconstruction built with the same argument uses.
+
+    Args:
+        frames_meta: The parsed metadata, for the reference camera's extrinsic.
+        reference_camera_params_id: Camera to put the rig origin on, or None for
+            the vehicle body.
+
+    Returns:
+        The reference and the fixed `vehicle_T_cam_ref` bridge.
+
+    Raises:
+        KeyError: When the metadata carries no such `camera_params_id`.
+    """
+    if reference_camera_params_id is None:
+        return RigReference(camera_params_id=None, vehicle_T_reference=pycolmap.Rigid3d())
+    return RigReference(
+        camera_params_id=reference_camera_params_id,
+        vehicle_T_reference=frames_meta.cameras[reference_camera_params_id].vehicle_T_cam,
+    )
+
+
+def build_rig(frames_meta: FramesMeta, reference_camera_params_id: int | None = None) -> pycolmap.Rig:
+    """Build the rig: one sensor per `camera_params_id`, posed against the reference.
 
     Args:
         frames_meta: The parsed metadata.
+        reference_camera_params_id: Camera to put the rig origin on, or None to
+            use the vehicle body (the module docstring says when each is wanted).
 
     Returns:
-        A rig whose reference sensor is the vehicle body and whose camera sensors
-        each carry `sensor_from_rig = cam_T_vehicle`.
+        A rig whose camera sensors each carry `sensor_from_rig = cam_T_cam_ref`,
+        which is `cam_T_vehicle` for the vehicle reference.
+
+    Raises:
+        KeyError: When the metadata carries no such `camera_params_id`.
     """
+    reference: RigReference = rig_reference(frames_meta, reference_camera_params_id)
     rig: pycolmap.Rig = pycolmap.Rig()
     rig.rig_id = RIG_ID
-    rig.add_ref_sensor(vehicle_sensor_id())
+    rig.add_ref_sensor(reference.sensor_id())
     for camera_params_id, camera in sorted(frames_meta.cameras.items()):
-        rig.add_sensor(camera_sensor_id(camera_params_id), camera.vehicle_T_cam.inverse())
+        if camera_params_id == reference_camera_params_id:
+            continue
+        rig.add_sensor(camera_sensor_id(camera_params_id), camera.vehicle_T_cam.inverse() * reference.vehicle_T_reference)
     return rig
 
 
 def build_reconstruction(
     frames_meta: FramesMeta,
     cameras: dict[int, pycolmap.Camera] | None = None,
+    reference_camera_params_id: int | None = None,
 ) -> pycolmap.Reconstruction:
     """Build a registered, pose-carrying reconstruction with no 3D points yet.
 
@@ -112,28 +247,35 @@ def build_reconstruction(
         frames_meta: The parsed `frames_meta.json`.
         cameras: COLMAP cameras keyed by `camera_params_id`; derived from the
             metadata by `colsfm.cameras.colmap_cameras` when None.
+        reference_camera_params_id: Camera to put the rig origin on, or None to
+            use the vehicle body. Extrinsic refinement needs a camera; every
+            other job wants the vehicle. See the module docstring.
 
     Returns:
         A reconstruction with one rig, one frame per `synced_sample_id` and one
-        image per keyframe, all frames registered.
+        image per keyframe, all frames registered. Every `cam_T_world` is the
+        same whichever reference was asked for.
 
     Raises:
-        KeyError: When a keyframe names a `camera_params_id` the cameras lack.
+        KeyError: When a keyframe names a `camera_params_id` the cameras lack,
+            or when the metadata carries no `reference_camera_params_id`.
     """
+    reference: RigReference = rig_reference(frames_meta, reference_camera_params_id)
+    reference_T_vehicle: pycolmap.Rigid3d = reference.vehicle_T_reference.inverse()
     reconstruction: pycolmap.Reconstruction = pycolmap.Reconstruction()
     resolved_cameras: dict[int, pycolmap.Camera] = colmap_cameras(frames_meta) if cameras is None else cameras
     for camera_params_id in sorted(resolved_cameras):
         camera: pycolmap.Camera = resolved_cameras[camera_params_id]
         camera.has_prior_focal_length = True
         reconstruction.add_camera(camera)
-    reconstruction.add_rig(build_rig(frames_meta))
+    reconstruction.add_rig(build_rig(frames_meta, reference_camera_params_id))
 
     keyframe_by_id = frames_meta.keyframe_by_id()
     for rig_frame in frames_meta.rig_frames():
         frame: pycolmap.Frame = pycolmap.Frame()
         frame.frame_id = rig_frame.synced_sample_id
         frame.rig_id = RIG_ID
-        frame.rig_from_world = rig_frame.world_T_vehicle.inverse()
+        frame.rig_from_world = reference_T_vehicle * rig_frame.world_T_vehicle.inverse()
         for keyframe_id in rig_frame.keyframe_ids:
             camera_params_id: int = keyframe_by_id[keyframe_id].camera_params_id
             frame.add_data_id(pycolmap.data_t(camera_sensor_id(camera_params_id), keyframe_id))
@@ -149,6 +291,30 @@ def build_reconstruction(
             image.frame_id = rig_frame.synced_sample_id
             reconstruction.add_image(image)
     return reconstruction
+
+
+def gauge_camera_params_id(frames_meta: FramesMeta) -> int:
+    """The camera cuSFM's constant keyframe belongs to.
+
+    cuSFM fixes one keyframe — in Galileo the lowest id in the map
+    (keypoints_mapper_main.md §6.3) — and when extrinsics are refined
+    `--fixed_camera_name` pins one camera's extrinsic as well. Using the same
+    camera for both, and for the rig origin, is what makes `vehicle_T_cam_ref`
+    an input constant the solve never touches, so `RigReference` can invert the
+    bookkeeping exactly.
+
+    Args:
+        frames_meta: The parsed metadata.
+
+    Returns:
+        The `camera_params_id` of the lowest keyframe id.
+
+    Raises:
+        ValueError: When the collection holds no keyframes.
+    """
+    if not frames_meta.keyframes:
+        raise ValueError("Cannot choose a gauge camera: the metadata holds no keyframes")
+    return min(frames_meta.keyframes, key=lambda keyframe: keyframe.keyframe_id).camera_params_id
 
 
 def gauge_rig_frame(frames_meta: FramesMeta) -> RigFrame:

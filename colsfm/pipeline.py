@@ -1,4 +1,4 @@
-"""The eight cuSFM stages wired into one run — `colsfm`'s `cusfm_runner.run_all`.
+"""The cuSFM stages wired into one run — `colsfm`'s `cusfm_runner.run_all`.
 
 ```
 frames_meta.json ─1─> keyframes/frames_meta.json
@@ -8,6 +8,7 @@ frames_meta.json ─1─> keyframes/frames_meta.json
                  ─5─> loop edges (optional; their pairs are matched into the same database)
                  ─6─> pose_graph/{frames_meta.json,vehicle_pose.tum}
                  ─7─> triangulation + bundle adjustment
+                 ─7b> the same again with the rig extrinsics free (--optimize-extrinsics)
                  ─8─> sparse/, kpmap/keyframes/frames_meta.json, output_poses/, summary.json
 ```
 
@@ -51,9 +52,10 @@ Ordering notes worth knowing before reading the code:
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import subprocess
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final, Literal, TypeAlias
@@ -79,14 +81,14 @@ from colsfm.export import (
     write_tum_file,
 )
 from colsfm.features import ExtractionReport, FeatureOptions, extract_features
-from colsfm.frames_meta import FramesMeta, KeyframeMeta, RigFrame, read_frames_meta, write_frames_meta
-from colsfm.geometry import TumPose
+from colsfm.frames_meta import CameraParams, FramesMeta, KeyframeMeta, RigFrame, read_frames_meta, write_frames_meta
+from colsfm.geometry import TumPose, relative_rotation_degrees
 from colsfm.keyframe_selection import KeyframeSelection, apply_selection, select_keyframes
 from colsfm.mapping import MappingOptions, MappingResult, run_mapping
 from colsfm.matching import BLOB_MATCH_TOP_K, MatchingOptions, MatchReport, match_pairs
 from colsfm.pairs import select_pairs
 from colsfm.pose_graph import PoseGraphEdge, PoseGraphResult, RigNode, sequential_edges, solve_pose_graph
-from colsfm.reconstruction import build_reconstruction
+from colsfm.reconstruction import RigReference, build_reconstruction, gauge_camera_params_id, rig_reference
 
 StageName: TypeAlias = Literal[
     "keyframe_selection",
@@ -96,9 +98,10 @@ StageName: TypeAlias = Literal[
     "loop_closure",
     "pose_graph",
     "reconstruction",
+    "extrinsic_refinement",
     "export",
 ]
-"""The eight stages, in the order `CusfmRunner.run_all` runs their blob equivalents."""
+"""The stages, in the order `CusfmRunner.run_all` runs their blob equivalents."""
 
 STAGE_NAMES: Final[tuple[StageName, ...]] = (
     "keyframe_selection",
@@ -110,7 +113,32 @@ STAGE_NAMES: Final[tuple[StageName, ...]] = (
     "reconstruction",
     "export",
 )
-"""Every stage a full run records, so `runtime.csv` has a fixed row count."""
+"""The stages every run records; `stage_names` adds the ninth for `--optimize-extrinsics`."""
+
+EXTRINSIC_REFINEMENT_STAGE: Final[StageName] = "extrinsic_refinement"
+"""The second mapping pass `--optimize-extrinsics` adds, mirroring the blob.
+
+`CusfmRunner` runs `keypoints_mapper_main` twice: once with the extrinsics fixed
+and once with `--optimize_extrinsics=True`, both over the same matches and the
+same `pose_graph/frames_meta.json` poses (`pycusfm/cusfm_runner.py`,
+`run_mapping` then `refine_extrinsics`). The second pass overwrites `kpmap/`."""
+
+
+def stage_names(optimize_extrinsics: bool) -> tuple[StageName, ...]:
+    """The stages a run will record, in order.
+
+    Args:
+        optimize_extrinsics: Whether the run makes the second mapping pass.
+
+    Returns:
+        `STAGE_NAMES`, with `extrinsic_refinement` inserted before `export` when
+        the flag is set.
+    """
+    if not optimize_extrinsics:
+        return STAGE_NAMES
+    index: int = STAGE_NAMES.index("export")
+    return STAGE_NAMES[:index] + (EXTRINSIC_REFINEMENT_STAGE,) + STAGE_NAMES[index:]
+
 
 CheapStageName: TypeAlias = Literal["keyframe_selection", "pair_selection"]
 """The stages the `stage` subcommand can run on their own: metadata only, no GPU."""
@@ -208,6 +236,23 @@ class PipelineOptions:
 
 @serde
 @dataclass(frozen=True, slots=True)
+class ExtrinsicChange:
+    """How far the refinement moved one camera's `sensor_to_vehicle_transform`."""
+
+    camera_params_id: int
+    """The camera, as `camera_params_id_to_camera_params` keys it."""
+    sensor_name: str
+    """The camera folder name, e.g. `front_stereo_camera_left`."""
+    translation_change_mm: float
+    """Distance between the input and refined extrinsic origins, in millimetres."""
+    rotation_change_deg: float
+    """Angle between the input and refined extrinsic rotations, in degrees."""
+    is_reference: bool
+    """Whether this is the rig origin and fixed camera, whose change is exactly zero."""
+
+
+@serde
+@dataclass(frozen=True, slots=True)
 class PipelineSummary:
     """`summary.json`: what one run produced and how long each stage took."""
 
@@ -253,6 +298,10 @@ class PipelineSummary:
     """Wall-clock seconds per stage, in stage order; the same rows as `runtime.csv`."""
     total_seconds: float
     """Wall-clock seconds for the whole run."""
+    optimize_extrinsics: bool = False
+    """Whether the run made the second, extrinsic-refining mapping pass."""
+    extrinsic_changes: tuple[ExtrinsicChange, ...] = ()
+    """Per-camera extrinsic movement the refinement produced; empty when the flag is off."""
 
 
 @dataclass(slots=True)
@@ -261,6 +310,8 @@ class StageClock:
 
     output_dir: Path
     """Workspace root holding `runtime.csv`."""
+    stages: tuple[StageName, ...] = STAGE_NAMES
+    """The stages this run will record, so the progress line counts the right total."""
     seconds_by_stage: dict[str, float] = field(default_factory=dict)
     """Wall-clock seconds per stage, in completion order."""
 
@@ -287,7 +338,7 @@ def timed_stage(clock: StageClock, stage: StageName) -> Iterator[None]:
         Nothing; the block runs inside the timing window.
     """
     started: float = time.perf_counter()
-    print(f"[colsfm] stage {STAGE_NAMES.index(stage) + 1}/{len(STAGE_NAMES)}: {stage}")
+    print(f"[colsfm] stage {clock.stages.index(stage) + 1}/{len(clock.stages)}: {stage}")
     try:
         yield
     finally:
@@ -415,6 +466,53 @@ def _largest_translation_change_m(nodes: Sequence[RigNode], world_T_rig_by_rig_i
         if node.rig_id in world_T_rig_by_rig_id
     ]
     return max(changes) if changes else 0.0
+
+
+def extrinsic_changes(
+    frames_meta: FramesMeta,
+    refined_by_camera_params_id: Mapping[int, pycolmap.Rigid3d],
+    reference_camera_params_id: int,
+) -> tuple[ExtrinsicChange, ...]:
+    """Measure what the refinement did to each camera's extrinsic.
+
+    Args:
+        frames_meta: The collection the refinement started from.
+        refined_by_camera_params_id: `vehicle_T_cam` per camera after the solve.
+        reference_camera_params_id: The rig origin, which is also the fixed camera.
+
+    Returns:
+        One record per camera, ordered by `camera_params_id`.
+    """
+    changes: list[ExtrinsicChange] = []
+    for camera_params_id in sorted(refined_by_camera_params_id):
+        camera: CameraParams = frames_meta.cameras[camera_params_id]
+        refined: pycolmap.Rigid3d = refined_by_camera_params_id[camera_params_id]
+        changes.append(
+            ExtrinsicChange(
+                camera_params_id=camera_params_id,
+                sensor_name=camera.sensor_name,
+                translation_change_mm=float(
+                    np.linalg.norm(np.asarray(refined.translation) - np.asarray(camera.vehicle_T_cam.translation))
+                )
+                * 1e3,
+                rotation_change_deg=relative_rotation_degrees(refined, camera.vehicle_T_cam),
+                is_reference=camera_params_id == reference_camera_params_id,
+            )
+        )
+    return tuple(changes)
+
+
+def _print_mapping(mapping: MappingResult) -> None:
+    """Print one mapping pass's headline counts.
+
+    Args:
+        mapping: What `run_mapping` returned.
+    """
+    print(
+        f"[colsfm] mapping: {mapping.num_images_with_observations}/{mapping.num_registered_images} images with points, "
+        f"{mapping.num_points3D} points, {mapping.mean_reprojection_error_px:.4f} px, "
+        f"track {mapping.mean_track_length:.3f}"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -567,7 +665,7 @@ def run_pipeline(options: PipelineOptions) -> PipelineSummary:
     options.output_dir.mkdir(parents=True, exist_ok=True)
     runtime_csv: Path = options.output_dir / RUNTIME_CSV_NAME
     runtime_csv.unlink(missing_ok=True)
-    clock: StageClock = StageClock(output_dir=options.output_dir)
+    clock: StageClock = StageClock(output_dir=options.output_dir, stages=stage_names(options.optimize_extrinsics))
 
     config: CusfmConfig = read_config_directory(
         options.config_dir,
@@ -664,33 +762,61 @@ def run_pipeline(options: PipelineOptions) -> PipelineSummary:
         _write_vehicle_pose_file(pose_graph_dir / VEHICLE_POSE_TUM_NAME, nodes, world_T_rig_by_rig_id)
         pose_graph_change_m: float = _largest_translation_change_m(nodes, world_T_rig_by_rig_id)
 
+    mapping_options: MappingOptions = MappingOptions(
+        num_threads=options.ba_num_threads,
+        use_gpu=options.ba_use_gpu,
+        stop_on_observation_change=options.stop_on_observation_change,
+    )
+
     # ── 7. triangulation and bundle adjustment ───────────────────────────────────────
     with timed_stage(clock, "reconstruction"):
-        reconstruction: pycolmap.Reconstruction = build_reconstruction(pose_graph_meta)
         mapping: MappingResult = run_mapping(
-            reconstruction,
+            build_reconstruction(pose_graph_meta),
             options.database_path,
             config.vision_mapping,
             config.vision_mapping.bundle_adjustment,
-            MappingOptions(
-                optimize_extrinsics=options.optimize_extrinsics,
-                num_threads=options.ba_num_threads,
-                use_gpu=options.ba_use_gpu,
-                stop_on_observation_change=options.stop_on_observation_change,
-            ),
+            mapping_options,
         )
-        print(
-            f"[colsfm] mapping: {mapping.num_images_with_observations}/{mapping.num_registered_images} images with points, "
-            f"{mapping.num_points3D} points, {mapping.mean_reprojection_error_px:.4f} px, "
-            f"track {mapping.mean_track_length:.3f}"
-        )
+        _print_mapping(mapping)
+
+    # ── 7b. extrinsic refinement ─────────────────────────────────────────────────────
+    # The blob's second `keypoints_mapper_main` pass: the same matches and the same
+    # pose-graph poses again, this time with `--optimize_extrinsics=True`, overwriting
+    # `kpmap/` (`pycusfm.cusfm_runner.refine_extrinsics`). The rig origin moves onto the
+    # gauge camera because COLMAP freezes every extrinsic of a rig whose reference
+    # sensor owns no images — see `colsfm.reconstruction`.
+    mapped_meta: FramesMeta = pose_graph_meta
+    changes: tuple[ExtrinsicChange, ...] = ()
+    if options.optimize_extrinsics:
+        with timed_stage(clock, EXTRINSIC_REFINEMENT_STAGE):
+            reference_camera_params_id: int = gauge_camera_params_id(pose_graph_meta)
+            reference: RigReference = rig_reference(pose_graph_meta, reference_camera_params_id)
+            mapping = run_mapping(
+                build_reconstruction(pose_graph_meta, reference_camera_params_id=reference_camera_params_id),
+                options.database_path,
+                config.vision_mapping,
+                config.vision_mapping.bundle_adjustment,
+                dataclasses.replace(mapping_options, optimize_extrinsics=True),
+                rig_reference=reference,
+            )
+            assert mapping.refined_extrinsics is not None, "run_mapping returns them whenever it refines"
+            changes = extrinsic_changes(pose_graph_meta, mapping.refined_extrinsics, reference_camera_params_id)
+            mapped_meta = pose_graph_meta.with_extrinsics(mapping.refined_extrinsics)
+            _print_mapping(mapping)
+            print(
+                f"[colsfm] extrinsic refinement: rig origin on camera {reference_camera_params_id} "
+                f"({pose_graph_meta.cameras[reference_camera_params_id].sensor_name}), moves "
+                + ", ".join(f"{change.camera_params_id}={change.translation_change_mm:.2f} mm" for change in changes)
+            )
 
     # ── 8. export ────────────────────────────────────────────────────────────────────
     with timed_stage(clock, "export"):
         num_coloured: int = colour_points_from_images(mapping.reconstruction, options.input_dir, options.num_threads)
         print(f"[colsfm] export: coloured {num_coloured}/{mapping.num_points3D} points from the source imagery")
         write_colmap_model(options.output_dir, mapping.reconstruction)
-        optimised: FramesMeta = pose_graph_meta.with_camera_to_world(
+        # `camera_to_world` comes straight off the adjusted reconstruction, so it stays
+        # consistent with whatever extrinsics were just written next to it.
+        optimised: FramesMeta = mapped_meta.with_camera_to_world(
             optimised_camera_poses(mapping.reconstruction), "ALIGNMENT"
         )
         write_frames_meta(options.output_dir / KEYFRAME_METADATA_SUBPATH, optimised)
@@ -719,6 +845,8 @@ def run_pipeline(options: PipelineOptions) -> PipelineSummary:
         mean_track_length=mapping.mean_track_length,
         stage_seconds=dict(clock.seconds_by_stage),
         total_seconds=time.perf_counter() - started,
+        optimize_extrinsics=options.optimize_extrinsics,
+        extrinsic_changes=changes,
     )
     (options.output_dir / SUMMARY_NAME).write_text(to_json(summary) + "\n")
     print(

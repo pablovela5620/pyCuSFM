@@ -48,7 +48,15 @@ from colsfm.mapping import (
     projection_sanity_bound_px,
     run_mapping,
 )
-from colsfm.reconstruction import RIG_ID, build_reconstruction, camera_sensor_id, gauge_rig_frame
+from colsfm.reconstruction import (
+    RIG_ID,
+    RigReference,
+    build_reconstruction,
+    camera_sensor_id,
+    gauge_camera_params_id,
+    gauge_rig_frame,
+    rig_reference,
+)
 from colsfm.schema import KEYFRAMES_METADATA_COLLECTION, load_schema
 
 IMAGE_WIDTH: int = 640
@@ -1245,3 +1253,281 @@ def test_projection_failure_guard_is_a_no_op_on_a_healthy_model(
 
     assert filter_projection_failures(observation_manager, reconstruction) == 0
     assert reconstruction.compute_num_observations() == num_observations_before
+
+
+# ── extrinsic refinement (`--optimize_extrinsics`) ───────────────────────────────────
+
+WEAKLY_CONSTRAINED_MOVE_M: float = 0.03
+"""Above this an unregularised refinement is drifting, not correcting; see
+`test_the_unregularised_refinement_drifts_on_weakly_covisible_cameras`."""
+
+EXTRINSIC_PERTURBATION_M: float = 0.02
+"""20 mm of translation error the refinement has to remove."""
+
+EXTRINSIC_RECOVERY_M: float = 1e-3
+"""How close to the unperturbed refinement the perturbed one must land: 1 mm."""
+
+EXTRINSIC_RECOVERY_DEG: float = 0.05
+"""How close to the unperturbed refinement the perturbed one must land: 0.05 deg."""
+
+
+def _stereo_partner(frames_meta: FramesMeta, camera_params_id: int) -> int:
+    """The other camera of the declared stereo pair holding this one.
+
+    The refinement tests perturb the reference camera's stereo partner, because
+    that is the one relative extrinsic Galileo's imagery genuinely determines:
+    the pair shares a whole field of view, whereas two cameras facing different
+    ways are linked only through the trajectory.
+
+    Args:
+        frames_meta: The collection, for its `stereo_pair` list.
+        camera_params_id: One camera of a declared pair.
+
+    Returns:
+        The partner's `camera_params_id`.
+
+    Raises:
+        ValueError: When the camera is in no declared stereo pair.
+    """
+    for pair in frames_meta.stereo_pairs:
+        if pair.left_camera_params_id == camera_params_id:
+            return pair.right_camera_params_id
+        if pair.right_camera_params_id == camera_params_id:
+            return pair.left_camera_params_id
+    raise ValueError(f"camera {camera_params_id} is in no declared stereo pair")
+
+
+@pytest.fixture(scope="module")
+def galileo_pose_graph_meta(repo_root: Path) -> FramesMeta:
+    """The rig-exact 226-keyframe Galileo poses a colsfm run's pose-graph stage wrote."""
+    path: Path = repo_root / "data" / "cusfm_runs" / "galileo_colsfm" / "cusfm" / "pose_graph" / "frames_meta.json"
+    if not path.is_file():
+        pytest.skip(f"missing {path}")
+    return read_frames_meta(path)
+
+
+@pytest.fixture(scope="module")
+def galileo_colsfm_database(repo_root: Path) -> Path:
+    """The COLMAP database that same run's matching stage wrote."""
+    path: Path = repo_root / "data" / "cusfm_runs" / "galileo_colsfm" / "cusfm" / "database.db"
+    if not path.is_file():
+        pytest.skip(f"missing {path}")
+    return path
+
+
+def _perturbed_extrinsic(pose: pycolmap.Rigid3d, seed: int = 5) -> pycolmap.Rigid3d:
+    """Knock one extrinsic 20 mm and 0.5 deg off.
+
+    Args:
+        pose: The extrinsic to disturb.
+        seed: PRNG seed for the offset directions.
+
+    Returns:
+        The perturbed transform.
+    """
+    rng: np.random.Generator = np.random.default_rng(seed)
+    rotation_vector: Float64[ndarray, "3"] = rng.normal(0.0, 1.0, 3)
+    rotation_vector = rotation_vector / np.linalg.norm(rotation_vector) * np.deg2rad(PERTURBATION_DEG)
+    translation: Float64[ndarray, "3"] = rng.normal(0.0, 1.0, 3)
+    translation = translation / np.linalg.norm(translation) * EXTRINSIC_PERTURBATION_M
+    offset: pycolmap.Rigid3d = pycolmap.Rigid3d(
+        pycolmap.Rotation3d(Rotation.from_rotvec(rotation_vector).as_quat()), translation
+    )
+    return pose * offset
+
+
+@dataclass(frozen=True, slots=True)
+class ExtrinsicRuns:
+    """Three Galileo mappings that differ only in the start point and the flag."""
+
+    fixed: MappingResult
+    """Perturbed metadata, `optimize_extrinsics` off: the control that keeps the perturbation."""
+    refined: MappingResult
+    """Perturbed metadata, `optimize_extrinsics` on."""
+    refined_from_clean: MappingResult
+    """Unperturbed metadata, `optimize_extrinsics` on: where the refinement's own optimum is."""
+    perturbed_meta: FramesMeta
+    """The metadata the first two runs started from."""
+    reference_camera_params_id: int
+    """The rig origin, which is also the fixed camera."""
+    perturbed_camera_params_id: int
+    """The camera the first two runs started 20 mm and 0.5 deg off."""
+
+
+@pytest.fixture(scope="module")
+def extrinsic_runs(
+    galileo_pose_graph_meta: FramesMeta, galileo_colsfm_database: Path, isaac_config: CusfmConfig
+) -> ExtrinsicRuns:
+    """Map Galileo three times over the same matches; see `ExtrinsicRuns`.
+
+    Args:
+        galileo_pose_graph_meta: The rig-exact input poses.
+        galileo_colsfm_database: The matches every run reads.
+        isaac_config: The mapping configuration.
+
+    Returns:
+        The three results and what they started from.
+    """
+    mapping_config: VisionMappingConfig = isaac_config.vision_mapping
+    reference_camera_params_id: int = gauge_camera_params_id(galileo_pose_graph_meta)
+    perturbed_camera_params_id: int = _stereo_partner(galileo_pose_graph_meta, reference_camera_params_id)
+    perturbed_meta: FramesMeta = galileo_pose_graph_meta.with_extrinsics(
+        {perturbed_camera_params_id: _perturbed_extrinsic(
+            galileo_pose_graph_meta.cameras[perturbed_camera_params_id].vehicle_T_cam
+        )}
+    )
+
+    def _map(frames_meta: FramesMeta, optimize_extrinsics: bool) -> MappingResult:
+        reference: RigReference = rig_reference(frames_meta, reference_camera_params_id)
+        return run_mapping(
+            build_reconstruction(frames_meta, reference_camera_params_id=reference_camera_params_id),
+            galileo_colsfm_database,
+            mapping_config,
+            mapping_config.bundle_adjustment,
+            _quiet_options(optimize_extrinsics=optimize_extrinsics, num_threads=1),
+            rig_reference=reference,
+        )
+
+    return ExtrinsicRuns(
+        fixed=_map(perturbed_meta, False),
+        refined=_map(perturbed_meta, True),
+        refined_from_clean=_map(galileo_pose_graph_meta, True),
+        perturbed_meta=perturbed_meta,
+        reference_camera_params_id=reference_camera_params_id,
+        perturbed_camera_params_id=perturbed_camera_params_id,
+    )
+
+
+def test_refinement_removes_a_20_mm_extrinsic_perturbation(
+    extrinsic_runs: ExtrinsicRuns, galileo_pose_graph_meta: FramesMeta
+) -> None:
+    """Camera 1, knocked 20 mm and 0.5 deg off, lands where the clean refinement lands.
+
+    The unperturbed refinement is the reference rather than the input
+    calibration, because the refinement is **unregularised**: colsfm has no
+    equivalent of cuSFM's absolute and relative extrinsic priors (§7), so its
+    optimum sits a millimetre or two off the factory calibration even with
+    nothing perturbed. Landing on that optimum from 20 mm away is what proves the
+    perturbation was removed rather than merely reduced.
+
+    The fixed-extrinsics run over the same matches is the control: it keeps all
+    20 mm, which is the regression this whole change exists for.
+    """
+    truth: pycolmap.Rigid3d = galileo_pose_graph_meta.cameras[extrinsic_runs.perturbed_camera_params_id].vehicle_T_cam
+    started: pycolmap.Rigid3d = extrinsic_runs.perturbed_meta.cameras[extrinsic_runs.perturbed_camera_params_id].vehicle_T_cam
+    assert _pose_delta(started, truth)[0] == pytest.approx(EXTRINSIC_PERTURBATION_M, abs=1e-9)
+
+    assert extrinsic_runs.fixed.refined_extrinsics is None, "nothing is refined when the flag is off"
+    reference: RigReference = rig_reference(extrinsic_runs.perturbed_meta, extrinsic_runs.reference_camera_params_id)
+    kept: dict[int, pycolmap.Rigid3d] = reference.vehicle_T_cam_by_camera_params_id(
+        extrinsic_runs.fixed.reconstruction
+    )
+    assert _pose_delta(kept[extrinsic_runs.perturbed_camera_params_id], truth)[0] == pytest.approx(EXTRINSIC_PERTURBATION_M, abs=1e-9)
+
+    assert extrinsic_runs.refined.refined_extrinsics is not None
+    assert extrinsic_runs.refined_from_clean.refined_extrinsics is not None
+    recovered: pycolmap.Rigid3d = extrinsic_runs.refined.refined_extrinsics[extrinsic_runs.perturbed_camera_params_id]
+    clean: pycolmap.Rigid3d = extrinsic_runs.refined_from_clean.refined_extrinsics[extrinsic_runs.perturbed_camera_params_id]
+    translation_m, rotation_deg = _pose_delta(recovered, clean)
+    residual_m, residual_deg = _pose_delta(recovered, truth)
+    print(
+        f"[colsfm] extrinsic refinement: camera {extrinsic_runs.perturbed_camera_params_id} started "
+        f"{EXTRINSIC_PERTURBATION_M * 1e3:.1f} mm / {PERTURBATION_DEG} deg off, landed "
+        f"{translation_m * 1e3:.3f} mm / {rotation_deg:.4f} deg from the clean refinement and "
+        f"{residual_m * 1e3:.3f} mm / {residual_deg:.4f} deg from the calibration; reprojection "
+        f"{extrinsic_runs.fixed.mean_reprojection_error_px:.4f} -> "
+        f"{extrinsic_runs.refined.mean_reprojection_error_px:.4f} px"
+    )
+    assert translation_m < EXTRINSIC_RECOVERY_M
+    assert rotation_deg < EXTRINSIC_RECOVERY_DEG
+    assert residual_m < EXTRINSIC_PERTURBATION_M / 2.0
+    assert extrinsic_runs.refined.mean_reprojection_error_px <= extrinsic_runs.fixed.mean_reprojection_error_px
+
+
+def test_the_fixed_camera_extrinsic_is_untouched(
+    extrinsic_runs: ExtrinsicRuns, galileo_pose_graph_meta: FramesMeta
+) -> None:
+    """The fixed camera is the rig origin, so its `vehicle_T_cam` is the input one exactly.
+
+    Bundle adjustment holds no parameter block for the reference sensor at all —
+    COLMAP fixes it to identity — which is what makes it the exact bridge back to
+    the vehicle frame.
+    """
+    assert extrinsic_runs.refined.refined_extrinsics is not None
+    camera_params_id: int = extrinsic_runs.reference_camera_params_id
+    translation_m, rotation_deg = _pose_delta(
+        extrinsic_runs.refined.refined_extrinsics[camera_params_id],
+        galileo_pose_graph_meta.cameras[camera_params_id].vehicle_T_cam,
+    )
+    assert translation_m == pytest.approx(0.0, abs=1e-12)
+    assert rotation_deg == pytest.approx(0.0, abs=1e-9)
+
+
+def test_the_unregularised_refinement_drifts_on_weakly_covisible_cameras(
+    extrinsic_runs: ExtrinsicRuns, galileo_pose_graph_meta: FramesMeta
+) -> None:
+    """`refined_extrinsics` covers the whole rig, and records how far each camera walked.
+
+    This pins the measured cost of having no extrinsic priors. cuSFM regularises
+    its refinement with absolute and relative extrinsic residuals (§7), which
+    pycolmap's bundle adjuster cannot express, so colsfm's optimum is the
+    reprojection optimum alone. On Galileo's 0.66 m sweep that is well determined
+    only inside a stereo pair — the reference camera's partner moves millimetres,
+    the four cameras facing other directions tens of millimetres, because nothing
+    but the trajectory links them to the reference.
+    """
+    refined: dict[int, pycolmap.Rigid3d] | None = extrinsic_runs.refined_from_clean.refined_extrinsics
+    assert refined is not None
+    assert sorted(refined) == sorted(extrinsic_runs.refined_from_clean.reconstruction.cameras)
+    moved_m: dict[int, float] = {
+        camera_params_id: _pose_delta(pose, galileo_pose_graph_meta.cameras[camera_params_id].vehicle_T_cam)[0]
+        for camera_params_id, pose in refined.items()
+    }
+    print(
+        "[colsfm] unregularised extrinsic moves (mm): "
+        + ", ".join(f"{key}={value * 1e3:.2f}" for key, value in sorted(moved_m.items()))
+    )
+    reference_camera_params_id: int = extrinsic_runs.reference_camera_params_id
+    assert moved_m[reference_camera_params_id] == pytest.approx(0.0, abs=1e-12)
+    partner: int = _stereo_partner(galileo_pose_graph_meta, reference_camera_params_id)
+    assert 0.0 < moved_m[partner] < WEAKLY_CONSTRAINED_MOVE_M, "the reference's own stereo pair stays put"
+    elsewhere: list[float] = [
+        value for key, value in moved_m.items() if key not in {reference_camera_params_id, partner}
+    ]
+    assert max(elsewhere) > WEAKLY_CONSTRAINED_MOVE_M, "the other cameras drift; there is no prior holding them"
+
+
+def test_refining_extrinsics_on_a_vehicle_referenced_rig_is_refused(
+    synthetic_rig: SyntheticRig, synthetic_database: Path, isaac_config: CusfmConfig
+) -> None:
+    """A vehicle-referenced rig cannot refine extrinsics, and says so instead of no-opping.
+
+    COLMAP freezes every `sensor_from_rig` of a rig whose reference sensor is not
+    itself parameterised, and the vehicle body owns no images, so the request
+    would otherwise be silently ignored.
+    """
+    mapping_config: VisionMappingConfig = isaac_config.vision_mapping
+    with pytest.raises(ValueError, match="reference sensor"):
+        run_mapping(
+            build_reconstruction(synthetic_rig.frames_meta),
+            synthetic_database,
+            mapping_config,
+            mapping_config.bundle_adjustment,
+            _quiet_options(optimize_extrinsics=True),
+        )
+
+
+def test_refining_extrinsics_without_a_rig_reference_is_refused(
+    synthetic_rig: SyntheticRig, synthetic_database: Path, isaac_config: CusfmConfig
+) -> None:
+    """Even a camera-referenced rig needs the input `vehicle_T_cam_ref` to invert with."""
+    mapping_config: VisionMappingConfig = isaac_config.vision_mapping
+    reference_camera_params_id: int = gauge_camera_params_id(synthetic_rig.frames_meta)
+    with pytest.raises(ValueError, match="rig_reference"):
+        run_mapping(
+            build_reconstruction(synthetic_rig.frames_meta, reference_camera_params_id=reference_camera_params_id),
+            synthetic_database,
+            mapping_config,
+            mapping_config.bundle_adjustment,
+            _quiet_options(optimize_extrinsics=True),
+        )
