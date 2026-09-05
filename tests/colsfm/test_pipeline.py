@@ -144,6 +144,71 @@ def test_the_pose_graph_stage_writes_a_pose_per_rig_frame(galileo_run: PipelineS
     assert all(len(line.split()) == 8 for line in lines)
 
 
+# ── `--ba-backend caspar`: COLMAP's GPU bundle adjustment ────────────────────────────
+
+MAX_REGISTERED_DIFFERENCE: int = 2
+"""How far the CASPAR run's registered count may sit from the Ceres run's.
+
+The two solvers move the same poses by fractions of a millimetre, but they are a
+double and a float32 solver with different stopping rules, so a track that sits
+exactly on a round's pixel gate can fall either side of it and take its image's
+last observation with it."""
+
+
+@pytest.fixture(scope="module")
+def galileo_caspar_run(
+    galileo_input_dir: Path, tmp_path_factory: pytest.TempPathFactory, caspar_enabled: bool
+) -> PipelineSummary:
+    """The same smoke run with `--ba-backend caspar`, into its own workspace.
+
+    Args:
+        galileo_input_dir: The r2b_galileo input directory, from the shared conftest.
+        tmp_path_factory: pytest's per-module temporary directory factory.
+        caspar_enabled: Whether this pycolmap has the GPU backend compiled in.
+
+    Returns:
+        The summary the run produced.
+    """
+    if not caspar_enabled:
+        pytest.skip("this pycolmap is built without CASPAR_ENABLED; run under `pixi run -e colsfm-caspar`")
+    input_dir: Path = galileo_input_dir
+    if not (input_dir / FRAMES_META_NAME).is_file():
+        pytest.skip(f"missing {input_dir / FRAMES_META_NAME}")
+    options: PipelineOptions = PipelineOptions(
+        input_dir=input_dir,
+        output_dir=tmp_path_factory.mktemp("galileo_colsfm_caspar"),
+        min_inter_frame_distance=SMOKE_MIN_INTER_FRAME_DISTANCE_M,
+        ba_backend="caspar",
+    )
+    return run_pipeline(options)
+
+
+def test_the_caspar_run_reconstructs_what_the_ceres_run_reconstructs(
+    galileo_caspar_run: PipelineSummary, galileo_run: PipelineSummary
+) -> None:
+    """The GPU backend finishes the pipeline and lands on the same map.
+
+    `summary.json` records the backend the solves *ran* on, not the one asked for,
+    so this also proves no fallback fired.
+    """
+    print(
+        f"[colsfm] galileo smoke caspar | {galileo_caspar_run.mapping.num_points3D} points against "
+        f"{galileo_run.mapping.num_points3D}, reprojection "
+        f"{galileo_caspar_run.mapping.mean_reprojection_error_px:.4f} px against "
+        f"{galileo_run.mapping.mean_reprojection_error_px:.4f} px, mapping stage "
+        f"{galileo_caspar_run.stage_seconds['reconstruction']:.2f} s against "
+        f"{galileo_run.stage_seconds['reconstruction']:.2f} s"
+    )
+    assert galileo_caspar_run.options.ba_backend == "caspar"
+    assert galileo_caspar_run.mapping.ba_backend == "caspar"
+    assert galileo_run.mapping.ba_backend == "ceres"
+    registered_difference: int = abs(
+        galileo_caspar_run.mapping.num_registered_images - galileo_run.mapping.num_registered_images
+    )
+    assert registered_difference <= MAX_REGISTERED_DIFFERENCE
+    assert galileo_caspar_run.mapping.num_registered_images >= MIN_REGISTERED_IMAGES
+
+
 # ── `--optimize-extrinsics`: the blob's second mapping pass ──────────────────────────
 
 

@@ -112,6 +112,33 @@ superset at a lower reprojection error: 98-99 % of the blob's points have one of
 ours within 5 cm, and merging is already at a fixed point (a second
 `merge_all_tracks` pass returns 0), so the difference is structural rather than
 a missing merge.
+
+## `ba_backend = "caspar"`: COLMAP's GPU bundle adjustment
+
+`MappingOptions.ba_backend` picks the solver behind the same
+`create_default_bundle_adjuster` call. `caspar` needs a `CASPAR_ENABLED` build,
+which only the `colsfm-caspar` environment has (`docs/caspar-build.md`); the
+stock environment raises when the adjuster is built and this module falls back to
+Ceres and says so, so the flag is safe to pass anywhere.
+
+**CASPAR drops the robust loss.** It solves plain least squares whatever
+`ceres.loss_function_type` says, so the CAUCHY term at sigma 4 that whitens
+cuSFM's residual (§9.2, the table above) is simply not applied: every outlier
+enters the normal equations at full weight. What still rejects them is the outer
+loop — the per-round gate `g_k` filters at 25, 20, 15, 10, 5 px *before* each
+solve, and `filter_degenerate_points` / `filter_projection_failures` run after it.
+That is enough: an ablation on KITTI 06 — Ceres with `loss_type: TRIVIAL` — scores
+0.899 m Sim(3) ATE against the robust run's 0.895 m, so the loss is not what
+CASPAR's 1.299 m costs (NOTES.md "CASPAR backend"). Its float32 arithmetic is.
+
+Three more constraints, all from COLMAP 4.2.0's source and all handled here:
+observations from a camera that is not PINHOLE or SIMPLE_RADIAL are *silently
+skipped*, so `resolve_ba_backend` falls back to Ceres rather than solve a
+quietly smaller problem; `refine_sensor_from_rig = True` is a hard throw on a
+multi-sensor frame, so `optimize_extrinsics` falls back too (the regularised
+`colsfm.extrinsic_refinement` path keeps CASPAR: it holds the extrinsics fixed
+inside the pycolmap solve by construction); and `refine_focal_length` must equal
+`refine_extra_params`, which it does — both are False.
 """
 
 from __future__ import annotations
@@ -121,7 +148,7 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, TypeAlias
+from typing import Final, Literal, TypeAlias
 
 import numpy as np
 import pycolmap
@@ -159,6 +186,25 @@ LOSS_FUNCTION_BY_NAME: Final[dict[LossFunctionType, pycolmap.LossFunctionType]] 
     "HUBER": pycolmap.LossFunctionType.HUBER,
 }
 """cuSFM's `loss_type` enum to pycolmap's; the two sets coincide exactly."""
+
+BaBackend: TypeAlias = Literal["ceres", "caspar"]
+"""Which implementation solves the global bundle adjustment; `MappingOptions.ba_backend`."""
+
+BUNDLE_ADJUSTMENT_BACKEND: Final[dict[BaBackend, pycolmap.BundleAdjustmentBackend]] = {
+    "ceres": pycolmap.BundleAdjustmentBackend.CERES,
+    "caspar": pycolmap.BundleAdjustmentBackend.CASPAR,
+}
+"""The name to pycolmap's enum. The enum is bound unconditionally, so its presence proves
+nothing about the build — only a solve does (`docs/caspar-build.md`)."""
+
+CASPAR_CAMERA_MODELS: Final[frozenset[pycolmap.CameraModelId]] = frozenset(
+    {pycolmap.CameraModelId.PINHOLE, pycolmap.CameraModelId.SIMPLE_RADIAL}
+)
+"""The only two models CASPAR projects. Observations of any other model are dropped with
+a `LOG(WARNING)` and the solve still reports success, so this is a pre-flight, not a guard."""
+
+CASPAR_DISABLED_MARKER: Final[str] = "CASPAR_ENABLED"
+"""What COLMAP's "built without CASPAR_ENABLED" `ValueError` says; the capability test."""
 
 BRIEF_REPORT_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"Iterations:\s*(\d+),\s*Initial cost:\s*([0-9.eE+-]+),\s*Final cost:\s*([0-9.eE+-]+)"
@@ -226,6 +272,15 @@ class MappingOptions:
     against 20.9 s on 800 RoboCap images — 5 % the wrong way, then 8 % the right way. The
     blob's own mapper is Ceres on the CPU, so that is where the default stays. Which GPU
     is left to Ceres, i.e. pycolmap's `gpu_index` default of `-1`."""
+    ba_backend: BaBackend = "ceres"
+    """Which implementation solves the global bundle adjustment.
+
+    `caspar` is COLMAP's GPU backend and needs a `CASPAR_ENABLED` build — the
+    `colsfm-caspar` environment. It falls back to `ceres`, loudly, on three
+    conditions: a camera model outside PINHOLE / SIMPLE_RADIAL (whose observations
+    CASPAR would silently drop), `optimize_extrinsics` (which CASPAR cannot honour),
+    and a pycolmap built without it. See the module docstring for the robust loss
+    CASPAR does not apply."""
     verbose: bool = True
     """Print one line per triangulation pass and per outer round, as cuSFM does."""
     round_callback: RoundCallback | None = None
@@ -287,6 +342,10 @@ class MappingResult:
     extrinsics_refined: bool = False
     """Whether this pass refined `sensor_from_rig`; what makes `refined_extrinsics`
     something other than the input calibration read back out of the rig."""
+    ba_backend: BaBackend = "ceres"
+    """Which backend the solves actually ran on — `ceres` whenever one of the three
+    fallbacks of `MappingOptions.ba_backend` fired, so this is evidence rather than a
+    request."""
 
     @property
     def num_registered_images(self) -> int:
@@ -423,17 +482,70 @@ def triangulator_options(mapping_config: VisionMappingConfig, max_pixel_error: f
     return options
 
 
+def resolve_ba_backend(options: MappingOptions, reconstruction: pycolmap.Reconstruction | None = None) -> BaBackend:
+    """The backend that will actually run, after the two pre-flight fallbacks.
+
+    Neither condition is an error: CASPAR would *silently* drop the observations of
+    an unsupported camera model, and would hold `sensor_from_rig` fixed where the
+    caller asked for it to move. Both are reported and Ceres takes the solve.
+
+    Args:
+        options: Command-line style knobs; `ba_backend` is what is being resolved.
+        reconstruction: The model about to be adjusted, for its camera models. When
+            None the camera check is skipped — the caller has none to offer.
+
+    Returns:
+        `ceres` or `caspar`.
+    """
+    if options.ba_backend != "caspar":
+        return options.ba_backend
+    if options.optimize_extrinsics:
+        print(
+            "[colsfm] CASPAR holds `sensor_from_rig` fixed and throws when asked to refine it; "
+            "`--optimize-extrinsics` therefore falls back to Ceres for this solve"
+        )
+        return "ceres"
+    if reconstruction is not None:
+        unsupported: set[str] = {
+            camera.model.name for camera in reconstruction.cameras.values() if camera.model not in CASPAR_CAMERA_MODELS
+        }
+        if unsupported:
+            print(
+                f"[colsfm] CASPAR projects only PINHOLE and SIMPLE_RADIAL, and this model has "
+                f"{sorted(unsupported)}, whose observations it would silently drop; using Ceres"
+            )
+            return "ceres"
+    return "caspar"
+
+
+def backend_name(ba_options: pycolmap.BundleAdjustmentOptions) -> BaBackend:
+    """Which backend a set of options selects, as this module's name for it.
+
+    Args:
+        ba_options: The options a solve ran with.
+
+    Returns:
+        `caspar` when the options select CASPAR, `ceres` otherwise.
+    """
+    return "caspar" if ba_options.backend == BUNDLE_ADJUSTMENT_BACKEND["caspar"] else "ceres"
+
+
 def bundle_adjustment_options(
-    ba_config: BundleAdjustmentConfig, options: MappingOptions
+    ba_config: BundleAdjustmentConfig,
+    options: MappingOptions,
+    reconstruction: pycolmap.Reconstruction | None = None,
 ) -> pycolmap.BundleAdjustmentOptions:
     """Bundle adjustment options mirroring cuSFM's `BundleAdjustmentConfig` (§9.2).
 
     Args:
         ba_config: The Ceres settings from `vision_mapping_config.pb.txt`.
         options: Command-line style knobs.
+        reconstruction: The model about to be adjusted, read only for its camera
+            models when `ba_backend` is `caspar`; see `resolve_ba_backend`.
 
     Returns:
-        Options with every override of the module docstring applied.
+        Options with every override of the module docstring applied, on the backend
+        `resolve_ba_backend` allows.
 
     Raises:
         KeyError: When the configuration names a loss pycolmap does not have.
@@ -463,6 +575,17 @@ def bundle_adjustment_options(
     solver_options.gradient_tolerance = CERES_GRADIENT_TOLERANCE
     solver_options.parameter_tolerance = CERES_PARAMETER_TOLERANCE
     solver_options.minimizer_progress_to_stdout = False
+
+    backend: BaBackend = resolve_ba_backend(options, reconstruction)
+    ba_options.backend = BUNDLE_ADJUSTMENT_BACKEND[backend]
+    if backend == "caspar":
+        # CASPAR throws on a multi-sensor frame whose extrinsics are free, and throws
+        # again unless focal length and the distortion block agree; both are False here.
+        ba_options.refine_sensor_from_rig = False
+        ba_options.refine_extra_params = ba_options.refine_focal_length
+        # `-1` is COLMAP's own pick, which is what `use_gpu` off means everywhere else
+        # in this dataclass. Both were measured to solve on the 5090.
+        ba_options.caspar.gpu_index = "0" if options.use_gpu else "-1"
     return ba_options
 
 
@@ -744,6 +867,12 @@ def solve_bundle_adjustment(
     `fix_gauge` is deliberately not used: it would pick its own two frames and
     the resulting trajectory would no longer be anchored where cuSFM anchors it.
 
+    A pycolmap built without `CASPAR_ENABLED` says so only when the adjuster is
+    built, which is where the capability check therefore lives: the first
+    construction that raises it switches `ba_options` back to Ceres — in place, so
+    every later round follows without repeating the message — and builds again.
+    Nothing else is retried; any other `ValueError` propagates.
+
     Args:
         reconstruction: The model to adjust, in place.
         ba_options: Solver and refinement options.
@@ -754,7 +883,7 @@ def solve_bundle_adjustment(
             already fixes to identity.
 
     Returns:
-        The solver summary and the seconds the solve took.
+        The solver summary and the seconds `solve()` took.
     """
     config: pycolmap.BundleAdjustmentConfig = pycolmap.BundleAdjustmentConfig()
     for image_id in registered_image_ids(reconstruction):
@@ -764,7 +893,18 @@ def solve_bundle_adjustment(
         fixed_sensor: pycolmap.sensor_t = camera_sensor_id(fixed_camera_params_id)
         if not reconstruction.rig(RIG_ID).is_ref_sensor(fixed_sensor):
             config.set_constant_sensor_from_rig_pose(fixed_sensor)
-    adjuster: pycolmap.BundleAdjuster = pycolmap.create_default_bundle_adjuster(ba_options, config, reconstruction)
+    try:
+        adjuster: pycolmap.BundleAdjuster = pycolmap.create_default_bundle_adjuster(ba_options, config, reconstruction)
+    except ValueError as error:
+        if CASPAR_DISABLED_MARKER not in str(error):
+            raise
+        print(
+            "[colsfm] this pycolmap is built without CASPAR_ENABLED, so the GPU backend "
+            "cannot solve; falling back to Ceres for the rest of the run "
+            "(the `colsfm-caspar` environment has the build that can)"
+        )
+        ba_options.backend = BUNDLE_ADJUSTMENT_BACKEND["ceres"]
+        adjuster = pycolmap.create_default_bundle_adjuster(ba_options, config, reconstruction)
     started: float = time.perf_counter()
     summary: pycolmap.BundleAdjustmentSummary = adjuster.solve()
     return summary, time.perf_counter() - started
@@ -914,7 +1054,7 @@ def run_mapping(
             f"mean length {reconstruction.compute_mean_track_length():.4f}"
         )
 
-    ba_options: pycolmap.BundleAdjustmentOptions = bundle_adjustment_options(ba_config, resolved_options)
+    ba_options: pycolmap.BundleAdjustmentOptions = bundle_adjustment_options(ba_config, resolved_options, reconstruction)
     rounds: list[RoundStats] = []
     bundle_adjustment_seconds: float = 0.0
     for round_index, max_pixel_error in enumerate(schedule):
@@ -984,4 +1124,7 @@ def run_mapping(
         bundle_adjustment_seconds=bundle_adjustment_seconds,
         total_seconds=time.perf_counter() - started,
         extrinsics_refined=resolved_options.optimize_extrinsics,
+        # Read off the options the solves ran with, not off the request: the
+        # capability fallback rewrites them in place at the first solve.
+        ba_backend=backend_name(ba_options),
     )

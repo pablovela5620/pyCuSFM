@@ -42,6 +42,8 @@ from colsfm.mapping import (
     MappingOptions,
     MappingResult,
     RoundStats,
+    backend_name,
+    bundle_adjustment_options,
     filter_degenerate_points,
     filter_projection_failures,
     load_correspondences,
@@ -749,6 +751,135 @@ def test_fisheye_rig_triangulates(tmp_path: Path, isaac_config: CusfmConfig) -> 
     assert result.num_points3D > 100
     assert result.mean_reprojection_error_px < 1.0
 
+
+# ---------------------------------------------------------------------------
+# The CASPAR bundle-adjustment backend and its three fallbacks
+# ---------------------------------------------------------------------------
+
+
+def test_the_caspar_backend_reaches_the_options_the_solver_reads(
+    synthetic_rig: SyntheticRig, isaac_config: CusfmConfig
+) -> None:
+    """A PINHOLE rig under `ba_backend="caspar"` gets CASPAR and the settings it demands.
+
+    CASPAR throws on a free `sensor_from_rig` and on a focal length refined apart
+    from the distortion block, so the options builder owes all three: the backend,
+    the frozen extrinsics and the two refinement flags in agreement.
+    """
+    reconstruction: pycolmap.Reconstruction = build_reconstruction(synthetic_rig.frames_meta).reconstruction
+    assert {camera.model.name for camera in reconstruction.cameras.values()} == {"PINHOLE"}
+
+    ba_options: pycolmap.BundleAdjustmentOptions = bundle_adjustment_options(
+        isaac_config.vision_mapping.bundle_adjustment, _quiet_options(ba_backend="caspar"), reconstruction
+    )
+    assert backend_name(ba_options) == "caspar"
+    assert ba_options.refine_sensor_from_rig is False
+    assert ba_options.refine_extra_params == ba_options.refine_focal_length
+    assert ba_options.caspar.gpu_index == "-1"
+    on_gpu: pycolmap.BundleAdjustmentOptions = bundle_adjustment_options(
+        isaac_config.vision_mapping.bundle_adjustment,
+        _quiet_options(ba_backend="caspar", use_gpu=True),
+        reconstruction,
+    )
+    assert on_gpu.caspar.gpu_index == "0"
+
+
+def test_the_default_backend_is_ceres_and_leaves_caspar_alone(
+    synthetic_rig: SyntheticRig, isaac_config: CusfmConfig
+) -> None:
+    """Without the flag nothing about the solve changes: Ceres, as every run before."""
+    reconstruction: pycolmap.Reconstruction = build_reconstruction(synthetic_rig.frames_meta).reconstruction
+    ba_options: pycolmap.BundleAdjustmentOptions = bundle_adjustment_options(
+        isaac_config.vision_mapping.bundle_adjustment, _quiet_options(), reconstruction
+    )
+    assert backend_name(ba_options) == "ceres"
+    assert ba_options.caspar.gpu_index == "-1"
+
+
+def test_a_camera_model_caspar_would_silently_drop_falls_back_to_ceres(
+    isaac_config: CusfmConfig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An OPENCV_FISHEYE rig goes to Ceres, and the warning names the model.
+
+    CASPAR skips the observations of every model but PINHOLE and SIMPLE_RADIAL with
+    a log line and still reports success, so a silent half-problem is what the
+    fallback exists to prevent.
+    """
+    rig: SyntheticRig = build_synthetic_rig(num_frames=4, num_points=50, fisheye=True, seed=3)
+    reconstruction: pycolmap.Reconstruction = build_reconstruction(rig.frames_meta).reconstruction
+
+    ba_options: pycolmap.BundleAdjustmentOptions = bundle_adjustment_options(
+        isaac_config.vision_mapping.bundle_adjustment, _quiet_options(ba_backend="caspar"), reconstruction
+    )
+    assert backend_name(ba_options) == "ceres"
+    assert "OPENCV_FISHEYE" in capsys.readouterr().out
+
+
+def test_refining_extrinsics_falls_back_to_ceres(
+    synthetic_rig: SyntheticRig, isaac_config: CusfmConfig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`optimize_extrinsics` and CASPAR are exclusive, so the request wins the solver.
+
+    CASPAR hard-throws on a free `sensor_from_rig` in a multi-sensor frame. Forcing
+    the flag off instead would turn an asked-for refinement into a silent no-op.
+    """
+    reconstruction: pycolmap.Reconstruction = build_reconstruction(synthetic_rig.frames_meta).reconstruction
+    ba_options: pycolmap.BundleAdjustmentOptions = bundle_adjustment_options(
+        isaac_config.vision_mapping.bundle_adjustment,
+        _quiet_options(ba_backend="caspar", optimize_extrinsics=True),
+        reconstruction,
+    )
+    assert backend_name(ba_options) == "ceres"
+    assert ba_options.refine_sensor_from_rig is True
+    assert "optimize-extrinsics" in capsys.readouterr().out
+
+
+def test_the_mapper_runs_on_caspar_or_reports_the_build_that_cannot(
+    synthetic_rig: SyntheticRig,
+    synthetic_database: Path,
+    isaac_config: CusfmConfig,
+    caspar_enabled: bool,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`--ba-backend caspar` maps the synthetic rig, in either environment.
+
+    On a CASPAR-enabled pycolmap the GPU backend solves and the map matches the
+    Ceres one; on the stock one the missing capability is reported once and Ceres
+    finishes the run, so the flag never costs a result. The map itself is checked
+    against the ground-truth points, not against the solver's own opinion.
+    """
+    mapping_config: VisionMappingConfig = isaac_config.vision_mapping
+    ceres: MappingResult = run_mapping(
+        build_reconstruction(synthetic_rig.frames_meta), synthetic_database, mapping_config, _quiet_options()
+    )
+    capsys.readouterr()
+    caspar: MappingResult = run_mapping(
+        build_reconstruction(synthetic_rig.frames_meta),
+        synthetic_database,
+        mapping_config,
+        _quiet_options(ba_backend="caspar"),
+    )
+    printed: str = capsys.readouterr().out
+
+    if not caspar_enabled:
+        assert caspar.ba_backend == "ceres"
+        assert "CASPAR_ENABLED" in printed
+        assert caspar.num_points3D == ceres.num_points3D
+        return
+
+    assert caspar.ba_backend == "caspar"
+    assert "CASPAR_ENABLED" not in printed
+    recovered, mixed_tracks, relative_errors = _match_tracks_to_truth(caspar.reconstruction, synthetic_rig)
+    print(
+        f"[colsfm] caspar synthetic: {caspar.num_points3D} points against ceres' {ceres.num_points3D}, "
+        f"reprojection {caspar.mean_reprojection_error_px:.4f} px against {ceres.mean_reprojection_error_px:.4f} px"
+    )
+    assert mixed_tracks == 0
+    assert len(recovered) / len(synthetic_rig.points_xyz) >= 0.95
+    assert float(np.median(relative_errors)) < 0.01
+    assert caspar.num_registered_images == ceres.num_registered_images
+    assert caspar.num_points3D == pytest.approx(ceres.num_points3D, rel=0.05)
+    assert caspar.mean_reprojection_error_px == pytest.approx(ceres.mean_reprojection_error_px, abs=0.05)
 
 
 

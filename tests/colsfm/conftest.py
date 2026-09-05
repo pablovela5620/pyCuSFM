@@ -80,6 +80,25 @@ def three_samples(galileo_input: FramesMeta) -> FramesMeta:
     return galileo_input.filtered(keep)
 
 
+@pytest.fixture(scope="session")
+def caspar_enabled() -> bool:
+    """Whether this environment's pycolmap can build a CASPAR bundle adjuster at all.
+
+    The `BundleAdjustmentBackend.CASPAR` enum is bound unconditionally, so it proves
+    nothing; a pycolmap without `CASPAR_ENABLED` refuses only when the adjuster is
+    created (`docs/caspar-build.md`). An empty problem is enough to ask, and cheap.
+    """
+    options: pycolmap.BundleAdjustmentOptions = pycolmap.BundleAdjustmentOptions()
+    options.backend = pycolmap.BundleAdjustmentBackend.CASPAR
+    try:
+        pycolmap.create_default_bundle_adjuster(
+            options, pycolmap.BundleAdjustmentConfig(), pycolmap.Reconstruction()
+        )
+    except ValueError:
+        return False
+    return True
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Geometry helpers
 # ─────────────────────────────────────────────────────────────────────────────

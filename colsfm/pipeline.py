@@ -116,7 +116,7 @@ from colsfm.frames_meta import FRAMES_META_NAME, CameraParams, FramesMeta, RigFr
 from colsfm.geometry import MILLIMETRES_PER_METRE, TumPose, relative_rotation_degrees
 from colsfm.keyframe_selection import KeyframeSelection, apply_selection, select_keyframes
 from colsfm.loop_closure import LoopClosureConfig, LoopClosureDiagnostics, LoopClosureResult, find_loop_edges
-from colsfm.mapping import MappingOptions, MappingResult, run_mapping
+from colsfm.mapping import BaBackend, MappingOptions, MappingResult, run_mapping
 from colsfm.matching import BLOB_MATCH_TOP_K, MatchCapMode, MatchingBackend, MatchingOptions, MatchReport, match_pairs
 from colsfm.pairs import select_pairs
 from colsfm.pose_graph import PoseGraphEdge, PoseGraphResult, RigNode, sequential_edges, solve_pose_graph
@@ -241,6 +241,12 @@ class PipelineOptions:
     worker processes, not the threads inside one: the runner launches one process per
     camera. COLMAP has a single process, so 1 serialises JPEG decode against the GPU and
     costs 4.4x on Galileo (33.9 s against 7.6 s, measured)."""
+    ba_backend: BaBackend = "ceres"
+    """Which implementation solves the bundle adjustments — Ceres on the CPU, or COLMAP's
+    CASPAR on the GPU. `caspar` needs the `colsfm-caspar` environment's CASPAR-enabled
+    pycolmap and falls back to `ceres`, loudly, when it is missing, when a camera model is
+    outside PINHOLE / SIMPLE_RADIAL, or when `--optimize-extrinsics` is set. It also drops
+    the robust loss; see `colsfm.mapping`'s module docstring."""
     ba_num_threads: int | None = None
     """Ceres threads; None takes `bundle_adjustment_config.num_threads` (8) from the config,
     which is what the blob solves with. Set 1 for a bit-reproducible solve."""
@@ -328,6 +334,9 @@ class MappingStats:
     """Mean reprojection error over every observation, in pixels."""
     mean_track_length: float
     """Mean observations per point."""
+    ba_backend: BaBackend = "ceres"
+    """Which backend the bundle adjustments actually ran on, fallbacks applied; the one
+    field here that is not a counter, and the only record a finished run keeps of it."""
 
     @staticmethod
     def of(mapping: MappingResult) -> MappingStats:
@@ -337,7 +346,8 @@ class MappingStats:
             mapping: What the last mapping pass produced.
 
         Returns:
-            The six counters, frozen at this point in the run.
+            The six counters and the backend that produced them, frozen at this
+            point in the run.
         """
         return MappingStats(
             num_registered_images=mapping.num_registered_images,
@@ -346,6 +356,7 @@ class MappingStats:
             num_observations=mapping.num_observations,
             mean_reprojection_error_px=mapping.mean_reprojection_error_px,
             mean_track_length=mapping.mean_track_length,
+            ba_backend=mapping.ba_backend,
         )
 
 
@@ -1245,7 +1256,11 @@ def run_pipeline(options: PipelineOptions) -> PipelineSummary:
     with timed_stage(clock, "pose_graph"):
         pose_graph: PoseGraphStageResult = run_pose_graph_stage(options, selection.selected, config, loops.edges)
 
-    mapping_options: MappingOptions = MappingOptions(num_threads=options.ba_num_threads, use_gpu=options.ba_use_gpu)
+    mapping_options: MappingOptions = MappingOptions(
+        num_threads=options.ba_num_threads,
+        use_gpu=options.ba_use_gpu,
+        ba_backend=options.ba_backend,
+    )
 
     # ── 7. triangulation and bundle adjustment ───────────────────────────────────────
     with timed_stage(clock, "reconstruction"):

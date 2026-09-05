@@ -126,6 +126,15 @@ walked 234 mm. **4/4 acceptance bounds**, 3.2 s for the stage. `--no-regularised
 keeps the plain pycolmap path for comparison. The flag stays off by default: the gain over a
 fixed-extrinsic run is 0.4 px of reprojection and 0.02 mm of ATE.
 
+`--ba-backend caspar` runs the bundle adjustments on COLMAP's GPU CASPAR solver instead of
+Ceres, in the `colsfm-caspar` environment's from-source pycolmap (`docs/caspar-build.md`),
+falling back to Ceres with a message wherever the build, the camera model or
+`--optimize-extrinsics` rules it out. Measured in NOTES.md "CASPAR backend": on KITTI 06
+with loops it takes the mapping stage from **148.5 s to 31.5 s** (4.7x, total 338.0 s to
+208.6 s) and the Sim(3) ATE from 0.895 m to 1.299 m; an ablation puts that on CASPAR's
+float32 solve rather than on the robust loss it drops, since Ceres without that loss scores
+0.899 m. On Galileo it is a wash (1.76 s against 1.82 s). Off by default.
+
 **Acceptance, Galileo** (`data/bench/galileo_compare.md`), B relative to A:
 
 | Check | Bound | Value | Result |
