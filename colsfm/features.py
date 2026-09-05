@@ -123,6 +123,14 @@ class FeatureOptions:
     """Compute device; `auto` falls back to the CPU provider when cuDNN is missing."""
     gpu_index: str = "-1"
     """CUDA device index as COLMAP's comma-separated string; `"-1"` lets COLMAP choose."""
+    native_resolution: bool = True
+    """On `raco` only: run each image at its own size instead of stretching it.
+
+    True picks the shape-dynamic graph and infers a 1226x370 KITTI frame over
+    1248x384 rather than 1920x1200. False is the legacy stretch on the
+    fixed-shape graph, which is what `docs/kitti-06-results.md` §9 measured. The
+    other two backends ignore it: `pycolmap` is already native and `tensorrt` is
+    the blob's own static engine."""
 
 
 DEFAULT_FEATURE_OPTIONS: Final[FeatureOptions] = FeatureOptions()
@@ -273,6 +281,7 @@ def extract_features(
                 image_names,
                 min_score=RACO_MIN_SCORE,
                 max_num_features=options.max_num_features,
+                native_resolution=options.native_resolution,
             )
         else:
             from colsfm.features_trt import extract_tensorrt

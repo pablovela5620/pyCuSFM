@@ -19,6 +19,16 @@ from torch.nn import functional
 UPSTREAM_COMMIT: str = "d12b4ba1632f558234e3f084e1f3d8bdf9147890"
 """Pinned fabio-sim/LightGlue-ONNX revision used by the Pixi environment."""
 
+INPUT_DIM_DIVISOR: int = 32
+"""`Extractor.raco_aliked.input_dim_divisor`: RaCo's four-level pyramid pools by 32.
+
+Upstream's own CLI refuses a static height or width that is not a multiple of
+this, and builds its dynamic spatial dimensions as `32 * Dim(...)` for the same
+reason. `colsfm.features_raco` rounds every frame size up to it."""
+
+MINIMUM_DYNAMIC_SIDE: int = 64
+"""Smallest height or width the boundary ranker accepts, from upstream's CLI check."""
+
 
 @dataclass
 class ExportConfig:
@@ -46,6 +56,14 @@ class ExportConfig:
     """Decompose DeformConv into GridSample nodes instead of its native ONNX operator."""
     static_batch_size: int | None = None
     """When set, unroll this fixed batch into batch-one branches instead of exporting dynamically."""
+    dynamic_shape: bool = False
+    """When set, also mark height and width dynamic so one engine serves every frame size.
+
+    The graph then takes the image at its *network* size directly and drops the
+    in-graph `interpolate`: a spatial resample whose target is a symbolic
+    `ceil(size / 32) * 32` cannot be expressed without leaking the rounding into
+    the graph, and the host already resizes. Callers must therefore hand it a
+    height and a width that are multiples of `INPUT_DIM_DIVISOR`."""
 
 
 class CusfmExtractor(nn.Module):
@@ -132,6 +150,40 @@ class BatchedCusfmExtractor(CusfmExtractor):
             and scores ``[batch, 2048]``.
         """
         return self.extract_batch(image)
+
+
+class DynamicShapeCusfmExtractor(CusfmExtractor):
+    """Expose RaCo features with a dynamic batch **and** a dynamic input size.
+
+    The batched graph resamples every input to a fixed 1216x1920 inside itself,
+    so a 1226x370 KITTI frame is inferred over five times the pixels it has. This
+    variant deletes that resample and normalises against the shape it is handed,
+    which makes the network size the caller's choice and therefore the frame's
+    own. The one thing the caller inherits is RaCo's pooling: height and width
+    must be multiples of `INPUT_DIM_DIVISOR`.
+    """
+
+    def forward(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Extract batch-preserving cuSFM tensors at the shape supplied.
+
+        Args:
+            image: Float32 images with shape ``[batch, 3, height, width]`` and
+                values in ``[0, 1]``; height and width multiples of 32.
+
+        Returns:
+            Keypoints ``[batch, 2048, 2]``, descriptors ``[batch, 2048, 128]``,
+            and scores ``[batch, 2048]``.
+        """
+        keypoints_bnc, descriptors_bnd = self.extractor.extract_for_matching(image)
+        # The static graph divides by a baked `[width, processing_height]`. Here
+        # the two sides are symbolic, and `torch.stack` of the two scaled columns
+        # is the one form that keeps them symbolic through the Dynamo export
+        # rather than freezing the example shape into a constant.
+        normalized_x_bn: torch.Tensor = 2.0 * keypoints_bnc[..., 0] / image.shape[3] - 1.0
+        normalized_y_bn: torch.Tensor = 2.0 * keypoints_bnc[..., 1] / image.shape[2] - 1.0
+        normalized_bnc: torch.Tensor = torch.stack((normalized_x_bn, normalized_y_bn), dim=-1)
+        scores_bn: torch.Tensor = self.selection_scores[None].expand(image.shape[0], -1)
+        return normalized_bnc, descriptors_bnd, scores_bn
 
 
 class StaticBatchedCusfmExtractor(CusfmExtractor):
@@ -298,6 +350,9 @@ def export_batched_extractor(config: ExportConfig, output_path: Path) -> None:
     if config.static_batch_size is not None:
         export_static_batched_extractor(config, output_path)
         return
+    if config.dynamic_shape:
+        export_dynamic_shape_extractor(config, output_path)
+        return
     if not (
         1 <= config.minimum_batch_size
         <= config.optimal_batch_size
@@ -338,6 +393,65 @@ def export_batched_extractor(config: ExportConfig, output_path: Path) -> None:
         custom_translation_table=translation_table,
     )
     _stamp_model(output_path, "cusfm-raco-aliked-batched-extractor")
+
+
+def export_dynamic_shape_extractor(config: ExportConfig, output_path: Path) -> None:
+    """Export a batch- and shape-dynamic RaCo-ALIKED graph.
+
+    Every optimisation the fixed-shape export uses is kept: the boundary ranker,
+    the portable DeformConv decomposition, folded BatchNorm, the 65536-element
+    top-k chunk, upstream's default 2x candidate multiplier, and the integer-Div
+    translation that stops TensorRT lowering flattened indices through FP16.
+
+    Args:
+        config: Export settings; `image_height` and `image_width` become the
+            Dynamo trace's example shape rather than the graph's shape.
+        output_path: Where to write the ONNX graph.
+
+    Raises:
+        ValueError: When the batch bounds are unordered or the example shape is
+            not a usable multiple of `INPUT_DIM_DIVISOR`.
+    """
+    if not 1 <= config.minimum_batch_size <= config.optimal_batch_size <= config.maximum_batch_size:
+        raise ValueError(
+            "Batch bounds must satisfy 1 <= minimum <= optimal <= maximum, got "
+            f"{config.minimum_batch_size}, {config.optimal_batch_size}, {config.maximum_batch_size}"
+        )
+    example_height: int = (config.image_height + INPUT_DIM_DIVISOR - 1) // INPUT_DIM_DIVISOR * INPUT_DIM_DIVISOR
+    example_width: int = (config.image_width + INPUT_DIM_DIVISOR - 1) // INPUT_DIM_DIVISOR * INPUT_DIM_DIVISOR
+    if min(example_height, example_width) < MINIMUM_DYNAMIC_SIDE:
+        raise ValueError(f"Boundary ranking needs both sides at least {MINIMUM_DYNAMIC_SIDE}, got {example_height}x{example_width}")
+
+    module: DynamicShapeCusfmExtractor = DynamicShapeCusfmExtractor(config).eval()
+    module.extractor.fuse_batch_norm()
+    example_image_bchw: torch.Tensor = torch.zeros(
+        config.optimal_batch_size, 3, example_height, example_width, dtype=torch.float32
+    )
+    minimum_factor: int = MINIMUM_DYNAMIC_SIDE // INPUT_DIM_DIVISOR
+    batch_dimension: torch.export.Dim = torch.export.Dim(
+        "batch", min=config.minimum_batch_size, max=config.maximum_batch_size
+    )
+    height_factor: torch.export.Dim = torch.export.Dim("height_factor", min=minimum_factor)
+    width_factor: torch.export.Dim = torch.export.Dim("width_factor", min=minimum_factor)
+    dynamic_shapes: tuple[dict[int, object], ...] = (
+        {0: batch_dimension, 2: INPUT_DIM_DIVISOR * height_factor, 3: INPUT_DIM_DIVISOR * width_factor},
+    )
+    translation_table: dict[Any, Any] = {torch.ops.aten.div.Tensor_mode: _integer_division}
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.onnx.export(
+        module,
+        (example_image_bchw,),
+        str(output_path),
+        input_names=["image"],
+        output_names=["keypoints", "descriptors", "scores"],
+        opset_version=config.opset,
+        dynamic_shapes=dynamic_shapes,
+        dynamo=True,
+        external_data=False,
+        optimize=False,
+        custom_translation_table=translation_table,
+    )
+    _stamp_model(output_path, "cusfm-raco-aliked-dynamic-shape-extractor")
 
 
 def export_static_batched_extractor(config: ExportConfig, output_path: Path) -> None:
@@ -411,7 +525,7 @@ def main(config: ExportConfig) -> None:
         mode: str = (
             f"static unrolled batch {config.static_batch_size}"
             if config.static_batch_size is not None
-            else "dynamic batch"
+            else ("dynamic batch and shape" if config.dynamic_shape else "dynamic batch")
         )
         print(f"Exporting {mode} extractor to {config.batched_extractor_path}")
         export_batched_extractor(config, config.batched_extractor_path)

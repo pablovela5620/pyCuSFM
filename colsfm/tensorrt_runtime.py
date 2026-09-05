@@ -182,18 +182,24 @@ def tensorrt_version_tag() -> str:
     return "_".join(numeric[:4])
 
 
-def engine_path_for(onnx_path: Path, *, device_index: int = 0) -> Path:
+def engine_path_for(onnx_path: Path, *, profile_tag: str = "", device_index: int = 0) -> Path:
     """Where the engine built from one ONNX graph lives.
 
     Args:
         onnx_path: The graph, e.g. `pycusfm/models/aliked_lightglue/aliked.onnx`.
+        profile_tag: A short name for the optimisation profile, inserted after
+            `_fp16`. Empty — the default — keeps the blob's own naming and
+            therefore hits the two engines already in the repo. A shape-dynamic
+            graph must pass one: its engine is only valid for the bounds it was
+            built with, and those bounds are not recoverable from the file name
+            otherwise.
         device_index: CUDA device the engine is built for.
 
     Returns:
-        `<onnx dir>/<stem>_fp16_<trt version>_sm_<arch>.engine`, which is the
-        blob's own naming and therefore hits the two engines already in the repo.
+        `<onnx dir>/<stem>_fp16[_<profile tag>]_<trt version>_sm_<arch>.engine`.
     """
-    return onnx_path.with_name(f"{onnx_path.stem}_fp16_{tensorrt_version_tag()}_sm_{compute_capability(device_index)}.engine")
+    tag: str = f"_{profile_tag}" if profile_tag else ""
+    return onnx_path.with_name(f"{onnx_path.stem}_fp16{tag}_{tensorrt_version_tag()}_sm_{compute_capability(device_index)}.engine")
 
 
 def build_fp16_engine(
@@ -270,19 +276,21 @@ def build_fp16_engine(
 
 
 def resolve_engine(
-    onnx_path: Path, profiles: Mapping[str, ShapeProfile] | None = None, *, device_index: int = 0
+    onnx_path: Path, profiles: Mapping[str, ShapeProfile] | None = None, *, profile_tag: str = "", device_index: int = 0
 ) -> Path:
     """Return the cached engine for one graph, building it when it is absent.
 
     Args:
         onnx_path: The ONNX graph.
         profiles: Optimisation profile per dynamic input; see `build_fp16_engine`.
+        profile_tag: Names the profile in the cached engine's file name; see
+            `engine_path_for`.
         device_index: CUDA device the engine is built for.
 
     Returns:
         The engine file.
     """
-    engine_path: Path = engine_path_for(onnx_path, device_index=device_index)
+    engine_path: Path = engine_path_for(onnx_path, profile_tag=profile_tag, device_index=device_index)
     if engine_path.is_file():
         return engine_path
     return build_fp16_engine(onnx_path, engine_path, profiles)

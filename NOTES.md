@@ -794,6 +794,22 @@ identity `cv2.resize` are gone. It is bit-exact against the old host arithmetic,
 Galileo run is unchanged at 224/226, 1.500 px, 5.17 mm ATE, 4/4 bounds, with the extraction
 stage at 4.77 s.
 
+**Native resolution is now the default, and it is worth 2.4x on KITTI.**
+`data/cusfm_models/raco-aliked-dyn.onnx` — `raco-export --dynamic-shape`, whose input is
+declared `[batch, 3, 32*height_factor, 32*width_factor]` — is built with one optimisation
+profile spanning 256x256 to 1216x1920 at batch 1..8, and `extract_raco` groups images by
+their own size rounded up to 32 and runs each group at that shape.
+`FeatureOptions.native_resolution=False` restores the old graph and the old stretch. KITTI
+06's 1226x370 frames fall from **11.9 to 4.9 ms per image** warm (200 frames) and its full
+`--loop-closure` run's extraction stage from §9's 42.3 s to **10.1 s**, total 295.0 s to
+**203.2 s**, at Sim(3) ATE 0.878 m against 0.902 m — cheaper and no worse. Galileo pays for
+it: it is already the profile's *maximum*, so it gains nothing from the smaller input and
+loses the fixed-shape engine's specialised tactics, **11.9 to 21.9 ms per image**. The
+shape-dynamic engine also sizes its execution context for the maximum shape whatever it
+runs, ~16 GB at batch 8, which is the other reason not to widen the profile further. The
+deviation is deliberate and against the blob, which resizes every input to its network size
+(`docs/spec/feature_extractor_main.md` §8).
+
 ### CASPAR backend
 
 `--ba-backend caspar` sends every bundle adjustment to **CASPAR**, COLMAP's experimental

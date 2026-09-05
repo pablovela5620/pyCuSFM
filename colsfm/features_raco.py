@@ -18,10 +18,25 @@ point: the graph has a real batch axis, `image [batch, 3, 1200, 1920]` with
 `batch` in 1..16, so the engine is built with an optimisation profile rather than
 at the shipped static shape and `DEFAULT_BATCH_SIZE` images cross the PCIe bus
 and the detector pyramid together. Everything either side of the engine is
-unchanged and imported from `colsfm.features_trt`: the same OpenCV stretch
+unchanged and imported from `colsfm.features_trt`: the same OpenCV
 preprocessing, the same bounded decode-ahead thread pool, the same
 `(k + 1) * 0.5 * (size - 1)` mapping back onto the original image, the same two
 database columns written for image rows somebody else created.
+
+**Native resolution is the default, and it is a deliberate deviation.** The
+blob's feature extractor resizes every input to its network size
+(`docs/spec/feature_extractor_main.md` §8), and the fixed-shape graph above does
+the same: a 1226x370 KITTI frame is inferred over 1920x1200, five times the
+pixels it has, for 19.6 ms against pycolmap's 7.8 ms at the native size
+(`docs/kitti-06-results.md` §9). `native_resolution=True` instead runs
+`data/cusfm_models/raco-aliked-dyn.onnx`, whose spatial axes are symbolic, at
+each image's own size rounded up to `INPUT_DIM_DIVISOR` — so KITTI runs at
+1248x384 and Galileo at 1920x1216. Images are grouped by that rounded size so a
+batch is still one shape, and the mapping back to pixels needs nothing new:
+`normalized_to_pixels` already targets the *original* size, and rounding up (a
+rescale) rather than padding (a translation) keeps it exact.
+`native_resolution=False` restores the stretch, on the old graph and the old
+engine, so the two are measurable against each other.
 
 **Scores are a selection order, not a detector response.** Upstream's boundary
 ranker returns its top 2048 points already ordered but never materialises a
@@ -78,6 +93,12 @@ Not committed — `data/cusfm_models` is gitignored and the graph is 8.9 MB of
 weights. Produce it with
 `pixi run -e raco raco-export --batched-extractor-path data/cusfm_models/raco-aliked-b1-16.onnx`."""
 
+RACO_DYNAMIC_ONNX_PATH: Final[Path] = REPO_ROOT / "data" / "cusfm_models" / "raco-aliked-dyn.onnx"
+"""The batch- **and** shape-dynamic RaCo-ALIKED graph; its engine is cached beside it.
+
+Also not committed. Produce it with
+`pixi run -e raco raco-export --dynamic-shape --batched-extractor-path data/cusfm_models/raco-aliked-dyn.onnx`."""
+
 MINIMUM_BATCH_SIZE: Final[int] = 1
 """The optimisation profile's `min`, so a one-image run still executes."""
 
@@ -85,11 +106,49 @@ DEFAULT_BATCH_SIZE: Final[int] = 8
 """Images per execution, and the profile's `opt`; `tools/raco_extract.py`'s own default."""
 
 MAXIMUM_BATCH_SIZE: Final[int] = 16
-"""The profile's `max`, and the ceiling the ONNX graph itself was exported with."""
+"""The fixed-shape profile's `max`, and the ceiling the ONNX graph itself was exported with."""
+
+DYNAMIC_MAXIMUM_BATCH_SIZE: Final[int] = 8
+"""The shape-dynamic profile's `max` batch.
+
+16 is inside the fixed-shape graph's export bounds but its execution already
+failed on a 32 GB 5090 (NOTES.md "RaCo backend"), and with the spatial axes
+dynamic the builder has to size its tactic workspace for the *maximum* shape as
+well, which pushes the build itself over. 8 is `DEFAULT_BATCH_SIZE`, so nothing
+in the extraction path wants more."""
+
+INPUT_DIM_DIVISOR: Final[int] = 32
+"""RaCo's four-level pyramid pools by 32, so both network sides must be multiples of it.
+
+`tools/export_cusfm_raco.INPUT_DIM_DIVISOR` is the same constant read off
+upstream's `Extractor.raco_aliked.input_dim_divisor`; the dynamic graph's input
+is literally declared as `32 * height_factor` by `32 * width_factor`."""
+
+MINIMUM_NETWORK_SIDE: Final[int] = 256
+"""The profile's `min` height and width.
+
+Below this the detector's top-2048 head starts competing with the number of
+candidates the boundary ranker can find, and no camera this pipeline sees is
+smaller."""
+
+OPTIMAL_NETWORK_HEIGHT: Final[int] = 768
+"""The profile's `opt` height; a midpoint between KITTI's 384 and Galileo's 1216."""
+
+OPTIMAL_NETWORK_WIDTH: Final[int] = 1024
+"""The profile's `opt` width; the same midpoint between KITTI's 1248 and Galileo's 1920."""
+
+MAXIMUM_NETWORK_HEIGHT: Final[int] = 1216
+"""The profile's `max` height: Galileo's 1200 rounded up to `INPUT_DIM_DIVISOR`.
+
+1216 is also the height the *fixed*-shape graph resamples to internally, so a
+Galileo frame reaches the same convolutions either way."""
+
+MAXIMUM_NETWORK_WIDTH: Final[int] = 1920
+"""The profile's `max` width, which Galileo already is."""
 
 
 def raco_profile(network_height: int = NETWORK_HEIGHT, network_width: int = NETWORK_WIDTH) -> dict[str, ShapeProfile]:
-    """The optimisation profile the batch-dynamic graph is built with.
+    """The optimisation profile the batch-dynamic, fixed-shape graph is built with.
 
     Args:
         network_height: The graph's input height.
@@ -107,6 +166,83 @@ def raco_profile(network_height: int = NETWORK_HEIGHT, network_width: int = NETW
     }
 
 
+def raco_dynamic_profile() -> dict[str, ShapeProfile]:
+    """The optimisation profile the shape-dynamic graph is built with.
+
+    One profile, not two: TensorRT picks tactics for `opt` and tolerates the rest
+    of the range, and a second profile would double the build (already the
+    expensive part) to serve a bimodal size distribution this repo does not have.
+
+    Returns:
+        One `(minimum, optimal, maximum)` shape for the `image` binding, spanning
+        256x256 to 1216x1920 at batch 1 to `DYNAMIC_MAXIMUM_BATCH_SIZE`.
+    """
+    return {
+        ALIKED_IMAGE_BINDING: (
+            (MINIMUM_BATCH_SIZE, 3, MINIMUM_NETWORK_SIDE, MINIMUM_NETWORK_SIDE),
+            (DEFAULT_BATCH_SIZE, 3, OPTIMAL_NETWORK_HEIGHT, OPTIMAL_NETWORK_WIDTH),
+            (DYNAMIC_MAXIMUM_BATCH_SIZE, 3, MAXIMUM_NETWORK_HEIGHT, MAXIMUM_NETWORK_WIDTH),
+        )
+    }
+
+
+def raco_dynamic_engine_tag() -> str:
+    """The engine cache name's profile tag, so a re-tuned profile is a different file.
+
+    Returns:
+        `b<min>-<max>_<min side>x<min side>_<max height>x<max width>`.
+    """
+    return (
+        f"b{MINIMUM_BATCH_SIZE}-{DYNAMIC_MAXIMUM_BATCH_SIZE}"
+        f"_{MINIMUM_NETWORK_SIDE}x{MINIMUM_NETWORK_SIDE}"
+        f"_{MAXIMUM_NETWORK_HEIGHT}x{MAXIMUM_NETWORK_WIDTH}"
+    )
+
+
+def network_size_for(image_height: int, image_width: int) -> tuple[int, int]:
+    """The network size one image runs at when the engine is shape-dynamic.
+
+    The image's own size, rounded **up** to `INPUT_DIM_DIVISOR` and clamped into
+    the profile. Rounding up rather than padding keeps the mapping back to pixels
+    a plain linear rescale, which is exactly what `normalized_to_pixels` already
+    is — a padded border would put keypoints in a frame that mapping does not
+    describe.
+
+    Args:
+        image_height: The image's own height in pixels.
+        image_width: The image's own width in pixels.
+
+    Returns:
+        `(network_height, network_width)`, both multiples of `INPUT_DIM_DIVISOR`
+        and inside the profile's bounds.
+    """
+
+    def rounded(side: int, ceiling: int) -> int:
+        grid: int = -(-max(side, MINIMUM_NETWORK_SIDE) // INPUT_DIM_DIVISOR) * INPUT_DIM_DIVISOR
+        return min(grid, ceiling)
+
+    return rounded(image_height, MAXIMUM_NETWORK_HEIGHT), rounded(image_width, MAXIMUM_NETWORK_WIDTH)
+
+
+def _size_groups(tasks: Sequence[ImageTask]) -> dict[tuple[int, int], list[ImageTask]]:
+    """Group images by the network size they will run at, keeping their order.
+
+    A batch is one TensorRT execution at one input shape, so images of different
+    sizes cannot share one. Grouping first means a mixed-camera set still fills
+    its batches instead of flushing a short one at every size change.
+
+    Args:
+        tasks: The images, in the order their results are wanted.
+
+    Returns:
+        Tasks per `(network_height, network_width)`, first-seen size first.
+    """
+    groups: dict[tuple[int, int], list[ImageTask]] = {}
+    for task in tasks:
+        groups.setdefault(network_size_for(task.image_height, task.image_width), []).append(task)
+    return groups
+
+
 def _batched(prepared: Iterator[PreparedImage], batch_size: int) -> Iterator[list[PreparedImage]]:
     """Group a prepared-image stream into fixed-size batches, the last one short.
 
@@ -121,6 +257,46 @@ def _batched(prepared: Iterator[PreparedImage], batch_size: int) -> Iterator[lis
         yield batch
 
 
+def _store_batch(
+    database: pycolmap.Database,
+    batch: Sequence[PreparedImage],
+    outputs: dict[str, ndarray],
+    *,
+    min_score: float,
+    max_num_features: int,
+) -> None:
+    """Write one executed batch's keypoints and descriptors into the database.
+
+    Args:
+        database: An open COLMAP database whose image rows already exist.
+        batch: The prepared images that made up this execution, in binding order.
+        outputs: The engine's `keypoints`, `descriptors` and `scores` arrays.
+        min_score: Gate on `scores`, which is a selection rank; see the module
+            docstring.
+        max_num_features: Keypoint ceiling per image; 0 or less keeps everything
+            the gate left.
+    """
+    keypoints_bn2: Float32[ndarray, "batch num_keypoints 2"] = np.asarray(outputs["keypoints"], dtype=np.float32)
+    descriptors_bnd: Float32[ndarray, "batch num_keypoints 128"] = np.asarray(outputs["descriptors"], dtype=np.float32)
+    scores_bn: Float32[ndarray, "batch num_keypoints"] = np.asarray(outputs["scores"], dtype=np.float32)
+    for index, item in enumerate(batch):
+        scores: Float32[ndarray, " num_keypoints"] = scores_bn[index].reshape(-1)
+        kept: Bool[ndarray, " num_keypoints"] = scores >= np.float32(min_score)
+        if max_num_features > 0 and int(kept.sum()) > max_num_features:
+            strongest: Int64[ndarray, " num_selected"] = np.argsort(np.where(kept, scores, -np.inf))[::-1][:max_num_features]
+            kept = np.zeros_like(kept)
+            kept[strongest] = True
+        keypoints_xy: KeypointsXY = normalized_to_pixels(
+            keypoints_bn2[index].reshape(-1, 2)[kept], item.task.image_width, item.task.image_height
+        )
+        descriptors: Descriptors = np.ascontiguousarray(descriptors_bnd[index].reshape(len(scores), -1)[kept])
+        database.write_keypoints(item.task.image_id, keypoints_xy)
+        database.write_descriptors(
+            item.task.image_id,
+            pycolmap.FeatureDescriptorsFloat(data=descriptors, type=DESCRIPTOR_TYPE).to_bytes(),
+        )
+
+
 def extract_raco(
     database_path: Path,
     image_root: Path,
@@ -128,10 +304,11 @@ def extract_raco(
     *,
     min_score: float,
     max_num_features: int,
-    onnx_path: Path = RACO_ONNX_PATH,
+    onnx_path: Path | None = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
     preprocessing_workers: int = DEFAULT_PREPROCESSING_WORKERS,
     gpu_preprocessing: bool = DEFAULT_GPU_PREPROCESSING,
+    native_resolution: bool = True,
 ) -> TensorRTExtraction:
     """Run the batched RaCo-ALIKED engine over the named images and store the features.
 
@@ -144,13 +321,18 @@ def extract_raco(
             rank rather than by detector response.
         max_num_features: Keypoint ceiling per image; the graph's own top-2048
             head normally binds first, so this only ever truncates.
-        onnx_path: The batch-dynamic RaCo-ALIKED graph whose engine to use.
-        batch_size: Images executed together, 1 to `MAXIMUM_BATCH_SIZE`.
+        onnx_path: The RaCo-ALIKED graph whose engine to use. `None` picks the
+            one `native_resolution` implies.
+        batch_size: Images executed together, 1 to the graph's batch ceiling.
         preprocessing_workers: Decode-and-resize threads.
         gpu_preprocessing: Stage the decoded uint8 frames in one page-locked
             batch buffer and let a TensorRT preprocessing engine transpose, widen
             and scale them. `False` restores the host conversion plus the
             `np.concatenate` that used to build every batch.
+        native_resolution: Run each image at its own size, rounded up to
+            `INPUT_DIM_DIVISOR`, through the shape-dynamic graph. `False` is the
+            legacy behaviour: the fixed-shape graph, and every frame stretched to
+            1920x1200 whatever it was.
 
     Returns:
         Keypoints stored per `image_id`, and the wall time of the whole pass
@@ -165,65 +347,57 @@ def extract_raco(
         raise FileNotFoundError(f"No COLMAP database at {database_path}")
     if not image_root.is_dir():
         raise FileNotFoundError(f"No image directory at {image_root}")
-    if not MINIMUM_BATCH_SIZE <= batch_size <= MAXIMUM_BATCH_SIZE:
-        raise ValueError(f"batch_size must be in [{MINIMUM_BATCH_SIZE}, {MAXIMUM_BATCH_SIZE}], got {batch_size}")
+    maximum_batch_size: int = DYNAMIC_MAXIMUM_BATCH_SIZE if native_resolution else MAXIMUM_BATCH_SIZE
+    if not MINIMUM_BATCH_SIZE <= batch_size <= maximum_batch_size:
+        raise ValueError(f"batch_size must be in [{MINIMUM_BATCH_SIZE}, {maximum_batch_size}], got {batch_size}")
 
     started: float = time.perf_counter()
     tasks: list[ImageTask] = _image_tasks(database_path, image_root, image_names)
-    engine_path: Path = resolve_engine(onnx_path, raco_profile())
+    graph_path: Path = onnx_path or (RACO_DYNAMIC_ONNX_PATH if native_resolution else RACO_ONNX_PATH)
+    engine_path: Path = (
+        resolve_engine(graph_path, raco_dynamic_profile(), profile_tag=raco_dynamic_engine_tag())
+        if native_resolution
+        else resolve_engine(graph_path, raco_profile())
+    )
     with ExitStack() as stack:
         session: TensorRTSession = stack.enter_context(TensorRTSession(engine_path, reuse_output_buffers=True))
         database: pycolmap.Database = stack.enter_context(pycolmap.Database.open(database_path))
-        declared_shape: tuple[int, ...] = tuple(session.engine.get_tensor_shape(ALIKED_IMAGE_BINDING))
-        network_height: int = int(declared_shape[2])
-        network_width: int = int(declared_shape[3])
-        preprocessor: GpuPreprocessor | None = (
-            stack.enter_context(
-                GpuPreprocessor(
-                    height=network_height,
-                    width=network_width,
-                    max_batch=batch_size,
-                    optimal_batch=batch_size,
-                    stream=session.stream,
-                )
+        groups: dict[tuple[int, int], list[ImageTask]]
+        if native_resolution:
+            groups = _size_groups(tasks)
+        else:
+            declared_shape: tuple[int, ...] = tuple(session.engine.get_tensor_shape(ALIKED_IMAGE_BINDING))
+            groups = {(int(declared_shape[2]), int(declared_shape[3])): list(tasks)}
+        preprocessors: dict[tuple[int, int], GpuPreprocessor] = {}
+        for network_size, group in groups.items():
+            network_height, network_width = network_size
+            preprocessor: GpuPreprocessor | None = None
+            if gpu_preprocessing:
+                if network_size not in preprocessors:
+                    preprocessors[network_size] = stack.enter_context(
+                        GpuPreprocessor(
+                            height=network_height,
+                            width=network_width,
+                            max_batch=batch_size,
+                            optimal_batch=batch_size,
+                            stream=session.stream,
+                        )
+                    )
+                preprocessor = preprocessors[network_size]
+            prepared: Iterator[PreparedImage] = _prepared_stream(
+                group, preprocessing_workers, network_height, network_width, not gpu_preprocessing
             )
-            if gpu_preprocessing
-            else None
-        )
-        prepared: Iterator[PreparedImage] = _prepared_stream(
-            tasks, preprocessing_workers, network_height, network_width, not gpu_preprocessing
-        )
-        for batch in _batched(prepared, batch_size):
-            network_input: NetworkBatch | DeviceTensor
-            if preprocessor is None:
-                network_input = np.ascontiguousarray(
-                    np.concatenate([item.network_image() for item in batch], axis=0), dtype=np.float32
-                )
-            else:
-                for slot, item in enumerate(batch):
-                    preprocessor.staging_bhwc[slot] = item.resized_bgr_hwc
-                network_input = preprocessor.run(len(batch))
-            outputs: dict[str, ndarray] = session.run({ALIKED_IMAGE_BINDING: network_input})
-            keypoints_bn2: Float32[ndarray, "batch num_keypoints 2"] = np.asarray(outputs["keypoints"], dtype=np.float32)
-            descriptors_bnd: Float32[ndarray, "batch num_keypoints 128"] = np.asarray(outputs["descriptors"], dtype=np.float32)
-            scores_bn: Float32[ndarray, "batch num_keypoints"] = np.asarray(outputs["scores"], dtype=np.float32)
-            for index, item in enumerate(batch):
-                scores: Float32[ndarray, " num_keypoints"] = scores_bn[index].reshape(-1)
-                kept: Bool[ndarray, " num_keypoints"] = scores >= np.float32(min_score)
-                if max_num_features > 0 and int(kept.sum()) > max_num_features:
-                    strongest: Int64[ndarray, " num_selected"] = np.argsort(np.where(kept, scores, -np.inf))[::-1][
-                        :max_num_features
-                    ]
-                    kept = np.zeros_like(kept)
-                    kept[strongest] = True
-                keypoints_xy: KeypointsXY = normalized_to_pixels(
-                    keypoints_bn2[index].reshape(-1, 2)[kept], item.task.image_width, item.task.image_height
-                )
-                descriptors: Descriptors = np.ascontiguousarray(descriptors_bnd[index].reshape(len(scores), -1)[kept])
-                database.write_keypoints(item.task.image_id, keypoints_xy)
-                database.write_descriptors(
-                    item.task.image_id,
-                    pycolmap.FeatureDescriptorsFloat(data=descriptors, type=DESCRIPTOR_TYPE).to_bytes(),
-                )
+            for batch in _batched(prepared, batch_size):
+                network_input: NetworkBatch | DeviceTensor
+                if preprocessor is None:
+                    network_input = np.ascontiguousarray(
+                        np.concatenate([item.network_image() for item in batch], axis=0), dtype=np.float32
+                    )
+                else:
+                    for slot, item in enumerate(batch):
+                        preprocessor.staging_bhwc[slot] = item.resized_bgr_hwc
+                    network_input = preprocessor.run(len(batch))
+                outputs: dict[str, ndarray] = session.run({ALIKED_IMAGE_BINDING: network_input})
+                _store_batch(database, batch, outputs, min_score=min_score, max_num_features=max_num_features)
     elapsed_seconds: float = time.perf_counter() - started
     return keypoint_counts(database_path, [task.image_id for task in tasks]), elapsed_seconds

@@ -234,3 +234,30 @@ visible and neither is a property of the change:
 
 Re-measure on an idle GPU before quoting these stage numbers anywhere that
 matters. The equivalence results need no such caveat.
+
+## Several input sizes at once
+
+`colsfm.features_raco` gained a native-resolution path: with
+`FeatureOptions.native_resolution` (the default) each image runs at its own size
+rounded up to 32 rather than stretched to 1920x1200, so one extraction pass can
+touch more than one input shape. Nothing in `GpuPreprocessor` had to change for
+that — the engine was already keyed by `(height, width, max_batch)` in
+`preprocess_engine_path` and built on demand — but two consequences are worth
+recording.
+
+**Each new size costs one build, once.** A four-layer network builds in a second
+or two, and the file is cached beside the detector engines under
+`preprocess_bgr_u8_<h>x<w>_b<batch>.engine`. `data/cusfm_models` now holds a
+`1216x1920` (Galileo at the network grid) and a `384x1248` (KITTI) next to the
+older `1200x1920`. The build is invisible on a full dataset and very visible on
+a short one: KITTI's first 50 frames measured 21.97 ms per image with the build
+inside the stage and 4.87 ms per image over 200 frames without it. Warm-cache
+numbers are the only ones worth quoting.
+
+**`extract_raco` keeps one preprocessor per size for the length of the run.**
+Images are grouped by rounded size before batching, and each group's
+`GpuPreprocessor` is entered on the run's `ExitStack`, so a mixed-camera set
+pays one build and one page-locked staging buffer per distinct size rather than
+one per batch. The staging buffer is `max_batch * height * width * 3` bytes of
+pinned host memory, which is 45 MB at batch 8 and 1216x1920 — worth knowing
+before pointing this at a set with many distinct camera sizes.
