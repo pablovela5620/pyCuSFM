@@ -493,10 +493,11 @@ benched against the blob reference: **225/226 images, 6301 points, 1.389 px,
 That is `colsfm-caspar`'s 4.30 mm / 4-of-4 to within the run-to-run noise, so
 the extra adapters cost the pinhole path nothing.
 
-### 9.3 The RoboCap run, for when the data is back
+### 9.3 The RoboCap run
 
-RoboCap is the fisheye rig this whole adapter is for, and it was off disk while
-this was written; nothing below has been executed against it.
+RoboCap is the fisheye rig this whole adapter is for. It was off disk while this
+section was written; §9.4 records the first measurement, made on 2026-09-05 once
+the data was back.
 
 ```bash
 # Full segment, GPU bundle adjustment, Ceres polish on (the default):
@@ -568,3 +569,54 @@ The comparison worth making once the full run exists is the same one §5 makes o
 the synthetic rig — `--ba-backend caspar` against `--ba-backend ceres` on
 identical input — because on a real fisheye rig the fallback is no longer
 available as a control: in `colsfm-caspar` the caspar run *is* the ceres run.
+
+### 9.4 Measured: 150 rig frames of RoboCap, RaCo + LightGlue+, Ceres against CASPAR
+
+The first 150 rig frames (600 OPENCV_FISHEYE images, sliced with the §9.3 script) run
+twice in `colsfm-caspar-fisheye` with the RaCo backends and nothing else changed:
+
+```bash
+pixi run -e colsfm-caspar-fisheye python -m colsfm run --input-dir /tmp/robocap_slice \
+    --features-backend raco --matching-backend raco --ba-backend ceres  --output-dir /tmp/colsfm_runs/robocap_slice_raco_ceres/cusfm
+pixi run -e colsfm-caspar-fisheye python -m colsfm run --input-dir /tmp/robocap_slice \
+    --features-backend raco --matching-backend raco --ba-backend caspar --output-dir /tmp/colsfm_runs/robocap_slice_raco_caspar/cusfm
+pixi run -e colsfm python -m colsfm.bench_cli --dataset robocap --input-dir /tmp/robocap_slice \
+    --run-a /tmp/colsfm_runs/robocap_slice_raco_ceres/cusfm --run-b /tmp/colsfm_runs/robocap_slice_raco_caspar/cusfm \
+    --name-a raco-ceres --name-b raco-caspar --save data/bench/robocap_slice_ceres_vs_caspar.rrd --report data/bench/robocap_slice_ceres_vs_caspar.md
+```
+
+**It went to the GPU.** The CASPAR run's log carries the capability probe's two
+`unsupported camera model: OPENCV` / `FULL_OPENCV` lines and nothing about
+OPENCV_FISHEYE; `summary.json` records `ba_backend: caspar`, `polish_seconds: 3.82`,
+`polish_iterations: 20`. This is the fisheye adapter solving a real fisheye rig.
+
+| | Ceres | CASPAR + polish | B/A |
+|---|---:|---:|---:|
+| feature extraction (s) | 13.44 | 11.92 | 0.89 |
+| matching (s) | 4.67 | 4.76 | 1.02 |
+| triangulation + bundle adjustment (s) | 22.56 | 12.57 | 0.56 |
+| total (s) | 41.54 | 30.18 | 0.73 |
+| registered images | 600 / 600 | 600 / 600 | |
+| 3D points | 36 998 | 37 452 | |
+| observations | 168 413 | 170 505 | |
+| mean reprojection error (px) | 1.413 | 1.470 | 1.04 |
+| rig poses vs input, RMSE (mm) | 134.80 | 118.29 | |
+| rig poses vs input, would-be scale | 0.99093 | 0.99398 | |
+
+The two trajectories agree to **20.25 mm RMSE, 47.17 mm max, 0.277° rotation RMSE**
+over 150 rig frames (`data/bench/robocap_slice_ceres_vs_caspar.md`), on a 600-image
+map whose mean reprojection error is 1.4 px. The polish took 3.8 s of the 12.57 s and
+moved reprojection from 1.531 to 1.470 px; without it the fp32 solve would have sat
+4 % short of Ceres in reprojection, the same shortfall §5 and docs/caspar-build.md
+measured on pinhole rigs. Every bench_cli bound passes (3/3; RoboCap has no ground
+truth so the ATE bound is not measurable).
+
+Pixel evidence: `/tmp/rerun-viewer-validation/robocap-slice-caspar/01-initial.png`
+(both coloured point clouds overlapping, both trajectories coincident, report panel
+readable) and `02-trajectories-maximized.png`, captured from a headless 0.37.1 viewer
+loading the saved `.rrd`; `notes.md` alongside.
+
+Against the blob's full-sequence reference the slice is not comparable on registered
+images (600 against 4522) and the harness says so; on what is comparable, the blob's
+poses sit 82.76 mm from the input over the same 150 rig frames against CASPAR's 118.29,
+and its reprojection error is 1.486 px against 1.470.
