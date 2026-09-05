@@ -187,7 +187,6 @@ def write_pose_files(
     frames_meta: FramesMeta,
     *,
     export_pose_in_vehicle_frame: bool = True,
-    also_merge_poses: bool = True,
 ) -> list[Path]:
     """Write the per-camera and merged TUM trajectories.
 
@@ -203,7 +202,6 @@ def write_pose_files(
         output_dir: Workspace root.
         frames_meta: The collection to export.
         export_pose_in_vehicle_frame: Write `world_T_vehicle` rather than `world_T_cam`.
-        also_merge_poses: Additionally write the merged trajectory.
 
     Returns:
         Every file written, per-camera files first.
@@ -220,7 +218,8 @@ def write_pose_files(
         write_tum_file(path, _tum_poses(frames_meta, by_camera[camera_params_id], export_pose_in_vehicle_frame))
         written.append(path)
 
-    if also_merge_poses and export_pose_in_vehicle_frame:
+    # `CusfmRunner` always passes `--also_merge_poses`, so the merged file is not a knob.
+    if export_pose_in_vehicle_frame:
         merged_path: Path = poses_dir / MERGED_POSE_FILE_NAME
         write_tum_file(merged_path, _tum_poses(frames_meta, frames_meta.keyframes, True))
         written.append(merged_path)
@@ -232,12 +231,17 @@ def write_optimised_frames_meta(
     frames_meta: FramesMeta,
     world_T_cam_by_keyframe_id: Mapping[int, pycolmap.Rigid3d],
     initial_pose_type: InitialPoseType = "ALIGNMENT",
-) -> Path:
+) -> FramesMeta:
     """Write `<output_dir>/kpmap/keyframes/frames_meta.json` with optimised poses.
 
     Everything except `camera_to_world` and `initial_pose_type` is copied from the
     input collection verbatim, which is exactly what the blob's own diff shows
     (export.md §5.2: 32 of 32 keyframes differ in the pose and in nothing else).
+
+    The re-posed collection is returned rather than the path — the path is
+    `output_dir / KEYFRAME_METADATA_SUBPATH` by definition, whereas `write_pose_files`
+    needs the very collection that was written, and building it twice is how the
+    exported poses and the exported TUM files drift apart.
 
     Args:
         output_dir: Workspace root.
@@ -246,11 +250,11 @@ def write_optimised_frames_meta(
         initial_pose_type: Provenance to stamp; the mapper writes `ALIGNMENT`.
 
     Returns:
-        The path written.
+        The collection that was written.
     """
-    path: Path = output_dir / KEYFRAME_METADATA_SUBPATH
-    write_frames_meta(path, frames_meta.with_camera_to_world(world_T_cam_by_keyframe_id, initial_pose_type))
-    return path
+    optimised: FramesMeta = frames_meta.with_camera_to_world(world_T_cam_by_keyframe_id, initial_pose_type)
+    write_frames_meta(output_dir / KEYFRAME_METADATA_SUBPATH, optimised)
+    return optimised
 
 
 def append_runtime_record(output_dir: Path, record: RuntimeRecord) -> Path:

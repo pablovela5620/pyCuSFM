@@ -8,16 +8,9 @@ from pathlib import Path
 
 import numpy as np
 import pycolmap
-import pytest
 
 from colsfm.frames_meta import FramesMeta, KeyframeMeta, RigFrame, read_frames_meta, write_frames_meta
 from colsfm.geometry import parse_tum_line, rigid3d_from_axis_angle_degrees
-
-
-@pytest.fixture(scope="module")
-def galileo_input(galileo_input_meta: Path) -> FramesMeta:
-    """The 226-keyframe Galileo input metadata."""
-    return read_frames_meta(galileo_input_meta)
 
 
 def test_reads_every_keyframe_and_camera(galileo_input: FramesMeta) -> None:

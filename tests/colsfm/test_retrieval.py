@@ -4,7 +4,9 @@ Seams under test (all public):
 
 * `build_retrieval_index` — turning per-image descriptors into a similarity matrix.
 * `RetrievalIndex.query` / `.score` — ranked candidates, self and temporal exclusion.
+* `RetrievalIndex.search` — the same, plus what the temporal gate dropped.
 * `read_descriptors_from_database` — the pycolmap read path.
+* `colsfm.vocab_tree.bow_matrix` / `all_pairs_l1_score` — the vocabulary's scoring.
 
 The Galileo test reads the shipped blob keyframe protos directly rather than running the
 feature extractor, so it is offline and needs no GPU. Its reader lives in this file
@@ -25,20 +27,22 @@ import pytest
 from jaxtyping import Float32, Int32
 from numpy import ndarray
 
-from colsfm.frames_meta import FramesMeta, read_frames_meta
+from colsfm.database import read_descriptors_from_database
+from colsfm.frames_meta import FramesMeta, KeyframeMeta, read_frames_meta
 from colsfm.retrieval import (
     ALIKED_DESCRIPTOR_DIM,
+    GOOD_SCORE_THRESHOLD,
+    BruteForceConfig,
     Candidate,
     Descriptors,
     RetrievalConfig,
     RetrievalIndex,
-    _all_pairs_l1_score,
-    _bow_matrix,
+    RetrievalQuery,
+    VocabConfig,
     build_retrieval_index,
-    l1_score,
-    read_descriptors_from_database,
 )
 from colsfm.schema import KEYFRAME, load_schema
+from colsfm.vocab_tree import all_pairs_l1_score, bow_matrix, l1_score
 
 REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 """Repo root, so data paths resolve regardless of the working directory."""
@@ -234,6 +238,76 @@ def test_build_rejects_a_single_image() -> None:
         build_retrieval_index({0: np.zeros((4, ALIKED_DESCRIPTOR_DIM), dtype=np.float32)})
 
 
+@pytest.mark.parametrize("backend", ["brute_force", "vocab"])
+def test_build_rejects_descriptors_of_different_widths_on_either_backend(backend: str) -> None:
+    """A ragged corpus is a `ValueError`, as the docstring promises, on both paths.
+
+    The check used to live inside the brute force's own stacking step, so the vocab path
+    reached `numpy.concatenate` with mismatched rows and failed there with a message about
+    array dimensions instead of about the descriptors.
+    """
+    generator: np.random.Generator = np.random.default_rng(3)
+    corpus: dict[int, Descriptors] = {
+        0: generator.standard_normal((16, ALIKED_DESCRIPTOR_DIM), dtype=np.float32),
+        1: generator.standard_normal((16, ALIKED_DESCRIPTOR_DIM), dtype=np.float32),
+        2: generator.standard_normal((16, ALIKED_DESCRIPTOR_DIM // 2), dtype=np.float32),
+    }
+    with pytest.raises(ValueError, match="descriptors, expected"):
+        build_retrieval_index(corpus, RetrievalConfig(backend=backend))
+
+
+def test_search_reports_what_the_temporal_gate_dropped_from_the_same_walk(
+    synthetic_corpus: SyntheticCorpus, synthetic_index: RetrievalIndex
+) -> None:
+    """`search` returns the hits and the gated count together, so a funnel can compose.
+
+    The loop-closure stage used to issue a second, ungated query only to count the temporal
+    rejections; the two numbers then described different candidate sets. Here the gate runs
+    inside the one ranking walk, so every hit the walk looked at is either returned or
+    counted.
+
+    The gate also runs inside the walk rather than over a finished top-k, which is what
+    keeps all `top_k` slots useful: with three slots, the gated query still returns three
+    candidates where a gated top-3 would have returned one.
+    """
+    gate_us: int = 5 * FRAME_PERIOD_US
+    answer: RetrievalQuery = synthetic_index.search(10, top_k=20, min_time_gap_us=gate_us, timestamps=synthetic_corpus.timestamps_us)
+    assert answer.candidates
+    assert answer.rejected_by_time > 0
+    assert answer.candidates == synthetic_index.query(10, top_k=20, min_time_gap_us=gate_us, timestamps=synthetic_corpus.timestamps_us)
+    assert synthetic_index.search(10, top_k=20).rejected_by_time == 0
+
+    narrow: RetrievalQuery = synthetic_index.search(10, top_k=3, min_time_gap_us=gate_us, timestamps=synthetic_corpus.timestamps_us)
+    ungated_top3: list[Candidate] = synthetic_index.query(10, top_k=3)
+    assert len(narrow.candidates) == 3
+    assert {candidate.image_id for candidate in ungated_top3} & {9, 11}
+    assert {candidate.image_id for candidate in narrow.candidates}.isdisjoint({9, 11})
+
+
+def test_the_config_nests_the_two_backends_and_still_defaults_in_one_call() -> None:
+    """`RetrievalConfig()` builds a whole working config; each backend owns its own knobs.
+
+    The two backends share nothing but the seed, so a flat config made every reader work out
+    which of ten fields the backend they chose actually reads. Nesting must not cost the
+    zero-argument construction the pipeline relies on.
+    """
+    config: RetrievalConfig = RetrievalConfig()
+    assert config.brute_force == BruteForceConfig()
+    assert config.vocab == VocabConfig()
+    assert RetrievalConfig(vocab=VocabConfig(depth=2)).vocab.depth == 2
+    with pytest.raises(ValueError, match="max_descriptors_per_image"):
+        BruteForceConfig(max_descriptors_per_image=0)
+    with pytest.raises(ValueError, match="vocab depth"):
+        VocabConfig(depth=0)
+
+
+def test_the_backend_is_derived_from_the_config_and_the_corpus(synthetic_corpus: SyntheticCorpus, synthetic_index: RetrievalIndex) -> None:
+    """`RetrievalIndex.backend` is a property, so it cannot disagree with what built it."""
+    assert synthetic_index.backend == synthetic_index.config.resolve_backend(len(synthetic_index.image_ids))
+    assert synthetic_index.backend == "brute_force"
+    assert build_retrieval_index(synthetic_corpus.descriptors, RetrievalConfig(brute_force_max_images=1)).backend == "vocab"
+
+
 # --------------------------------------------------------------------------------------
 # a. runtime
 # --------------------------------------------------------------------------------------
@@ -327,7 +401,7 @@ def test_the_vocabulary_backend_finds_the_revisit_once_neighbours_are_excluded(
         )
         assert candidates, f"image {query_id} retrieved nothing"
         assert candidates[0].image_id == query_id + synthetic_corpus.loop_offset
-        assert candidates[0].score > synthetic_vocab_index.good_score_threshold
+        assert candidates[0].score > GOOD_SCORE_THRESHOLD
 
 
 def test_the_vocabulary_score_ranks_the_revisit_above_the_neighbour_above_the_stranger(
@@ -345,7 +419,7 @@ def test_the_vocabulary_score_ranks_the_revisit_above_the_neighbour_above_the_st
     assert synthetic_vocab_index.score(10, 10) == 1.0
     assert synthetic_vocab_index.score(60, 10) == revisit
     assert revisit > neighbour > stranger
-    assert stranger < synthetic_vocab_index.good_score_threshold
+    assert stranger < GOOD_SCORE_THRESHOLD
 
 
 def test_the_vocabulary_backend_is_reproducible_and_the_seed_is_what_moves_it(
@@ -364,7 +438,7 @@ def test_the_vocabulary_backend_is_reproducible_and_the_seed_is_what_moves_it(
 
 
 def test_the_vectorised_l1_score_agrees_with_the_spec_reference() -> None:
-    """`_all_pairs_l1_score` must equal `docs/spec/bow.md` §9.5's `l1_score`, pair by pair.
+    """`all_pairs_l1_score` must equal `docs/spec/bow.md` §9.5's `l1_score`, pair by pair.
 
     The vectorised path replaces `-0.5 * (|q - d| - |q| - |d|)` with `min(q, d)`, which is
     the same thing for non-negative weights and is what lets the inverted index score every
@@ -376,8 +450,8 @@ def test_the_vectorised_l1_score_agrees_with_the_spec_reference() -> None:
     n_words: int = 40
     words: Int32[ndarray, "n_descriptors"] = generator.integers(0, n_words, 600).astype(np.int32)
     images: Int32[ndarray, "n_descriptors"] = np.repeat(np.arange(n_images, dtype=np.int32), 100)
-    bow = _bow_matrix(words, images, n_images, n_words)
-    scores: Float32[ndarray, "n_images n_images"] = _all_pairs_l1_score(bow)
+    bow = bow_matrix(words, images, n_images, n_words)
+    scores: Float32[ndarray, "n_images n_images"] = all_pairs_l1_score(bow)
     dense: Float32[ndarray, "n_images n_words"] = bow.toarray()
     np.testing.assert_allclose(dense.sum(axis=1), 1.0, atol=1e-6)
 
@@ -407,7 +481,7 @@ def test_the_vocabulary_backend_builds_and_queries_1000_images_inside_the_budget
         index.query(image_id, top_k=20)
     query_seconds: float = time.perf_counter() - started
     print(f"vocab retrieval: 1000 x 2048 -> {index.n_words} words, build {build_seconds:.1f} s, 1000 queries {query_seconds:.2f} s")
-    assert index.n_words == RetrievalConfig().vocab_branching ** RetrievalConfig().vocab_depth
+    assert index.n_words == VocabConfig().branching ** VocabConfig().depth
     assert build_seconds < 90.0
     assert query_seconds < 30.0
 
@@ -475,56 +549,91 @@ def test_galileo_descriptors_are_128d_and_unit_norm(galileo_descriptors: Mapping
     assert np.allclose(np.linalg.norm(sample, axis=1), 1.0, atol=1e-3)
 
 
-def test_galileo_top_candidate_is_a_nearby_view(galileo_index: RetrievalIndex, galileo_frames_meta: FramesMeta) -> None:
-    """Every keyframe's best match is the same camera or its stereo partner, and nearly always a nearby rig frame.
+@dataclass(frozen=True, slots=True)
+class GalileoRecall:
+    """How well one index's top candidates match the geometry of the Galileo sweep."""
 
-    Galileo is a 0.66 m sweep over 29 rig frames of 8 cameras, so there is no true
-    revisit in the data: the only "loops" it can offer are near-duplicate views. That
-    bounds what this test can assert. What the data *does* support is that the ranking is
-    geometric rather than random:
+    n_keyframes: int
+    """Keyframes queried."""
+    same_or_stereo_camera: int
+    """Queries whose top candidate came from their own camera or its stereo partner."""
+    top1_within_two_rigs: int
+    """Queries whose top candidate is within 2 rig frames."""
+    top3_within_two_rigs: int
+    """Queries with a top-3 candidate within 2 rig frames."""
 
-    * the top candidate always comes from the query's own camera or its stereo partner
-      (226/226) — cross-rig, cross-direction views never win;
-    * the top candidate is within 2 rig frames for 194/226 keyframes, and one of the top 3
-      is within 2 rig frames for 222/226.
 
-    The thresholds below sit under the measured values with a margin, so the test fails on
-    a real regression rather than on noise.
+def galileo_recall(index: RetrievalIndex, frames_meta: FramesMeta) -> GalileoRecall:
+    """Tally an index's top-3 candidates against the rig order and the stereo pairing.
+
+    Args:
+        index: An index over the Galileo keyframes.
+        frames_meta: The metadata of the same run.
+
+    Returns:
+        The three counts, out of the keyframes queried.
     """
     stereo_partner: dict[int, int] = {}
-    for pair in galileo_frames_meta.stereo_pairs:
+    for pair in frames_meta.stereo_pairs:
         stereo_partner[pair.left_camera_params_id] = pair.right_camera_params_id
         stereo_partner[pair.right_camera_params_id] = pair.left_camera_params_id
-    keyframe_by_id = galileo_frames_meta.keyframe_by_id()
-    rig_order: dict[int, int] = {
-        rig.synced_sample_id: position for position, rig in enumerate(galileo_frames_meta.rig_frames())
-    }
+    keyframe_by_id: dict[int, KeyframeMeta] = frames_meta.keyframe_by_id()
+    rig_order: dict[int, int] = {rig.synced_sample_id: position for position, rig in enumerate(frames_meta.rig_frames())}
 
     same_camera_family: int = 0
     top1_within_two_rigs: int = 0
     top3_within_two_rigs: int = 0
-    for keyframe_id in galileo_index.image_ids:
-        candidates: list[Candidate] = galileo_index.query(keyframe_id, top_k=3)
+    for keyframe_id in index.image_ids:
+        candidates: list[Candidate] = index.query(keyframe_id, top_k=3)
         assert candidates, f"keyframe {keyframe_id} retrieved nothing"
         query_camera: int = keyframe_by_id[keyframe_id].camera_params_id
         query_rig: int = rig_order[keyframe_by_id[keyframe_id].synced_sample_id]
         best_camera: int = keyframe_by_id[candidates[0].image_id].camera_params_id
         same_camera_family += best_camera in (query_camera, stereo_partner[query_camera])
-        offsets: list[int] = [abs(rig_order[keyframe_by_id[c.image_id].synced_sample_id] - query_rig) for c in candidates]
+        offsets: list[int] = [abs(rig_order[keyframe_by_id[candidate.image_id].synced_sample_id] - query_rig) for candidate in candidates]
         top1_within_two_rigs += offsets[0] <= 2
         top3_within_two_rigs += min(offsets) <= 2
-
-    n_keyframes: int = len(galileo_index.image_ids)
-    print(
-        f"galileo retrieval: build {galileo_index.build_seconds:.1f} s, "
-        f"{galileo_index.descriptors_per_image} descriptors/image, "
-        f"top1 same-or-stereo camera {same_camera_family}/{n_keyframes}, "
-        f"top1 within 2 rigs {top1_within_two_rigs}/{n_keyframes}, "
-        f"top3 within 2 rigs {top3_within_two_rigs}/{n_keyframes}"
+    return GalileoRecall(
+        n_keyframes=len(index.image_ids),
+        same_or_stereo_camera=same_camera_family,
+        top1_within_two_rigs=top1_within_two_rigs,
+        top3_within_two_rigs=top3_within_two_rigs,
     )
-    assert same_camera_family == n_keyframes
-    assert top1_within_two_rigs >= 0.80 * n_keyframes
-    assert top3_within_two_rigs >= 0.95 * n_keyframes
+
+
+@pytest.mark.parametrize(("index_fixture", "min_top1_fraction", "min_same_camera_fraction"), [("galileo_index", 0.80, 1.0), ("galileo_vocab_index", 0.80, 0.95)])
+def test_galileo_top_candidate_is_a_nearby_view(
+    request: pytest.FixtureRequest, galileo_frames_meta: FramesMeta, index_fixture: str, min_top1_fraction: float, min_same_camera_fraction: float
+) -> None:
+    """Every keyframe's best match is a nearby view of the same scene, on either backend.
+
+    Galileo is a 0.66 m sweep over 29 rig frames of 8 cameras, so there is no true revisit
+    in the data: the only "loops" it can offer are near-duplicate views. That bounds what
+    this test can assert. What the data *does* support is that the ranking is geometric
+    rather than random. Measured on the shipped descriptors:
+
+    | backend | top-1 within 2 rigs | top-3 within 2 rigs | same-or-stereo camera |
+    |---|---|---|---|
+    | brute force | 194/226 | 222/226 | 226/226 |
+    | vocab | 222/226 | 226/226 | 226/226 |
+
+    The bars below sit under the measured values with a margin, so the test fails on a real
+    regression rather than on k-means noise. `colsfm.retrieval`'s module docstring carries
+    the same numbers next to the build times, because together they are the case for or
+    against keeping two backends.
+    """
+    index: RetrievalIndex = request.getfixturevalue(index_fixture)
+    recall: GalileoRecall = galileo_recall(index, galileo_frames_meta)
+    print(
+        f"galileo {index.backend} retrieval: build {index.build_seconds:.1f} s, "
+        f"{index.descriptors_per_image} descriptors/image, {index.n_words} words, "
+        f"top1 same-or-stereo camera {recall.same_or_stereo_camera}/{recall.n_keyframes}, "
+        f"top1 within 2 rigs {recall.top1_within_two_rigs}/{recall.n_keyframes}, "
+        f"top3 within 2 rigs {recall.top3_within_two_rigs}/{recall.n_keyframes}"
+    )
+    assert recall.same_or_stereo_camera >= min_same_camera_fraction * recall.n_keyframes
+    assert recall.top1_within_two_rigs >= min_top1_fraction * recall.n_keyframes
+    assert recall.top3_within_two_rigs >= 0.95 * recall.n_keyframes
 
 
 def test_galileo_scores_separate_near_views_from_far_ones(galileo_index: RetrievalIndex) -> None:
@@ -540,47 +649,6 @@ def test_galileo_scores_separate_near_views_from_far_ones(galileo_index: Retriev
 def galileo_vocab_index(galileo_descriptors: Mapping[int, Descriptors]) -> RetrievalIndex:
     """A vocabulary-tree index over the real Galileo descriptors."""
     return build_retrieval_index(galileo_descriptors, RetrievalConfig(backend="vocab"))
-
-
-def test_galileo_vocabulary_top_candidate_is_a_nearby_view(galileo_vocab_index: RetrievalIndex, galileo_frames_meta: FramesMeta) -> None:
-    """The vocab backend, on real ALIKED descriptors, ranks by geometry rather than by chance.
-
-    Galileo is a 0.66 m sweep over 29 rig frames of 8 cameras, so there is no true revisit;
-    what the data supports is that the best match is a nearby view of the same scene. On
-    the shipped descriptors the vocab backend puts the top candidate within 2 rig frames
-    for 222/226 keyframes and in the same or the stereo-paired camera for 226/226 — better
-    than the brute force's 194/226, which is what the RoboCap measurements predict: the
-    brute force is the one paying for its descriptor budget, not the vocabulary.
-
-    The bar is the 80 % the task fixed, which sits well under the measured 97 %, so the
-    test fails on a real regression rather than on k-means noise.
-    """
-    stereo_partner: dict[int, int] = {}
-    for pair in galileo_frames_meta.stereo_pairs:
-        stereo_partner[pair.left_camera_params_id] = pair.right_camera_params_id
-        stereo_partner[pair.right_camera_params_id] = pair.left_camera_params_id
-    keyframe_by_id = galileo_frames_meta.keyframe_by_id()
-    rig_order: dict[int, int] = {rig.synced_sample_id: position for position, rig in enumerate(galileo_frames_meta.rig_frames())}
-
-    same_camera_family: int = 0
-    top1_within_two_rigs: int = 0
-    for keyframe_id in galileo_vocab_index.image_ids:
-        candidates: list[Candidate] = galileo_vocab_index.query(keyframe_id, top_k=1)
-        assert candidates, f"keyframe {keyframe_id} retrieved nothing"
-        query_camera: int = keyframe_by_id[keyframe_id].camera_params_id
-        query_rig: int = rig_order[keyframe_by_id[keyframe_id].synced_sample_id]
-        best_camera: int = keyframe_by_id[candidates[0].image_id].camera_params_id
-        same_camera_family += best_camera in (query_camera, stereo_partner[query_camera])
-        top1_within_two_rigs += abs(rig_order[keyframe_by_id[candidates[0].image_id].synced_sample_id] - query_rig) <= 2
-
-    n_keyframes: int = len(galileo_vocab_index.image_ids)
-    print(
-        f"galileo vocab retrieval: build {galileo_vocab_index.build_seconds:.1f} s, "
-        f"{galileo_vocab_index.n_words} words, top1 same-or-stereo camera {same_camera_family}/{n_keyframes}, "
-        f"top1 within 2 rigs {top1_within_two_rigs}/{n_keyframes}"
-    )
-    assert top1_within_two_rigs >= 0.80 * n_keyframes
-    assert same_camera_family >= 0.95 * n_keyframes
 
 
 # --------------------------------------------------------------------------------------
@@ -616,7 +684,7 @@ def test_descriptors_round_trip_through_a_colmap_database(tmp_path: Path, synthe
     for image_id in wanted:
         np.testing.assert_array_equal(recovered[image_id + 1], synthetic_corpus.descriptors[image_id])
 
-    index: RetrievalIndex = build_retrieval_index(recovered, RetrievalConfig(max_descriptors_per_image=64))
+    index: RetrievalIndex = build_retrieval_index(recovered, RetrievalConfig(brute_force=BruteForceConfig(max_descriptors_per_image=64)))
     assert index.image_ids == (1, 2, 3)
 
 

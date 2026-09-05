@@ -13,7 +13,8 @@ Three things about COLMAP 4.2 shape this module:
 * **`Camera.has_prior_focal_length` defaults to False**, and that silently
   selects the uncalibrated (fundamental-matrix) path in two-view geometry: a
   PINHOLE pair comes back `UNCALIBRATED`, an `OPENCV_FISHEYE` pair comes back
-  `DEGENERATE` with zero inliers (§5). Every camera written here sets it True.
+  `DEGENERATE` with zero inliers (§5). `colsfm.cameras.colmap_camera` sets it
+  True on every camera it builds, which is every camera that reaches this module.
 * **`extract_features` reuses a pre-existing image row** rather than inserting a
   second one: COLMAP's `ImageReader` looks the name up first, keeps the
   `camera_id`, `image_id` and `frame_id` already stored, and leaves the rig and
@@ -29,11 +30,11 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import TypeAlias
+from typing import Final, TypeAlias
 
 import numpy as np
 import pycolmap
-from jaxtyping import Float32, Int64
+from jaxtyping import Float, Float32, Int64
 from numpy import ndarray
 
 from colsfm.cameras import colmap_cameras
@@ -46,17 +47,27 @@ ImagePair: TypeAlias = tuple[int, int]
 KeypointsXY: TypeAlias = Float32[ndarray, "num_keypoints 2"]
 """Keypoint pixel coordinates in the original image, COLMAP's float32 storage type."""
 
+Keypoints: TypeAlias = Float[ndarray, "num_keypoints 2"]
+"""The same coordinates at whichever float width the caller asked `read_keypoints_batch` for.
+
+COLMAP stores them as float32 and `colsfm.matching` works in that width, but pycolmap's
+generalized absolute-pose estimators take float64, so the batch reader is parameterised on
+the dtype rather than forcing every caller through a cast it has to remember."""
+
+Descriptors: TypeAlias = Float32[ndarray, "num_features descriptor_dim"]
+"""One image's feature descriptors, as `FeatureDescriptors.to_float()` reinterprets them."""
+
+KeypointDtype: TypeAlias = type[np.float32 | np.float64]
+"""The two float widths `read_keypoints_batch` will return keypoint positions at."""
+
+KEYPOINT_XY_COLUMNS: Final[int] = 2
+"""COLMAP's keypoint rows are Nx2, Nx4 or Nx6; only the leading xy pair is a position."""
+
 MatchIndices: TypeAlias = Int64[ndarray, "num_matches 2"]
 """One row per match: the keypoint index in the pair's first image, then in its second."""
 
 
-def create_database(
-    database_path: Path,
-    frames_meta: FramesMeta,
-    cameras: Mapping[int, pycolmap.Camera] | None = None,
-    *,
-    overwrite: bool = False,
-) -> None:
+def create_database(database_path: Path, frames_meta: FramesMeta, *, overwrite: bool = False) -> None:
     """Write cameras, the rig, the frames and the images of a collection.
 
     Nothing else is written: keypoints, descriptors, matches and two-view
@@ -66,8 +77,6 @@ def create_database(
         database_path: Destination `.db` file; parent directories are created.
         frames_meta: The collection to import, already filtered to the keyframes
             that should be reconstructed (see `colsfm.keyframe_selection`).
-        cameras: COLMAP cameras keyed by `camera_params_id`; derived from
-            `frames_meta` with `colsfm.cameras.colmap_cameras` when None.
         overwrite: Delete an existing database first instead of failing.
 
     Raises:
@@ -79,24 +88,18 @@ def create_database(
         database_path.unlink()
     database_path.parent.mkdir(parents=True, exist_ok=True)
 
-    resolved_cameras: Mapping[int, pycolmap.Camera] = colmap_cameras(frames_meta) if cameras is None else cameras
+    cameras: dict[int, pycolmap.Camera] = colmap_cameras(frames_meta)
     keyframe_by_id: dict[int, KeyframeMeta] = frames_meta.keyframe_by_id()
     rig_frames: tuple[RigFrame, ...] = frames_meta.rig_frames()
 
-    database: pycolmap.Database = pycolmap.Database.open(database_path)
-    try:
-        for camera_params_id, camera in sorted(resolved_cameras.items()):
-            camera.camera_id = camera_params_id
-            camera.has_prior_focal_length = True
+    with pycolmap.Database.open(database_path) as database:
+        for camera in cameras.values():
             database.write_camera(camera, True)
         database.write_rig(build_rig(frames_meta), True)
         for rig_frame in rig_frames:
             database.write_frame(_colmap_frame(rig_frame, keyframe_by_id), True)
-        for rig_frame in rig_frames:
             for keyframe_id in rig_frame.keyframe_ids:
                 database.write_image(_colmap_image(keyframe_by_id[keyframe_id]), True)
-    finally:
-        database.close()
 
 
 def _colmap_frame(rig_frame: RigFrame, keyframe_by_id: Mapping[int, KeyframeMeta]) -> pycolmap.Frame:
@@ -147,11 +150,8 @@ def image_ids_by_name(database_path: Path) -> dict[str, int]:
     Returns:
         `image_id` keyed by `name`.
     """
-    database: pycolmap.Database = pycolmap.Database.open(database_path)
-    try:
+    with pycolmap.Database.open(database_path) as database:
         return {image.name: image.image_id for image in database.read_all_images()}
-    finally:
-        database.close()
 
 
 def read_keypoints(database_path: Path, image_id: int) -> KeypointsXY:
@@ -165,12 +165,79 @@ def read_keypoints(database_path: Path, image_id: int) -> KeypointsXY:
         Float32 `[num_keypoints, 2]` xy pixel coordinates. COLMAP's ALIKED
         extractor stores Nx6 rows; the trailing affine block is dropped.
     """
-    database: pycolmap.Database = pycolmap.Database.open(database_path)
-    try:
+    with pycolmap.Database.open(database_path) as database:
         stored: Float32[ndarray, "num_keypoints num_columns"] = database.read_keypoints(image_id)
-    finally:
-        database.close()
-    return np.ascontiguousarray(stored[:, :2])
+    return np.ascontiguousarray(stored[:, :KEYPOINT_XY_COLUMNS])
+
+
+def read_keypoints_batch(
+    database_path: Path, image_ids: Iterable[int], dtype: KeypointDtype = np.float32
+) -> dict[int, Keypoints]:
+    """Read many images' keypoint positions through one database handle.
+
+    The same "leading xy columns" rule as `read_keypoints`, spelled once: COLMAP's
+    `write_keypoints` stores whatever column count it is handed (Nx2, Nx4 and Nx6 are all
+    legal, `docs/spec/pycolmap-capabilities.md` §4), so anything past the first two is an
+    affine block, not a position.
+
+    Args:
+        database_path: An existing database.
+        image_ids: Images to read, in any order.
+        dtype: Float width to return. `float32` is COLMAP's storage width and what the
+            matcher works in; `float64` is what pycolmap's generalized absolute-pose
+            estimators take, so `colsfm.loop_pose` asks for it.
+
+    Returns:
+        Keypoint pixels per image id; an image with no keypoint row is left out.
+
+    Raises:
+        FileNotFoundError: When the database does not exist.
+    """
+    if not database_path.is_file():
+        raise FileNotFoundError(f"No COLMAP database at {database_path}")
+    keypoints: dict[int, Keypoints] = {}
+    with pycolmap.Database.open(database_path) as database:
+        for image_id in image_ids:
+            if not database.exists_keypoints(image_id):
+                continue
+            stored: Float32[ndarray, "num_keypoints num_columns"] = database.read_keypoints(image_id)
+            keypoints[image_id] = np.ascontiguousarray(stored[:, :KEYPOINT_XY_COLUMNS], dtype=dtype)
+    return keypoints
+
+
+def read_descriptors_from_database(database_path: Path, image_ids: Iterable[int] | None = None) -> dict[int, Descriptors]:
+    """Read float32 feature descriptors out of a COLMAP database.
+
+    COLMAP 4.2 stores descriptors as an opaque uint8 blob, so an Nx128 float32 ALIKED
+    block comes back as Nx512 uint8 and must be reinterpreted with
+    `FeatureDescriptors.to_float()` — a reinterpret, not a cast
+    (`docs/spec/pycolmap-capabilities.md` §4).
+
+    Args:
+        database_path: An existing database.
+        image_ids: Images to read, or None for every image in the database.
+
+    Returns:
+        Descriptors per image id; an image with no descriptor row is left out.
+
+    Raises:
+        FileNotFoundError: When the database does not exist.
+    """
+    if not database_path.is_file():
+        raise FileNotFoundError(f"No COLMAP database at {database_path}")
+    descriptors_by_image: dict[int, Descriptors] = {}
+    with pycolmap.Database.open(database_path) as database:
+        wanted: list[int] = (
+            [int(image.image_id) for image in database.read_all_images()]
+            if image_ids is None
+            else [int(image_id) for image_id in image_ids]
+        )
+        for image_id in wanted:
+            if not database.exists_descriptors(image_id):
+                continue
+            stored: pycolmap.FeatureDescriptors = database.read_descriptors(image_id)
+            descriptors_by_image[image_id] = np.ascontiguousarray(stored.to_float().data, dtype=np.float32)
+    return descriptors_by_image
 
 
 def keypoint_counts(database_path: Path, image_ids: Iterable[int] | None = None) -> dict[int, int]:
@@ -181,16 +248,18 @@ def keypoint_counts(database_path: Path, image_ids: Iterable[int] | None = None)
         image_ids: Images to count; every image in the database by default.
 
     Returns:
-        Keypoint count keyed by `image_id`.
+        Keypoint count keyed by `image_id`; 0 for an image with no keypoint row.
+
+    Note:
+        `num_keypoints_for_image` reads the stored row count out of SQLite rather
+        than materialising the blob, which matters on RoboCap where the keypoints
+        are 222 MB and this is only ever printed.
     """
-    database: pycolmap.Database = pycolmap.Database.open(database_path)
-    try:
+    with pycolmap.Database.open(database_path) as database:
         wanted: list[int] = (
             [image.image_id for image in database.read_all_images()] if image_ids is None else list(image_ids)
         )
-        return {image_id: int(database.read_keypoints(image_id).shape[0]) for image_id in wanted}
-    finally:
-        database.close()
+        return {image_id: int(database.num_keypoints_for_image(image_id)) for image_id in wanted}
 
 
 def read_two_view_geometry(database_path: Path, image_id1: int, image_id2: int) -> pycolmap.TwoViewGeometry:
@@ -204,15 +273,33 @@ def read_two_view_geometry(database_path: Path, image_id1: int, image_id2: int) 
     Returns:
         The stored geometry; an empty one when the pair was never verified.
     """
-    database: pycolmap.Database = pycolmap.Database.open(database_path)
-    try:
+    with pycolmap.Database.open(database_path) as database:
         return database.read_two_view_geometry(image_id1, image_id2)
-    finally:
-        database.close()
+
+
+def _counts_by_pair(pair_ids: Sequence[int], counts: Sequence[int]) -> dict[ImagePair, int]:
+    """Turn one of pycolmap's bulk `(pair_ids, counts)` readings into a pair-keyed map.
+
+    COLMAP stores a pair under a single packed 64-bit id; the bulk readers return
+    every stored row, so a pair that has no row is simply absent and the caller
+    supplies the 0.
+
+    Args:
+        pair_ids: Packed pair ids, as the bulk reader returned them.
+        counts: The matching counts, same length and order.
+
+    Returns:
+        Count keyed by `(min(image_id), max(image_id))`.
+    """
+    return {pycolmap.pair_id_to_image_pair(pair_id): int(count) for pair_id, count in zip(pair_ids, counts, strict=True)}
 
 
 def pair_inlier_counts(database_path: Path, pairs: Sequence[ImagePair]) -> dict[ImagePair, int]:
     """Count the verified inlier matches of many pairs in one pass.
+
+    `read_two_view_geometry_num_inliers` reads every stored row's count without
+    materialising a single match blob, so the cost no longer grows with the
+    matches per pair.
 
     Args:
         database_path: An existing database.
@@ -221,13 +308,9 @@ def pair_inlier_counts(database_path: Path, pairs: Sequence[ImagePair]) -> dict[
     Returns:
         Inlier count keyed by the pair as given; 0 for a pair with no geometry.
     """
-    database: pycolmap.Database = pycolmap.Database.open(database_path)
-    try:
-        return {
-            pair: len(database.read_two_view_geometry(pair[0], pair[1]).inlier_matches) for pair in pairs
-        }
-    finally:
-        database.close()
+    with pycolmap.Database.open(database_path) as database:
+        counts: dict[ImagePair, int] = _counts_by_pair(*database.read_two_view_geometry_num_inliers())
+    return {pair: counts.get(pair, 0) for pair in pairs}
 
 
 def delete_two_view_geometries(database_path: Path, pairs: Sequence[ImagePair]) -> None:
@@ -242,16 +325,16 @@ def delete_two_view_geometries(database_path: Path, pairs: Sequence[ImagePair]) 
         database_path: An existing database.
         pairs: Image pairs whose geometries should be removed.
     """
-    database: pycolmap.Database = pycolmap.Database.open(database_path)
-    try:
+    with pycolmap.Database.open(database_path) as database:
         for image_id1, image_id2 in pairs:
             database.delete_two_view_geometry(image_id1, image_id2)
-    finally:
-        database.close()
 
 
 def raw_match_counts(database_path: Path, pairs: Sequence[ImagePair]) -> dict[ImagePair, int]:
     """Count the unverified matches of many pairs in one pass.
+
+    `read_num_matches` reads every stored row's count in one query rather than
+    fetching and measuring each pair's match blob.
 
     Args:
         database_path: An existing database.
@@ -260,8 +343,6 @@ def raw_match_counts(database_path: Path, pairs: Sequence[ImagePair]) -> dict[Im
     Returns:
         Raw match count keyed by the pair as given; 0 for an unmatched pair.
     """
-    database: pycolmap.Database = pycolmap.Database.open(database_path)
-    try:
-        return {pair: len(database.read_matches(pair[0], pair[1])) for pair in pairs}
-    finally:
-        database.close()
+    with pycolmap.Database.open(database_path) as database:
+        counts: dict[ImagePair, int] = _counts_by_pair(*database.read_num_matches())
+    return {pair: counts.get(pair, 0) for pair in pairs}

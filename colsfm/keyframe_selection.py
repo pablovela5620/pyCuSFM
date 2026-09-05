@@ -20,7 +20,6 @@ Kept samples keep the number they were given in pass 1, so a selected file's
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Final
 
@@ -50,10 +49,20 @@ class KeyframeSelection:
 
     kept_keyframe_ids: tuple[int, ...]
     """Surviving keyframe ids, in the input file's order."""
-    kept_synced_sample_ids: tuple[int, ...]
-    """Surviving rig frame ids, ascending; sparse within the dense 1..N numbering."""
     synced_sample_id_by_keyframe_id: dict[int, int]
     """Renumbered rig frame id for every keyframe of the collection, kept or not."""
+
+    @property
+    def kept_synced_sample_ids(self) -> tuple[int, ...]:
+        """Surviving rig frame ids, ascending.
+
+        Sparse within the dense 1..N numbering: Galileo at 0.5 m / 5 deg keeps
+        `1, 8, 15, 22, 29`.
+
+        Returns:
+            The rig frame id of every kept keyframe, deduplicated and ascending.
+        """
+        return tuple(sorted({self.synced_sample_id_by_keyframe_id[keyframe_id] for keyframe_id in self.kept_keyframe_ids}))
 
 
 def synchronise_samples(
@@ -137,7 +146,6 @@ def select_keyframes(
     )
     return KeyframeSelection(
         kept_keyframe_ids=kept_keyframe_ids,
-        kept_synced_sample_ids=tuple(kept_sample_ids),
         synced_sample_id_by_keyframe_id=samples.synced_sample_id_by_keyframe_id,
     )
 
@@ -154,17 +162,3 @@ def apply_selection(frames_meta: FramesMeta, selection: KeyframeSelection) -> Fr
         rewritten to the dense 1-based numbering.
     """
     return frames_meta.filtered(selection.kept_keyframe_ids, selection.synced_sample_id_by_keyframe_id)
-
-
-def selected_image_names(frames_meta: FramesMeta, kept_keyframe_ids: Sequence[int]) -> tuple[str, ...]:
-    """List the images the selection keeps, in input order.
-
-    Args:
-        frames_meta: The input collection.
-        kept_keyframe_ids: Keyframe ids that survived selection.
-
-    Returns:
-        The `image_name` of every kept keyframe.
-    """
-    keyframes_by_id: dict[int, KeyframeMeta] = frames_meta.keyframe_by_id()
-    return tuple(keyframes_by_id[keyframe_id].image_name for keyframe_id in kept_keyframe_ids)

@@ -12,10 +12,17 @@ from pathlib import Path
 import numpy as np
 import pycolmap
 import pytest
+from conftest import pose_delta
 
 from colsfm.frames_meta import FramesMeta, KeyframeMeta, RigFrame, read_frames_meta
-from colsfm.geometry import relative_rotation_degrees
-from colsfm.reconstruction import RIG_ID, RigReference, build_reconstruction, camera_sensor_id, rig_reference
+from colsfm.reconstruction import (
+    RIG_ID,
+    PosedModel,
+    RigReference,
+    build_reconstruction,
+    camera_sensor_id,
+    rig_reference,
+)
 
 POSE_TOLERANCE: float = 1e-9
 """Round-trip tolerance in metres and in the matrix norm; this is pure algebra."""
@@ -33,29 +40,9 @@ def galileo_meta(galileo_run_dir: Path) -> FramesMeta:
 
 
 @pytest.fixture(scope="module")
-def galileo_raw_meta(galileo_input_meta: Path) -> FramesMeta:
-    """The raw 226-keyframe cuVSLAM input, which is not rig-exact."""
-    return read_frames_meta(galileo_input_meta)
-
-
-@pytest.fixture(scope="module")
 def fisheye_meta(repo_root: Path) -> FramesMeta:
     """A real OPENCV_FISHEYE collection: the 32-keyframe, 4-camera RoboCap smoke run."""
     return read_frames_meta(repo_root / "data" / "cusfm_runs" / "robocap_raco_smoke" / "input" / "frames_meta.json")
-
-
-def _pose_delta(actual: pycolmap.Rigid3d, expected: pycolmap.Rigid3d) -> tuple[float, float]:
-    """Translation and rotation difference between two poses.
-
-    Args:
-        actual: Pose under test.
-        expected: Reference pose.
-
-    Returns:
-        Translation difference in metres and rotation difference in degrees.
-    """
-    translation_m: float = float(np.linalg.norm(np.asarray(actual.translation) - np.asarray(expected.translation)))
-    return translation_m, relative_rotation_degrees(actual, expected)
 
 
 def test_galileo_poses_round_trip_through_the_reconstruction(galileo_meta: FramesMeta) -> None:
@@ -67,7 +54,7 @@ def test_galileo_poses_round_trip_through_the_reconstruction(galileo_meta: Frame
     rig frame were the reference camera rather than the vehicle, the composition
     would not return the metadata's own pose.
     """
-    reconstruction: pycolmap.Reconstruction = build_reconstruction(galileo_meta)
+    reconstruction: pycolmap.Reconstruction = build_reconstruction(galileo_meta).reconstruction
 
     assert reconstruction.num_cameras() == 8
     assert reconstruction.num_images() == len(galileo_meta.keyframes) == 226
@@ -82,7 +69,7 @@ def test_galileo_poses_round_trip_through_the_reconstruction(galileo_meta: Frame
         assert image.name == keyframe.image_name
         assert image.camera_id == keyframe.camera_params_id
         assert image.frame_id == keyframe.synced_sample_id
-        translation_m, rotation_deg = _pose_delta(image.cam_from_world().inverse(), keyframe.world_T_cam)
+        translation_m, rotation_deg = pose_delta(image.cam_from_world().inverse(), keyframe.world_T_cam)
         worst_translation_m = max(worst_translation_m, translation_m)
         worst_rotation_deg = max(worst_rotation_deg, rotation_deg)
     print(f"[colsfm] Galileo pose round trip: {worst_translation_m:.2e} m, {worst_rotation_deg:.2e} deg")
@@ -97,10 +84,10 @@ def test_rig_frames_carry_the_vehicle_pose(galileo_meta: FramesMeta) -> None:
     on, and it is what makes one BA pose per rig frame equal cuSFM's
     `VEHICLE_RIG` parameterisation.
     """
-    reconstruction: pycolmap.Reconstruction = build_reconstruction(galileo_meta)
+    reconstruction: pycolmap.Reconstruction = build_reconstruction(galileo_meta).reconstruction
     for rig_frame in galileo_meta.rig_frames():
         frame: pycolmap.Frame = reconstruction.frame(rig_frame.synced_sample_id)
-        translation_m, rotation_deg = _pose_delta(frame.rig_from_world.inverse(), rig_frame.world_T_vehicle)
+        translation_m, rotation_deg = pose_delta(frame.rig_from_world.inverse(), rig_frame.world_T_vehicle)
         assert translation_m < POSE_TOLERANCE
         assert rotation_deg < POSE_TOLERANCE
         assert sorted(data_id.id for data_id in frame.data_ids) == sorted(rig_frame.keyframe_ids)
@@ -108,12 +95,12 @@ def test_rig_frames_carry_the_vehicle_pose(galileo_meta: FramesMeta) -> None:
 
 def test_sensor_from_rig_is_the_inverted_extrinsic(galileo_meta: FramesMeta) -> None:
     """`sensor_from_rig` is `cam_T_vehicle`, the inverse of `sensor_to_vehicle_transform`."""
-    reconstruction: pycolmap.Reconstruction = build_reconstruction(galileo_meta)
+    reconstruction: pycolmap.Reconstruction = build_reconstruction(galileo_meta).reconstruction
     rig: pycolmap.Rig = reconstruction.rig(RIG_ID)
     assert rig.num_sensors() == 9, "eight cameras plus the vehicle body as the reference sensor"
     for camera_params_id, camera in galileo_meta.cameras.items():
         sensor_from_rig: pycolmap.Rigid3d = rig.sensor_from_rig(camera_sensor_id(camera_params_id))
-        translation_m, rotation_deg = _pose_delta(sensor_from_rig, camera.vehicle_T_cam.inverse())
+        translation_m, rotation_deg = pose_delta(sensor_from_rig, camera.vehicle_T_cam.inverse())
         assert translation_m < POSE_TOLERANCE
         assert rotation_deg < POSE_TOLERANCE
 
@@ -127,7 +114,7 @@ def test_cameras_declare_a_prior_focal_length(galileo_meta: FramesMeta, fisheye_
     here, so the flag is always true.
     """
     for frames_meta in (galileo_meta, fisheye_meta):
-        reconstruction: pycolmap.Reconstruction = build_reconstruction(frames_meta)
+        reconstruction: pycolmap.Reconstruction = build_reconstruction(frames_meta).reconstruction
         for camera_id in sorted(reconstruction.cameras):
             assert reconstruction.camera(camera_id).has_prior_focal_length is True
 
@@ -138,7 +125,7 @@ def test_fisheye_poses_round_trip_through_the_reconstruction(fisheye_meta: Frame
     RoboCap numbers its keyframes, cameras and rig frames from zero, so this
     also proves that COLMAP accepts id 0 for a camera, an image and a frame.
     """
-    reconstruction: pycolmap.Reconstruction = build_reconstruction(fisheye_meta)
+    reconstruction: pycolmap.Reconstruction = build_reconstruction(fisheye_meta).reconstruction
 
     assert reconstruction.num_cameras() == 4
     assert reconstruction.num_images() == 32
@@ -147,7 +134,7 @@ def test_fisheye_poses_round_trip_through_the_reconstruction(fisheye_meta: Frame
     assert 0 in reconstruction.cameras and 0 in reconstruction.images and 0 in reconstruction.frames
 
     for keyframe in fisheye_meta.keyframes:
-        translation_m, rotation_deg = _pose_delta(
+        translation_m, rotation_deg = pose_delta(
             reconstruction.image(keyframe.keyframe_id).cam_from_world().inverse(), keyframe.world_T_cam
         )
         assert translation_m < POSE_TOLERANCE
@@ -166,12 +153,12 @@ def test_supplied_cameras_are_used_verbatim(galileo_meta: FramesMeta) -> None:
             camera_params_id, pycolmap.CameraModelId.PINHOLE, 700.0, 1920, 1200
         )
         cameras[camera_params_id] = camera
-    reconstruction: pycolmap.Reconstruction = build_reconstruction(galileo_meta, cameras)
+    reconstruction: pycolmap.Reconstruction = build_reconstruction(galileo_meta, cameras).reconstruction
     for camera_params_id in sorted(galileo_meta.cameras):
         assert reconstruction.camera(camera_params_id).params[0] == pytest.approx(700.0)
 
 
-def test_a_rig_inexact_input_snaps_to_the_rig(galileo_input_meta: Path) -> None:
+def test_a_rig_inexact_input_snaps_to_the_rig(galileo_input: FramesMeta) -> None:
     """The raw cuVSLAM metadata is not rig-exact, and the rig model rounds it off.
 
     `data/r2b_galileo/frames_meta.json` carries an independent `camera_to_world`
@@ -183,7 +170,7 @@ def test_a_rig_inexact_input_snaps_to_the_rig(galileo_input_meta: Path) -> None:
     The residual is three orders of magnitude below the 5 mm the mapper moves
     poses by, so nothing downstream notices.
     """
-    frames_meta: FramesMeta = read_frames_meta(galileo_input_meta)
+    frames_meta: FramesMeta = galileo_input
     keyframe_by_id: dict[int, KeyframeMeta] = frames_meta.keyframe_by_id()
     worst_spread_m: float = max(
         float(
@@ -197,9 +184,9 @@ def test_a_rig_inexact_input_snaps_to_the_rig(galileo_input_meta: Path) -> None:
     )
     assert 1e-6 < worst_spread_m < 1e-4
 
-    reconstruction: pycolmap.Reconstruction = build_reconstruction(frames_meta)
+    reconstruction: pycolmap.Reconstruction = build_reconstruction(frames_meta).reconstruction
     worst_translation_m: float = max(
-        _pose_delta(reconstruction.image(keyframe.keyframe_id).cam_from_world().inverse(), keyframe.world_T_cam)[0]
+        pose_delta(reconstruction.image(keyframe.keyframe_id).cam_from_world().inverse(), keyframe.world_T_cam)[0]
         for keyframe in frames_meta.keyframes
     )
     print(f"[colsfm] raw Galileo input: rig spread {worst_spread_m * 1e6:.2f} um, snap {worst_translation_m * 1e6:.2f} um")
@@ -215,7 +202,7 @@ def test_the_reference_keyframe_is_the_lowest_id_of_the_first_rig_frame(galileo_
     lowest id — and through the rig that fixes its whole rig frame
     (keypoints_mapper_main.md §6.3).
     """
-    reconstruction: pycolmap.Reconstruction = build_reconstruction(galileo_meta)
+    reconstruction: pycolmap.Reconstruction = build_reconstruction(galileo_meta).reconstruction
     lowest_keyframe: KeyframeMeta = min(galileo_meta.keyframes, key=lambda keyframe: keyframe.keyframe_id)
     rig_frame: RigFrame = next(
         frame for frame in galileo_meta.rig_frames() if lowest_keyframe.keyframe_id in frame.keyframe_ids
@@ -227,7 +214,7 @@ REFERENCE_CAMERA_PARAMS_ID: int = 0
 """The camera the extrinsic-refinement tests put the rig origin on."""
 
 
-@pytest.mark.parametrize("frames_meta_name", ["galileo_meta", "galileo_raw_meta"])
+@pytest.mark.parametrize("frames_meta_name", ["galileo_meta", "galileo_input"])
 def test_a_camera_referenced_rig_round_trips_the_same_poses(
     request: pytest.FixtureRequest, frames_meta_name: str
 ) -> None:
@@ -238,10 +225,9 @@ def test_a_camera_referenced_rig_round_trips_the_same_poses(
     still `cam_T_world`, so every `camera_to_world` comes back out unchanged.
     """
     frames_meta: FramesMeta = request.getfixturevalue(frames_meta_name)
-    reconstruction: pycolmap.Reconstruction = build_reconstruction(
-        frames_meta, reference_camera_params_id=REFERENCE_CAMERA_PARAMS_ID
-    )
-    reference: pycolmap.Reconstruction = build_reconstruction(frames_meta)
+    model: PosedModel = build_reconstruction(frames_meta, reference_camera_params_id=REFERENCE_CAMERA_PARAMS_ID)
+    reconstruction: pycolmap.Reconstruction = model.reconstruction
+    reference: pycolmap.Reconstruction = build_reconstruction(frames_meta).reconstruction
 
     rig: pycolmap.Rig = reconstruction.rig(RIG_ID)
     assert rig.ref_sensor_id == camera_sensor_id(REFERENCE_CAMERA_PARAMS_ID)
@@ -251,7 +237,7 @@ def test_a_camera_referenced_rig_round_trips_the_same_poses(
     worst_rotation_deg: float = 0.0
     for keyframe in frames_meta.keyframes:
         image: pycolmap.Image = reconstruction.image(keyframe.keyframe_id)
-        translation_m, rotation_deg = _pose_delta(
+        translation_m, rotation_deg = pose_delta(
             image.cam_from_world(), reference.image(keyframe.keyframe_id).cam_from_world()
         )
         worst_translation_m = max(worst_translation_m, translation_m)
@@ -271,21 +257,20 @@ def test_the_rig_reference_recovers_the_vehicle_frame_quantities(
     `sensor_to_vehicle_transform` and every frame's `world_T_vehicle` come back
     as the metadata declared them.
     """
-    reconstruction: pycolmap.Reconstruction = build_reconstruction(
-        galileo_meta, reference_camera_params_id=reference_camera_params_id
-    )
-    reference: RigReference = rig_reference(galileo_meta, reference_camera_params_id)
+    model: PosedModel = build_reconstruction(galileo_meta, reference_camera_params_id=reference_camera_params_id)
+    reconstruction: pycolmap.Reconstruction = model.reconstruction
+    reference: RigReference = model.reference
 
     vehicle_T_cam: dict[int, pycolmap.Rigid3d] = reference.vehicle_T_cam_by_camera_params_id(reconstruction)
     assert sorted(vehicle_T_cam) == sorted(galileo_meta.cameras)
     for camera_params_id, camera in galileo_meta.cameras.items():
-        translation_m, rotation_deg = _pose_delta(vehicle_T_cam[camera_params_id], camera.vehicle_T_cam)
+        translation_m, rotation_deg = pose_delta(vehicle_T_cam[camera_params_id], camera.vehicle_T_cam)
         assert translation_m < POSE_TOLERANCE
         assert rotation_deg < POSE_TOLERANCE
 
     world_T_vehicle: dict[int, pycolmap.Rigid3d] = reference.world_T_vehicle_by_frame_id(reconstruction)
     for rig_frame in galileo_meta.rig_frames():
-        translation_m, rotation_deg = _pose_delta(
+        translation_m, rotation_deg = pose_delta(
             world_T_vehicle[rig_frame.synced_sample_id], rig_frame.world_T_vehicle
         )
         assert translation_m < POSE_TOLERANCE
@@ -300,7 +285,7 @@ def test_the_reference_camera_carries_the_identity_extrinsic(galileo_meta: Frame
     """
     reference: RigReference = rig_reference(galileo_meta, REFERENCE_CAMERA_PARAMS_ID)
     assert reference.camera_params_id == REFERENCE_CAMERA_PARAMS_ID
-    translation_m, rotation_deg = _pose_delta(
+    translation_m, rotation_deg = pose_delta(
         reference.vehicle_T_reference, galileo_meta.cameras[REFERENCE_CAMERA_PARAMS_ID].vehicle_T_cam
     )
     assert translation_m < POSE_TOLERANCE
@@ -308,7 +293,7 @@ def test_the_reference_camera_carries_the_identity_extrinsic(galileo_meta: Frame
 
     reconstruction: pycolmap.Reconstruction = build_reconstruction(
         galileo_meta, reference_camera_params_id=REFERENCE_CAMERA_PARAMS_ID
-    )
+    ).reconstruction
     assert reconstruction.rig(RIG_ID).is_ref_sensor(camera_sensor_id(REFERENCE_CAMERA_PARAMS_ID))
 
 

@@ -68,10 +68,15 @@ def test_galileo_default_mode_reproduces_the_blob_minus_loops(
 
 
 def test_galileo_with_loop_pairs_matches_the_blob_exactly(galileo_full_meta: FramesMeta, galileo_full_run: Path) -> None:
-    """Feeding the pose graph's LOOP edges back in reproduces the 339-pair task file."""
-    pairs: list[ImagePair] = select_pairs(galileo_full_meta, connected_keyframe_num=1, loop_pairs=GALILEO_LOOP_PAIRS)
+    """The task builder's pairs plus the pose graph's LOOP edges are the 339-pair task file.
+
+    `select_pairs` deliberately does not take the loop edges — they only exist after
+    retrieval and verification, and `colsfm.pipeline` matches them into the same
+    database afterwards. Merging them here is what the pipeline's two stages add up to.
+    """
+    pairs: set[ImagePair] = set(select_pairs(galileo_full_meta, connected_keyframe_num=1)) | set(GALILEO_LOOP_PAIRS)
     blob: list[ImagePair] = sorted(read_task_pairs(galileo_full_run / "matches" / "tasks" / "matching_task_000.pb"))
-    assert pairs == blob
+    assert sorted(pairs) == blob
 
 
 def test_selected_galileo_run_matches_the_blob_exactly(galileo_selected_meta: FramesMeta, galileo_run_dir: Path) -> None:
@@ -83,16 +88,15 @@ def test_selected_galileo_run_matches_the_blob_exactly(galileo_selected_meta: Fr
 
 
 def test_pairs_are_normalised_deduplicated_and_sorted(galileo_selected_meta: FramesMeta) -> None:
-    """`(min, max)`, unique, ascending — the invariants `UpdateMatchingTaskAndSave` keeps."""
-    duplicated: tuple[ImagePair, ...] = (
-        (2402, 2362),
-        (2362, 2402),
-        (2362, 2402),
-    )
-    pairs: list[ImagePair] = select_pairs(galileo_selected_meta, connected_keyframe_num=1, loop_pairs=duplicated)
+    """`(min, max)`, unique, ascending — the invariants `UpdateMatchingTaskAndSave` keeps.
+
+    The consecutive and stereo rules overlap wherever a stereo partner is also the
+    next rig frame's same-camera successor, so the deduplication is load-bearing.
+    """
+    pairs: list[ImagePair] = select_pairs(galileo_selected_meta, connected_keyframe_num=1)
     assert pairs == sorted(set(pairs))
     assert all(first < second for first, second in pairs)
-    assert pairs.count((2362, 2402)) == 1
+    assert set(pairs) == set(consecutive_pairs(galileo_selected_meta, 1)) | set(stereo_pairs(galileo_selected_meta))
 
 
 def test_connected_keyframe_num_adds_further_rig_hops(galileo_selected_meta: FramesMeta) -> None:

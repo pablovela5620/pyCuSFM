@@ -19,6 +19,15 @@ layout (`pycusfm/constants.py`), and the same `runtime.csv` — two columns,
 The `command` column holds the stage name rather than a blob command line;
 nothing reads it as a command, and the stage name is what a benchmark table wants.
 
+## One function per stage
+
+Each stage is a `run_<stage>_stage` function taking what it needs and returning a
+small result dataclass; `run_pipeline` only composes them and times each with
+`timed_stage`. The stage functions carry no timing and write no `runtime.csv`
+row, so a caller that wants to step through a dataset one stage at a time — the
+Rerun walkthrough, `run_stage`, a notebook — reuses exactly the code the full run
+executes rather than a parallel copy of it.
+
 Ordering notes worth knowing before reading the code:
 
 * **Pair selection cannot see loop pairs.** Stage 3 emits the consecutive and
@@ -36,6 +45,11 @@ Ordering notes worth knowing before reading the code:
   gate and the time gate, never on the matches), then one batch
   `colsfm.matching.match_pairs` over those pairs, then the real search reading
   matches back from the database.
+* **`--optimize-extrinsics` maps once, not twice.** The camera-referenced
+  reconstruction is built up front when the flag is set, stage 7 maps it, and
+  stage 7b refines the extrinsics of the model stage 7 left behind. Both
+  references give the same `cam_T_world`, so nothing about stage 7's result
+  depends on which one was used (`colsfm.reconstruction`).
 * **`--use-gpu` governs the ONNX stages only.** ALIKED and LightGlue run on the
   GPU; the Ceres solves stay on the CPU by default, as the blob's own
   `keypoints_mapper_main` and `pose_graph_main` do (docs/open-pipeline-plan.md,
@@ -57,7 +71,7 @@ import time
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Final, Literal, TypeAlias
+from typing import Final, Literal, TypeAlias, get_args
 
 import numpy as np
 import pycolmap
@@ -66,29 +80,39 @@ from numpy import ndarray
 from serde import serde
 from serde.json import to_json
 
-from colsfm.cameras import colmap_cameras
+from colsfm import REPO_ROOT
 from colsfm.config import CusfmConfig, KeyframeSelectionConfig, PoseGraphConfig, read_config_directory
-from colsfm.database import ImagePair, create_database, raw_match_counts
+from colsfm.database import (
+    Descriptors,
+    ImagePair,
+    Keypoints,
+    create_database,
+    raw_match_counts,
+    read_descriptors_from_database,
+    read_keypoints_batch,
+)
 from colsfm.export import (
-    KEYFRAME_METADATA_SUBPATH,
     RUNTIME_CSV_NAME,
     RuntimeRecord,
     append_runtime_record,
     colour_points_from_images,
     write_colmap_model,
+    write_optimised_frames_meta,
     write_pose_files,
     write_tum_file,
 )
 from colsfm.extrinsic_refinement import ExtrinsicRefinementOptions, ExtrinsicRefinementResult, refine_extrinsics
-from colsfm.features import ExtractionReport, FeatureOptions, extract_features
-from colsfm.frames_meta import CameraParams, FramesMeta, KeyframeMeta, RigFrame, read_frames_meta, write_frames_meta
-from colsfm.geometry import TumPose, relative_rotation_degrees
+from colsfm.features import DeviceChoice, ExtractionReport, FeatureOptions, extract_features
+from colsfm.frames_meta import FRAMES_META_NAME, CameraParams, FramesMeta, RigFrame, read_frames_meta, write_frames_meta
+from colsfm.geometry import MILLIMETRES_PER_METRE, TumPose, relative_rotation_degrees
 from colsfm.keyframe_selection import KeyframeSelection, apply_selection, select_keyframes
+from colsfm.loop_closure import LoopClosureConfig, LoopClosureResult, find_loop_edges
 from colsfm.mapping import MappingOptions, MappingResult, run_mapping
 from colsfm.matching import BLOB_MATCH_TOP_K, MatchingOptions, MatchReport, match_pairs
 from colsfm.pairs import select_pairs
 from colsfm.pose_graph import PoseGraphEdge, PoseGraphResult, RigNode, sequential_edges, solve_pose_graph
-from colsfm.reconstruction import RigReference, build_reconstruction, gauge_camera_params_id, rig_reference
+from colsfm.reconstruction import PosedModel, build_reconstruction, gauge_camera_params_id
+from colsfm.retrieval import RetrievalIndex, build_retrieval_index
 
 StageName: TypeAlias = Literal[
     "keyframe_selection",
@@ -103,18 +127,6 @@ StageName: TypeAlias = Literal[
 ]
 """The stages, in the order `CusfmRunner.run_all` runs their blob equivalents."""
 
-STAGE_NAMES: Final[tuple[StageName, ...]] = (
-    "keyframe_selection",
-    "feature_extraction",
-    "pair_selection",
-    "matching",
-    "loop_closure",
-    "pose_graph",
-    "reconstruction",
-    "export",
-)
-"""The stages every run records; `stage_names` adds the ninth for `--optimize-extrinsics`."""
-
 EXTRINSIC_REFINEMENT_STAGE: Final[StageName] = "extrinsic_refinement"
 """The second mapping pass `--optimize-extrinsics` adds, mirroring the blob.
 
@@ -122,6 +134,14 @@ EXTRINSIC_REFINEMENT_STAGE: Final[StageName] = "extrinsic_refinement"
 and once with `--optimize_extrinsics=True`, both over the same matches and the
 same `pose_graph/frames_meta.json` poses (`pycusfm/cusfm_runner.py`,
 `run_mapping` then `refine_extrinsics`). The second pass overwrites `kpmap/`."""
+
+ALL_STAGE_NAMES: Final[tuple[StageName, ...]] = get_args(StageName)
+"""Every stage, in `StageName`'s own order; what an `--optimize-extrinsics` run records."""
+
+STAGE_NAMES: Final[tuple[StageName, ...]] = tuple(
+    stage for stage in ALL_STAGE_NAMES if stage != EXTRINSIC_REFINEMENT_STAGE
+)
+"""The stages a default run records: every stage but the second mapping pass."""
 
 
 def stage_names(optimize_extrinsics: bool) -> tuple[StageName, ...]:
@@ -131,26 +151,16 @@ def stage_names(optimize_extrinsics: bool) -> tuple[StageName, ...]:
         optimize_extrinsics: Whether the run makes the second mapping pass.
 
     Returns:
-        `STAGE_NAMES`, with `extrinsic_refinement` inserted before `export` when
-        the flag is set.
+        `ALL_STAGE_NAMES` when the flag is set, `STAGE_NAMES` otherwise.
     """
-    if not optimize_extrinsics:
-        return STAGE_NAMES
-    index: int = STAGE_NAMES.index("export")
-    return STAGE_NAMES[:index] + (EXTRINSIC_REFINEMENT_STAGE,) + STAGE_NAMES[index:]
+    return ALL_STAGE_NAMES if optimize_extrinsics else STAGE_NAMES
 
 
 CheapStageName: TypeAlias = Literal["keyframe_selection", "pair_selection"]
 """The stages the `stage` subcommand can run on their own: metadata only, no GPU."""
 
-REPO_ROOT: Final[Path] = Path(__file__).resolve().parent.parent
-"""Repo root, so the default config directory resolves from any working directory."""
-
 DEFAULT_CONFIG_DIR: Final[Path] = REPO_ROOT / "data" / "cusfm_configs" / "loop-closure-fixed"
 """`isaac` with loop closure repaired; what the blob reference runs used."""
-
-FRAMES_META_NAME: Final[str] = "frames_meta.json"
-"""The metadata file name, in the input directory and in every output directory."""
 
 KEYFRAME_DIR_NAME: Final[str] = "keyframes"
 """`pycusfm.constants.kKEYFRAME_DIR`: where the selected metadata lands."""
@@ -171,6 +181,7 @@ LOOP_PROBE_MATCHES: Final[Int[ndarray, "0 2"]] = np.zeros((0, 2), dtype=np.int64
 """What the recording `match_fn` returns: no matches, so no candidate is verified."""
 
 
+@serde
 @dataclass(frozen=True, slots=True)
 class PipelineOptions:
     """Everything one run needs, mirroring `CusfmRunner`'s constructor arguments."""
@@ -195,12 +206,14 @@ class PipelineOptions:
     overfits (NOTES.md deviation 9). Only read when `optimize_extrinsics` is set."""
     extrinsic_refinement_rounds: int = 20
     """Ceiling on the extrinsics-then-poses rounds the regularised refinement may take; it
-    stops early on its own tolerances, after 19 rounds and 9.9 s on Galileo."""
+    stops early on its own tolerances, after 19 rounds and 3.2 s on Galileo."""
     loop_closure: bool = False
     """Run retrieval-based loop closure. Off by default: the plan decides per dataset,
     and on the 0.93 s Galileo sweep loops move poses further than the ATE budget allows."""
     use_gpu: bool = True
-    """Run ALIKED and LightGlue on the GPU when one is usable."""
+    """Run ALIKED and LightGlue on the GPU when one is usable. A bool rather than a
+    `DeviceChoice` because `--use-gpu` is the flag the pixi tasks and the plan use; the
+    `device` property below is the one place it turns into a device request."""
     ba_use_gpu: bool = False
     """Hand the bundle-adjustment linear solve to the GPU. Off by default: the measured
     difference is under 10 % and changes sign with the problem size, so the default follows
@@ -218,9 +231,16 @@ class PipelineOptions:
     max_matches_per_pair: int | None = BLOB_MATCH_TOP_K
     """Verified matches kept per pair after the spatial subsample; None keeps every inlier.
     The blob's `match_top_k`; see `colsfm.matching.subsample_matches_by_coverage`."""
-    stop_on_observation_change: bool = True
-    """Leave the mapper's outer loop once the observation change falls below the config's
-    `max_observation_change`, instead of always running every round."""
+
+    @property
+    def device(self) -> DeviceChoice:
+        """Device request for the two ONNX stages, derived from `use_gpu` exactly once.
+
+        Returns:
+            `auto` — which falls back to the CPU provider when CUDA or cuDNN is
+            missing — or `cpu` when `use_gpu` is off.
+        """
+        return "auto" if self.use_gpu else "cpu"
 
     @property
     def database_path(self) -> Path:
@@ -260,35 +280,14 @@ class ExtrinsicChange:
 
 @serde
 @dataclass(frozen=True, slots=True)
-class PipelineSummary:
-    """`summary.json`: what one run produced and how long each stage took."""
+class MappingStats:
+    """The reconstruction counters `summary.json` reports, as one block.
 
-    input_dir: Path
-    """Input directory the run read."""
-    output_dir: Path
-    """Workspace the run wrote."""
-    config_dir: Path
-    """Config profile the run used."""
-    git_sha: str
-    """`git rev-parse HEAD` of the working tree, or `"unknown"` outside a checkout."""
-    loop_closure_enabled: bool
-    """Whether stage 5 ran the retrieval search or reported itself as a no-op."""
-    num_input_keyframes: int
-    """Keyframes in the input `frames_meta.json`."""
-    num_selected_keyframes: int
-    """Keyframes that survived keyframe selection."""
-    num_rig_frames: int
-    """Rig frames (`synced_sample_id` groups) among the selected keyframes."""
-    num_pairs: int
-    """Image pairs stage 3 selected, before any loop pair."""
-    num_loop_pairs: int
-    """Extra image pairs matched for loop closure; 0 when the stage is off."""
-    num_loop_edges: int
-    """Loop constraints that survived verification and gating."""
-    num_pose_graph_edges: int
-    """Constraints in the solved pose graph, sequential and loop together."""
-    pose_graph_translation_change_m: float
-    """Largest rig position change the pose-graph solve produced, in metres."""
+    A snapshot of `colsfm.mapping.MappingResult`'s properties at the moment the
+    summary was written: the result itself computes them from the live
+    reconstruction, which is exactly why they cannot be stored there.
+    """
+
     num_registered_images: int
     """Images belonging to a registered frame after mapping."""
     num_images_with_observations: int
@@ -301,16 +300,62 @@ class PipelineSummary:
     """Mean reprojection error over every observation, in pixels."""
     mean_track_length: float
     """Mean observations per point."""
+
+    @staticmethod
+    def of(mapping: MappingResult) -> MappingStats:
+        """Snapshot a mapping result's counters.
+
+        Args:
+            mapping: What the last mapping pass produced.
+
+        Returns:
+            The six counters, frozen at this point in the run.
+        """
+        return MappingStats(
+            num_registered_images=mapping.num_registered_images,
+            num_images_with_observations=mapping.num_images_with_observations,
+            num_points3D=mapping.num_points3D,
+            num_observations=mapping.num_observations,
+            mean_reprojection_error_px=mapping.mean_reprojection_error_px,
+            mean_track_length=mapping.mean_track_length,
+        )
+
+
+@serde
+@dataclass(frozen=True, slots=True)
+class PipelineSummary:
+    """`summary.json`: what one run produced and how long each stage took."""
+
+    options: PipelineOptions
+    """The options the run was given, verbatim; the run's own provenance."""
+    git_sha: str
+    """`git rev-parse HEAD` of the working tree, or `"unknown"` outside a checkout."""
+    num_input_keyframes: int
+    """Keyframes in the input `frames_meta.json`."""
+    num_selected_keyframes: int
+    """Keyframes that survived keyframe selection."""
+    num_rig_frames: int
+    """Rig frames (`synced_sample_id` groups) among the selected keyframes."""
+    num_pairs: int
+    """Image pairs stage 3 selected, before any loop pair."""
+    num_loop_pairs: int
+    """Extra image pairs matched for loop closure; 0 when the stage is off. Only the
+    pairs stage 5 had to match itself are counted — most candidates are consecutive or
+    stereo pairs stage 4 already matched, and matching them again would only cost time."""
+    num_loop_edges: int
+    """Loop constraints that survived verification and gating."""
+    num_pose_graph_edges: int
+    """Constraints in the solved pose graph, sequential and loop together."""
+    pose_graph_translation_change_m: float
+    """Largest rig position change the pose-graph solve produced, in metres."""
+    mapping: MappingStats
+    """The final model's counters, after the extrinsic refinement when one ran."""
     stage_seconds: dict[str, float]
     """Wall-clock seconds per stage, in stage order; the same rows as `runtime.csv`."""
     total_seconds: float
     """Wall-clock seconds for the whole run."""
-    optimize_extrinsics: bool = False
-    """Whether the run made the second, extrinsic-refining mapping pass."""
     extrinsic_changes: tuple[ExtrinsicChange, ...] = ()
     """Per-camera extrinsic movement the refinement produced; empty when the flag is off."""
-    regularised_extrinsics: bool = True
-    """Whether that refinement carried the extrinsic priors."""
     extrinsic_refinement_rounds_run: int = 0
     """Rounds the regularised refinement actually took before it converged."""
 
@@ -486,6 +531,11 @@ def extrinsic_changes(
 ) -> tuple[ExtrinsicChange, ...]:
     """Measure what the refinement did to each camera's extrinsic.
 
+    The per-camera translation and rotation are the same two quantities
+    `colsfm.extrinsic_refinement.extrinsic_deltas` maximises over, computed the
+    same way — `MILLIMETRES_PER_METRE` times the origin distance, and
+    `colsfm.geometry.relative_rotation_degrees` for the angle.
+
     Args:
         frames_meta: The collection the refinement started from.
         refined_by_camera_params_id: `vehicle_T_cam` per camera after the solve.
@@ -498,14 +548,14 @@ def extrinsic_changes(
     for camera_params_id in sorted(refined_by_camera_params_id):
         camera: CameraParams = frames_meta.cameras[camera_params_id]
         refined: pycolmap.Rigid3d = refined_by_camera_params_id[camera_params_id]
+        translation_m: float = float(
+            np.linalg.norm(np.asarray(refined.translation) - np.asarray(camera.vehicle_T_cam.translation))
+        )
         changes.append(
             ExtrinsicChange(
                 camera_params_id=camera_params_id,
                 sensor_name=camera.sensor_name,
-                translation_change_mm=float(
-                    np.linalg.norm(np.asarray(refined.translation) - np.asarray(camera.vehicle_T_cam.translation))
-                )
-                * 1e3,
+                translation_change_mm=MILLIMETRES_PER_METRE * translation_m,
                 rotation_change_deg=relative_rotation_degrees(refined, camera.vehicle_T_cam),
                 is_reference=camera_params_id == reference_camera_params_id,
             )
@@ -526,14 +576,192 @@ def _print_mapping(mapping: MappingResult) -> None:
     )
 
 
+# ══════════════════════════════════════════════════════════════════════════════════════
+# the stages
+# ══════════════════════════════════════════════════════════════════════════════════════
+
+
+@dataclass(frozen=True, slots=True)
+class KeyframeSelectionStageResult:
+    """Stage 1: the configuration read and the keyframes that survived selection."""
+
+    config: CusfmConfig
+    """The whole config profile, with the command line's selection gates folded in."""
+    frames_meta: FramesMeta
+    """The input collection, unfiltered."""
+    selected: FramesMeta
+    """The kept keyframes, renumbered into the dense 1-based rig numbering."""
+    rig_frames: tuple[RigFrame, ...]
+    """Rig frames among the selected keyframes, one per `synced_sample_id`, in time
+    order. Bound once here: `FramesMeta.rig_frames` regroups the whole collection on
+    every call, and the stage's own print line and the summary both want it."""
+
+
+def run_keyframe_selection_stage(options: PipelineOptions) -> KeyframeSelectionStageResult:
+    """Read the config and the input metadata and apply cuSFM's keyframe selection.
+
+    Writes nothing; `run_pipeline` is what saves `keyframes/frames_meta.json`, so
+    `run_stage` can inspect a dataset without creating a workspace.
+
+    Args:
+        options: The run's options; the config directory and the three gates matter.
+
+    Returns:
+        The configuration, the input collection and the selected one.
+
+    Raises:
+        FileNotFoundError: When the input metadata or a config file is missing.
+        ValueError: When no keyframe survives selection.
+    """
+    if not options.frames_meta_path.is_file():
+        raise FileNotFoundError(f"No {FRAMES_META_NAME} at {options.frames_meta_path}")
+    config: CusfmConfig = read_config_directory(
+        options.config_dir,
+        KeyframeSelectionConfig(
+            min_inter_frame_distance_m=options.min_inter_frame_distance,
+            min_inter_frame_rotation_degrees=options.min_inter_frame_rotation_degrees,
+            sample_sync_threshold_microseconds=options.sample_sync_threshold_microseconds,
+        ),
+    )
+    frames_meta: FramesMeta = read_frames_meta(options.frames_meta_path)
+    selection: KeyframeSelection = select_keyframes(
+        frames_meta,
+        min_inter_frame_distance_m=config.keyframe_selection.min_inter_frame_distance_m,
+        min_inter_frame_rotation_degrees=config.keyframe_selection.min_inter_frame_rotation_degrees,
+        sample_sync_threshold_microseconds=config.keyframe_selection.sample_sync_threshold_microseconds,
+    )
+    selected: FramesMeta = apply_selection(frames_meta, selection)
+    if not selected.keyframes:
+        raise ValueError("keyframe selection kept no frames; loosen the distance and rotation gates")
+    return KeyframeSelectionStageResult(
+        config=config, frames_meta=frames_meta, selected=selected, rig_frames=selected.rig_frames()
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class FeatureExtractionStageResult:
+    """Stage 2: what ALIKED stored in the freshly created database."""
+
+    report: ExtractionReport
+    """Per-image keypoint counts, the device used and the wall time."""
+
+
+def run_feature_extraction_stage(options: PipelineOptions, selected: FramesMeta) -> FeatureExtractionStageResult:
+    """Create the COLMAP database and run ALIKED over the selected keyframes.
+
+    Args:
+        options: The run's options; the database path, the image root and the
+            thread and device knobs matter.
+        selected: The collection keyframe selection kept.
+
+    Returns:
+        The extraction report.
+
+    Raises:
+        FileNotFoundError: When the image root is missing.
+    """
+    create_database(options.database_path, selected, overwrite=True)
+    feature_options: FeatureOptions = FeatureOptions(num_threads=options.num_threads, device=options.device)
+    report: ExtractionReport = extract_features(
+        options.database_path,
+        options.input_dir,
+        [keyframe.image_name for keyframe in selected.keyframes],
+        feature_options,
+    )
+    return FeatureExtractionStageResult(report=report)
+
+
+@dataclass(frozen=True, slots=True)
+class PairSelectionStageResult:
+    """Stage 3: the consecutive and stereo pairs the matcher will be given."""
+
+    pairs: list[ImagePair]
+    """Normalised, deduplicated, sorted image pairs; no loop pair is here yet."""
+
+
+def run_pair_selection_stage(selected: FramesMeta, config: CusfmConfig) -> PairSelectionStageResult:
+    """Enumerate the pairs `feature_matcher_task_builder_main` would have written.
+
+    Args:
+        selected: The collection keyframe selection kept.
+        config: The config profile, for `connected_keyframe_num`.
+
+    Returns:
+        The pair list.
+
+    Raises:
+        ValueError: When `connected_keyframe_num` is below 1.
+    """
+    pairs: list[ImagePair] = select_pairs(selected, config.pose_graph.connected_keyframe_num)
+    print(
+        f"[colsfm] {len(pairs)} pairs from connected_keyframe_num="
+        f"{config.pose_graph.connected_keyframe_num} and {len(selected.stereo_pairs)} stereo declarations"
+    )
+    return PairSelectionStageResult(pairs=pairs)
+
+
+@dataclass(frozen=True, slots=True)
+class MatchingStageResult:
+    """Stage 4: LightGlue matches and their verified two-view geometries."""
+
+    report: MatchReport
+    """Per-pair raw and inlier counts, the device used and the wall time."""
+
+
+def run_matching_stage(
+    options: PipelineOptions, pairs: Sequence[ImagePair], matching_options: MatchingOptions
+) -> MatchingStageResult:
+    """Match and verify every selected pair into the database.
+
+    Args:
+        options: The run's options, for the database path.
+        pairs: The pairs stage 3 selected.
+        matching_options: Matching and verification settings.
+
+    Returns:
+        The match report.
+    """
+    return MatchingStageResult(report=match_pairs(options.database_path, list(pairs), matching_options))
+
+
 @dataclass(frozen=True, slots=True)
 class LoopClosureStageResult:
-    """What the loop-closure stage produced, whether it ran or not."""
+    """Stage 5: what the loop-closure search produced, whether it ran or not."""
 
     edges: list[PoseGraphEdge]
     """Verified, gated loop constraints; empty when the stage is off or found nothing."""
     num_pairs_matched: int
-    """Candidate image pairs matched into the database for verification."""
+    """Image pairs this stage had to match itself, i.e. the candidates stage 4 had not
+    already matched. The candidates it reused are not counted: `summary.json` reports
+    the *extra* matching work loop closure cost."""
+
+
+def _warn_about_closed_loop_gates(pose_graph_config: PoseGraphConfig) -> None:
+    """Say so, loudly, when the config's loop gates will reject every edge.
+
+    `gate_loop_edges` accepts a candidate whose relative pose is within
+    `max_translation_m` and `max_rotation_deg` of the retrieval estimate, so a
+    threshold of exactly 0.0 accepts nothing. Both are proto3 scalars, so the
+    stock `pycusfm/configs/isaac` and `pycusfm/configs/av` profiles — which set
+    neither — read back as 0.0 and silently discard 100 % of the edges after
+    paying for the whole stage. Only `data/cusfm_configs/loop-closure-fixed`
+    sets them (1.0 m / 10 deg). The gates keep their meaning; this only refuses
+    to be quiet about the outcome.
+
+    Args:
+        pose_graph_config: `pose_graph_config.pb.txt` as it was parsed.
+    """
+    if pose_graph_config.loop_edge_translation_threshold_meters > 0.0:
+        return
+    if pose_graph_config.loop_edge_rotation_threshold_degrees > 0.0:
+        return
+    print(
+        "[colsfm] WARNING: loop closure is on but both loop gates are 0.0 "
+        "(loop_edge_translation_threshold_meters and loop_edge_rotation_threshold_degrees), "
+        "so every candidate edge will be rejected and the stage will produce nothing. "
+        "The stock isaac and av profiles leave both unset; use "
+        "--config-dir data/cusfm_configs/loop-closure-fixed, or set the two thresholds."
+    )
 
 
 def run_loop_closure_stage(
@@ -544,17 +772,7 @@ def run_loop_closure_stage(
     *,
     enabled: bool,
 ) -> LoopClosureStageResult:
-    """Retrieve, match and verify loop candidates, guarded against a missing module.
-
-    `colsfm.retrieval` and `colsfm.loop_closure` are owned by another worker, so
-    they are imported here rather than at module scope and every call into them
-    is guarded: a run with `--no-loop-closure` never touches them, and a run that
-    asks for loops while the modules are absent or their API has moved says so
-    and continues as a no-op rather than losing the other seven stages.
-
-    The guard catches `TypeError` because that is what a changed signature (or a
-    beartype hint violation, which subclasses it) raises; the message carries the
-    exception so a mismatch is reported rather than silently swallowed.
+    """Retrieve, match and verify loop candidates.
 
     Args:
         frames_meta: The selected collection, in the pose graph's frame conventions.
@@ -564,42 +782,12 @@ def run_loop_closure_stage(
         enabled: Whether to run at all.
 
     Returns:
-        The loop edges and how many pairs were matched to find them.
+        The loop edges and how many extra pairs were matched to find them.
     """
     if not enabled:
         print("[colsfm] loop closure disabled (--loop-closure to enable); no loop edges")
         return LoopClosureStageResult(edges=[], num_pairs_matched=0)
-    try:
-        return _find_loop_edges(frames_meta, database_path, pose_graph_config, matching_options)
-    except (ImportError, AttributeError, TypeError) as error:
-        print(f"[colsfm] loop closure unavailable, running the stage as a no-op: {error!r}")
-        return LoopClosureStageResult(edges=[], num_pairs_matched=0)
-
-
-def _find_loop_edges(
-    frames_meta: FramesMeta,
-    database_path: Path,
-    pose_graph_config: PoseGraphConfig,
-    matching_options: MatchingOptions,
-) -> LoopClosureStageResult:
-    """Run retrieval, batch matching and verification over the whole collection.
-
-    Args:
-        frames_meta: The selected collection.
-        database_path: The database holding the keypoints and descriptors.
-        pose_graph_config: Supplies the loop gates the config profile sets.
-        matching_options: Settings for the batch match over the candidate pairs.
-
-    Returns:
-        The loop edges and how many pairs were matched to find them.
-
-    Raises:
-        ImportError: When `colsfm.retrieval` or `colsfm.loop_closure` is absent.
-        AttributeError: When either module lacks a name this stage needs.
-        TypeError: When either module's signatures have moved.
-    """
-    from colsfm.loop_closure import LoopClosureConfig, LoopClosureResult, find_loop_edges
-    from colsfm.retrieval import Descriptors, RetrievalIndex, build_retrieval_index, read_descriptors_from_database
+    _warn_about_closed_loop_gates(pose_graph_config)
 
     descriptors: dict[int, Descriptors] = read_descriptors_from_database(database_path)
     if not descriptors:
@@ -608,13 +796,10 @@ def _find_loop_edges(
     index: RetrievalIndex = build_retrieval_index(descriptors)
     print(f"[colsfm] loop closure: retrieval index over {len(index.image_ids)} images in {index.build_seconds:.2f}s")
 
-    config: LoopClosureConfig = LoopClosureConfig(
-        enabled=True,
-        loop_closure_interval_ratio=pose_graph_config.loop_closure_interval_ratio,
-        max_translation_m=pose_graph_config.loop_edge_translation_threshold_meters,
-        max_rotation_deg=pose_graph_config.loop_edge_rotation_threshold_degrees,
-        loop_residual_weight=pose_graph_config.loop_residual_weight,
-    )
+    config: LoopClosureConfig = LoopClosureConfig.from_pose_graph(pose_graph_config)
+    # Read once for both passes: the keypoints are the same file either side of the batch
+    # match, and on RoboCap they are 148 MB.
+    keypoints: dict[int, Keypoints] = read_keypoints_batch(database_path, index.image_ids, dtype=np.float64)
     requested: set[ImagePair] = set()
 
     def record_pair(image_id_a: int, image_id_b: int) -> Int[ndarray, "num_matches 2"]:
@@ -622,7 +807,7 @@ def _find_loop_edges(
         requested.add((min(image_id_a, image_id_b), max(image_id_a, image_id_b)))
         return LOOP_PROBE_MATCHES
 
-    find_loop_edges(frames_meta, database_path, index, config, record_pair)
+    find_loop_edges(frames_meta, database_path, index, config, record_pair, keypoints)
     requested_pairs: list[ImagePair] = sorted(requested)
     # Most requested pairs are the consecutive and stereo pairs stage 4 already matched
     # (8 400 of 14 443 on RoboCap); matching them again would only cost time.
@@ -643,7 +828,7 @@ def _find_loop_edges(
             """Read one pair's raw matches back out of the database."""
             return np.asarray(database.read_matches(image_id_a, image_id_b), dtype=np.int64)
 
-        result: LoopClosureResult = find_loop_edges(frames_meta, database_path, index, config, read_matches)
+        result: LoopClosureResult = find_loop_edges(frames_meta, database_path, index, config, read_matches, keypoints)
     edges: list[PoseGraphEdge] = list(result.edges)
     # Print the counters, not just the edge count: zero edges is the normal outcome on a
     # short or a low-recall sequence, and only the rejection breakdown says which it was.
@@ -652,13 +837,230 @@ def _find_loop_edges(
         f"{result.diagnostics.candidates_retrieved} retrieved, {result.diagnostics.rejected_by_score} below score, "
         f"{result.diagnostics.rejected_by_time} inside the {result.diagnostics.min_time_gap_seconds:.2f}s gap, "
         f"{result.diagnostics.rejected_by_geometry} failed geometry, {result.diagnostics.rejected_by_is_good} not good, "
-        f"{result.diagnostics.verified} verified over {len(requested_pairs)} matched pairs"
+        f"{result.diagnostics.verified} verified over {len(requested_pairs)} candidate pairs"
     )
-    return LoopClosureStageResult(edges=edges, num_pairs_matched=len(requested_pairs))
+    return LoopClosureStageResult(edges=edges, num_pairs_matched=len(candidate_pairs))
+
+
+@dataclass(frozen=True, slots=True)
+class PoseGraphStageResult:
+    """Stage 6: the solved rig trajectory and the collection re-posed through it."""
+
+    nodes: list[RigNode]
+    """The rig nodes as they entered the solve, carrying the input poses."""
+    edges: list[PoseGraphEdge]
+    """Sequential and loop constraints together, in the order they were solved."""
+    frames_meta: FramesMeta
+    """The selected collection with every camera pose re-derived through the rig."""
+    translation_change_m: float
+    """Largest rig position change the solve produced, in metres."""
+
+
+def run_pose_graph_stage(
+    options: PipelineOptions, selected: FramesMeta, config: CusfmConfig, loop_edges: Sequence[PoseGraphEdge]
+) -> PoseGraphStageResult:
+    """Solve the rig pose graph and write `pose_graph/`.
+
+    Args:
+        options: The run's options, for the output directory.
+        selected: The collection keyframe selection kept.
+        config: The config profile, for `connected_keyframe_num`.
+        loop_edges: Extra constraints from stage 5; may be empty.
+
+    Returns:
+        The nodes, the edges, the re-posed collection and the largest move.
+    """
+    nodes: list[RigNode] = rig_nodes(selected)
+    edges: list[PoseGraphEdge] = sequential_edges(nodes, config.pose_graph.connected_keyframe_num)
+    edges.extend(loop_edges)
+    world_T_rig_by_rig_id: dict[int, pycolmap.Rigid3d] = {node.rig_id: node.world_T_rig for node in nodes}
+    if edges:
+        solved: PoseGraphResult = solve_pose_graph(nodes, edges)
+        world_T_rig_by_rig_id = solved.world_T_rig
+        print(
+            f"[colsfm] pose graph: {len(nodes)} nodes, {len(edges)} edges "
+            f"({len(loop_edges)} loop), {solved.termination} after {solved.iterations} iterations, "
+            f"cost {solved.initial_cost:.6g} -> {solved.final_cost:.6g}"
+        )
+    else:
+        print("[colsfm] pose graph: a single rig frame has no edges; the input poses stand")
+    # Written unconditionally, even with the solve a no-op: the camera poses are
+    # re-derived through the rig, which is what makes the collection rigid and what
+    # `pose_graph_main` itself writes out.
+    pose_graph_meta: FramesMeta = selected.with_camera_to_world(camera_poses_from_rig_poses(selected, world_T_rig_by_rig_id))
+    pose_graph_dir: Path = options.output_dir / POSE_GRAPH_DIR_NAME
+    write_frames_meta(pose_graph_dir / FRAMES_META_NAME, pose_graph_meta)
+    _write_vehicle_pose_file(pose_graph_dir / VEHICLE_POSE_TUM_NAME, nodes, world_T_rig_by_rig_id)
+    return PoseGraphStageResult(
+        nodes=nodes,
+        edges=edges,
+        frames_meta=pose_graph_meta,
+        translation_change_m=_largest_translation_change_m(nodes, world_T_rig_by_rig_id),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ReconstructionStageResult:
+    """Stage 7: the triangulated, bundle-adjusted model."""
+
+    mapping: MappingResult
+    """The adjusted reconstruction, its rig reference and the per-round statistics."""
+
+
+def run_reconstruction_stage(
+    options: PipelineOptions, pose_graph_meta: FramesMeta, config: CusfmConfig, mapping_options: MappingOptions
+) -> ReconstructionStageResult:
+    """Triangulate and bundle-adjust the pose-graph poses.
+
+    With `--optimize-extrinsics` the reconstruction is built on the **gauge
+    camera** rather than the vehicle body, because COLMAP freezes every
+    `sensor_from_rig` of a rig whose reference sensor owns no images
+    (`colsfm.reconstruction`). Every `cam_T_world` is identical either way, so
+    this pass produces the same model and stage 7b can refine the extrinsics of
+    the very model it left behind instead of mapping the scene a second time.
+
+    Args:
+        options: The run's options; `optimize_extrinsics` chooses the rig origin.
+        pose_graph_meta: The collection stage 6 re-posed.
+        config: The config profile, for `vision_mapping_config`.
+        mapping_options: Command-line style mapper knobs.
+
+    Returns:
+        The mapping result.
+
+    Raises:
+        FileNotFoundError: When the database does not exist.
+        ValueError: When no frame is registered.
+    """
+    reference_camera_params_id: int | None = (
+        gauge_camera_params_id(pose_graph_meta) if options.optimize_extrinsics else None
+    )
+    model: PosedModel = build_reconstruction(pose_graph_meta, reference_camera_params_id=reference_camera_params_id)
+    mapping: MappingResult = run_mapping(model, options.database_path, config.vision_mapping, mapping_options)
+    _print_mapping(mapping)
+    return ReconstructionStageResult(mapping=mapping)
+
+
+@dataclass(frozen=True, slots=True)
+class ExtrinsicRefinementStageResult:
+    """Stage 7b: the alternating extrinsic refinement's model and its movement."""
+
+    mapping: MappingResult
+    """The refined mapping result; the same reconstruction, further adjusted."""
+    frames_meta: FramesMeta
+    """The pose-graph collection carrying the refined `sensor_to_vehicle_transform`."""
+    changes: tuple[ExtrinsicChange, ...]
+    """Per-camera movement, ordered by `camera_params_id`."""
+    rounds_run: int
+    """Alternation rounds the refinement took before it converged."""
+
+
+def run_extrinsic_refinement_stage(
+    options: PipelineOptions,
+    pose_graph_meta: FramesMeta,
+    config: CusfmConfig,
+    mapping_options: MappingOptions,
+    mapping: MappingResult,
+) -> ExtrinsicRefinementStageResult:
+    """Refine the rig extrinsics of the model stage 7 produced.
+
+    The blob's second `keypoints_mapper_main` pass: the same matches and the same
+    pose-graph poses, this time with `--optimize_extrinsics=True`, overwriting
+    `kpmap/` (`pycusfm.cusfm_runner.refine_extrinsics`).
+
+    Args:
+        options: The run's options; the refinement's ceiling and the prior switch.
+        pose_graph_meta: The collection stage 6 re-posed — what both priors pull towards.
+        config: The config profile, for the sigmas and the solver settings.
+        mapping_options: Command-line style mapper knobs, for the (B) half of the alternation.
+        mapping: What stage 7 produced, on a camera-referenced rig.
+
+    Returns:
+        The refined mapping result, the re-calibrated collection and the movement.
+
+    Raises:
+        ValueError: When stage 7 built a vehicle-referenced rig, whose extrinsics
+            COLMAP would silently hold constant.
+    """
+    refinement: ExtrinsicRefinementResult = refine_extrinsics(
+        mapping,
+        options.database_path,
+        config.vision_mapping,
+        mapping_options,
+        {camera_params_id: camera.vehicle_T_cam for camera_params_id, camera in pose_graph_meta.cameras.items()},
+        ExtrinsicRefinementOptions(
+            regularised=options.regularised_extrinsics,
+            num_rounds=options.extrinsic_refinement_rounds,
+            use_absolute_prior=config.vision_mapping.use_camera_extrinsic_constraint,
+            use_relative_prior=config.vision_mapping.use_camera_extrinsic_constraint,
+        ),
+    )
+    reference_camera_params_id: int = gauge_camera_params_id(pose_graph_meta)
+    changes: tuple[ExtrinsicChange, ...] = extrinsic_changes(
+        pose_graph_meta, refinement.refined_extrinsics, reference_camera_params_id
+    )
+    _print_mapping(refinement.mapping)
+    print(
+        f"[colsfm] extrinsic refinement "
+        f"({'regularised' if refinement.regularised else 'unregularised'}): rig origin on camera "
+        f"{reference_camera_params_id} "
+        f"({pose_graph_meta.cameras[reference_camera_params_id].sensor_name}), moves "
+        + ", ".join(f"{change.camera_params_id}={change.translation_change_mm:.2f} mm" for change in changes)
+    )
+    return ExtrinsicRefinementStageResult(
+        mapping=refinement.mapping,
+        frames_meta=pose_graph_meta.with_extrinsics(refinement.refined_extrinsics),
+        changes=changes,
+        rounds_run=len(refinement.rounds),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ExportStageResult:
+    """Stage 8: the four artifacts a cuSFM run leaves behind."""
+
+    optimised: FramesMeta
+    """The collection written to `kpmap/keyframes/frames_meta.json`."""
+    num_coloured: int
+    """Points that got a colour from the source imagery."""
+    pose_files: list[Path]
+    """Every TUM trajectory written, per-camera files first."""
+
+
+def run_export_stage(options: PipelineOptions, mapped_meta: FramesMeta, mapping: MappingResult) -> ExportStageResult:
+    """Colour the points and write `sparse/`, `kpmap/` and `output_poses/`.
+
+    Args:
+        options: The run's options, for the output directory and the image root.
+        mapped_meta: The collection carrying whatever extrinsics were just solved.
+        mapping: The final mapping result.
+
+    Returns:
+        The exported collection and what was written.
+
+    Raises:
+        FileNotFoundError: When the image root is missing.
+    """
+    num_coloured: int = colour_points_from_images(mapping.reconstruction, options.input_dir, options.num_threads)
+    print(f"[colsfm] export: coloured {num_coloured}/{mapping.num_points3D} points from the source imagery")
+    write_colmap_model(options.output_dir, mapping.reconstruction)
+    # `camera_to_world` comes straight off the adjusted reconstruction, so it stays
+    # consistent with whatever extrinsics were just written next to it.
+    optimised: FramesMeta = write_optimised_frames_meta(
+        options.output_dir, mapped_meta, optimised_camera_poses(mapping.reconstruction), "ALIGNMENT"
+    )
+    written: list[Path] = write_pose_files(options.output_dir, optimised)
+    print(f"[colsfm] export: sparse/ model, kpmap/keyframes/{FRAMES_META_NAME}, {len(written)} TUM files")
+    return ExportStageResult(optimised=optimised, num_coloured=num_coloured, pose_files=written)
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════
+# the run
+# ══════════════════════════════════════════════════════════════════════════════════════
 
 
 def run_pipeline(options: PipelineOptions) -> PipelineSummary:
-    """Run all eight stages and write cuSFM's outputs into `options.output_dir`.
+    """Run every stage and write cuSFM's outputs into `options.output_dir`.
 
     Args:
         options: Input, output, config and the per-stage knobs.
@@ -674,214 +1076,99 @@ def run_pipeline(options: PipelineOptions) -> PipelineSummary:
     if not options.frames_meta_path.is_file():
         raise FileNotFoundError(f"No {FRAMES_META_NAME} at {options.frames_meta_path}")
     options.output_dir.mkdir(parents=True, exist_ok=True)
-    runtime_csv: Path = options.output_dir / RUNTIME_CSV_NAME
-    runtime_csv.unlink(missing_ok=True)
+    (options.output_dir / RUNTIME_CSV_NAME).unlink(missing_ok=True)
     clock: StageClock = StageClock(output_dir=options.output_dir, stages=stage_names(options.optimize_extrinsics))
-
-    config: CusfmConfig = read_config_directory(
-        options.config_dir,
-        KeyframeSelectionConfig(
-            min_inter_frame_distance_m=options.min_inter_frame_distance,
-            min_inter_frame_rotation_degrees=options.min_inter_frame_rotation_degrees,
-            sample_sync_threshold_microseconds=options.sample_sync_threshold_microseconds,
-        ),
-    )
     print(f"[colsfm] config {options.config_dir} | input {options.input_dir} | output {options.output_dir}")
 
     # ── 1. keyframe selection ────────────────────────────────────────────────────────
     with timed_stage(clock, "keyframe_selection"):
-        frames_meta: FramesMeta = read_frames_meta(options.frames_meta_path)
-        selection: KeyframeSelection = select_keyframes(
-            frames_meta,
-            min_inter_frame_distance_m=config.keyframe_selection.min_inter_frame_distance_m,
-            min_inter_frame_rotation_degrees=config.keyframe_selection.min_inter_frame_rotation_degrees,
-            sample_sync_threshold_microseconds=config.keyframe_selection.sample_sync_threshold_microseconds,
-        )
-        selected: FramesMeta = apply_selection(frames_meta, selection)
-        if not selected.keyframes:
-            raise ValueError("keyframe selection kept no frames; loosen the distance and rotation gates")
-        write_frames_meta(options.output_dir / KEYFRAME_DIR_NAME / FRAMES_META_NAME, selected)
-        rig_frames: tuple[RigFrame, ...] = selected.rig_frames()
+        selection: KeyframeSelectionStageResult = run_keyframe_selection_stage(options)
+        write_frames_meta(options.output_dir / KEYFRAME_DIR_NAME / FRAMES_META_NAME, selection.selected)
         print(
-            f"[colsfm] selected {len(selected.keyframes)}/{len(frames_meta.keyframes)} keyframes "
-            f"in {len(rig_frames)} rig frames over {len(selected.cameras)} cameras"
+            f"[colsfm] selected {len(selection.selected.keyframes)}/{len(selection.frames_meta.keyframes)} keyframes "
+            f"in {len(selection.rig_frames)} rig frames over {len(selection.selected.cameras)} cameras"
         )
+    config: CusfmConfig = selection.config
 
     # ── 2. feature extraction ────────────────────────────────────────────────────────
     with timed_stage(clock, "feature_extraction"):
-        create_database(options.database_path, selected, colmap_cameras(selected), overwrite=True)
-        feature_options: FeatureOptions = FeatureOptions(
-            num_threads=options.num_threads,
-            device="auto" if options.use_gpu else "cpu",
-        )
-        extraction: ExtractionReport = extract_features(
-            options.database_path,
-            options.input_dir,
-            [keyframe.image_name for keyframe in selected.keyframes],
-            feature_options,
-        )
+        extraction: FeatureExtractionStageResult = run_feature_extraction_stage(options, selection.selected)
 
     # ── 3. pair selection ────────────────────────────────────────────────────────────
     with timed_stage(clock, "pair_selection"):
-        pairs: list[ImagePair] = select_pairs(selected, config.pose_graph.connected_keyframe_num)
-        print(
-            f"[colsfm] {len(pairs)} pairs from connected_keyframe_num="
-            f"{config.pose_graph.connected_keyframe_num} and {len(selected.stereo_pairs)} stereo declarations"
-        )
+        pair_selection: PairSelectionStageResult = run_pair_selection_stage(selection.selected, config)
 
     # ── 4. matching and verification ─────────────────────────────────────────────────
     matching_options: MatchingOptions = MatchingOptions(
         max_error_px=config.matching_task_worker.verification.max_pixel_error,
         confidence=config.matching_task_worker.verification.min_ransac_confidence,
         num_threads=options.num_threads,
-        device="auto" if options.use_gpu else "cpu",
+        device=options.device,
         max_matches_per_pair=options.max_matches_per_pair,
     )
     with timed_stage(clock, "matching"):
-        match_report: MatchReport = match_pairs(options.database_path, pairs, matching_options)
+        matching: MatchingStageResult = run_matching_stage(options, pair_selection.pairs, matching_options)
 
     # ── 5. loop closure ──────────────────────────────────────────────────────────────
     with timed_stage(clock, "loop_closure"):
         loops: LoopClosureStageResult = run_loop_closure_stage(
-            selected, options.database_path, config.pose_graph, matching_options, enabled=options.loop_closure
+            selection.selected, options.database_path, config.pose_graph, matching_options, enabled=options.loop_closure
         )
 
     # ── 6. pose graph ────────────────────────────────────────────────────────────────
     with timed_stage(clock, "pose_graph"):
-        nodes: list[RigNode] = rig_nodes(selected)
-        edges: list[PoseGraphEdge] = sequential_edges(nodes, config.pose_graph.connected_keyframe_num)
-        edges.extend(loops.edges)
-        world_T_rig_by_rig_id: dict[int, pycolmap.Rigid3d] = {node.rig_id: node.world_T_rig for node in nodes}
-        if edges:
-            solved: PoseGraphResult = solve_pose_graph(nodes, edges)
-            world_T_rig_by_rig_id = solved.world_T_rig
-            print(
-                f"[colsfm] pose graph: {len(nodes)} nodes, {len(edges)} edges "
-                f"({len(loops.edges)} loop), {solved.termination} after {solved.iterations} iterations, "
-                f"cost {solved.initial_cost:.6g} -> {solved.final_cost:.6g}"
-            )
-        else:
-            print("[colsfm] pose graph: a single rig frame has no edges; the input poses stand")
-        # Written unconditionally, even with the solve a no-op: the camera poses are
-        # re-derived through the rig, which is what makes the collection rigid and what
-        # `pose_graph_main` itself writes out.
-        pose_graph_meta: FramesMeta = selected.with_camera_to_world(
-            camera_poses_from_rig_poses(selected, world_T_rig_by_rig_id)
-        )
-        pose_graph_dir: Path = options.output_dir / POSE_GRAPH_DIR_NAME
-        write_frames_meta(pose_graph_dir / FRAMES_META_NAME, pose_graph_meta)
-        _write_vehicle_pose_file(pose_graph_dir / VEHICLE_POSE_TUM_NAME, nodes, world_T_rig_by_rig_id)
-        pose_graph_change_m: float = _largest_translation_change_m(nodes, world_T_rig_by_rig_id)
+        pose_graph: PoseGraphStageResult = run_pose_graph_stage(options, selection.selected, config, loops.edges)
 
-    mapping_options: MappingOptions = MappingOptions(
-        num_threads=options.ba_num_threads,
-        use_gpu=options.ba_use_gpu,
-        stop_on_observation_change=options.stop_on_observation_change,
-    )
+    mapping_options: MappingOptions = MappingOptions(num_threads=options.ba_num_threads, use_gpu=options.ba_use_gpu)
 
     # ── 7. triangulation and bundle adjustment ───────────────────────────────────────
     with timed_stage(clock, "reconstruction"):
-        mapping: MappingResult = run_mapping(
-            build_reconstruction(pose_graph_meta),
-            options.database_path,
-            config.vision_mapping,
-            config.vision_mapping.bundle_adjustment,
-            mapping_options,
+        reconstruction: ReconstructionStageResult = run_reconstruction_stage(
+            options, pose_graph.frames_meta, config, mapping_options
         )
-        _print_mapping(mapping)
 
     # ── 7b. extrinsic refinement ─────────────────────────────────────────────────────
-    # The blob's second `keypoints_mapper_main` pass: the same matches and the same
-    # pose-graph poses again, this time with `--optimize_extrinsics=True`, overwriting
-    # `kpmap/` (`pycusfm.cusfm_runner.refine_extrinsics`). The rig origin moves onto the
-    # gauge camera because COLMAP freezes every extrinsic of a rig whose reference
-    # sensor owns no images — see `colsfm.reconstruction`.
-    mapped_meta: FramesMeta = pose_graph_meta
+    mapping: MappingResult = reconstruction.mapping
+    mapped_meta: FramesMeta = pose_graph.frames_meta
     changes: tuple[ExtrinsicChange, ...] = ()
     rounds_run: int = 0
     if options.optimize_extrinsics:
         with timed_stage(clock, EXTRINSIC_REFINEMENT_STAGE):
-            reference_camera_params_id: int = gauge_camera_params_id(pose_graph_meta)
-            reference: RigReference = rig_reference(pose_graph_meta, reference_camera_params_id)
-            refinement: ExtrinsicRefinementResult = refine_extrinsics(
-                build_reconstruction(pose_graph_meta, reference_camera_params_id=reference_camera_params_id),
-                options.database_path,
-                config.vision_mapping,
-                config.vision_mapping.bundle_adjustment,
-                mapping_options,
-                reference,
-                {camera_params_id: camera.vehicle_T_cam for camera_params_id, camera in pose_graph_meta.cameras.items()},
-                ExtrinsicRefinementOptions(
-                    regularised=options.regularised_extrinsics,
-                    num_rounds=options.extrinsic_refinement_rounds,
-                    extrinsic_translation_sigma_m=config.vision_mapping.bundle_adjustment.extrinsic_error_meters,
-                    extrinsic_rotation_sigma_deg=config.vision_mapping.bundle_adjustment.extrinsic_error_degrees,
-                    reprojection_sigma_px=config.vision_mapping.bundle_adjustment.reprojection_error_standard_deviation,
-                    use_absolute_prior=config.vision_mapping.use_camera_extrinsic_constraint,
-                    use_relative_prior=config.vision_mapping.use_camera_extrinsic_constraint,
-                    max_num_iterations=config.vision_mapping.bundle_adjustment.max_num_iterations,
-                ),
+            refinement: ExtrinsicRefinementStageResult = run_extrinsic_refinement_stage(
+                options, pose_graph.frames_meta, config, mapping_options, mapping
             )
             mapping = refinement.mapping
-            rounds_run = len(refinement.rounds)
-            changes = extrinsic_changes(pose_graph_meta, refinement.refined_extrinsics, reference_camera_params_id)
-            mapped_meta = pose_graph_meta.with_extrinsics(refinement.refined_extrinsics)
-            _print_mapping(mapping)
-            print(
-                f"[colsfm] extrinsic refinement "
-                f"({'regularised' if refinement.regularised else 'unregularised'}): rig origin on camera "
-                f"{reference_camera_params_id} "
-                f"({pose_graph_meta.cameras[reference_camera_params_id].sensor_name}), moves "
-                + ", ".join(f"{change.camera_params_id}={change.translation_change_mm:.2f} mm" for change in changes)
-            )
+            mapped_meta = refinement.frames_meta
+            changes = refinement.changes
+            rounds_run = refinement.rounds_run
 
     # ── 8. export ────────────────────────────────────────────────────────────────────
     with timed_stage(clock, "export"):
-        num_coloured: int = colour_points_from_images(mapping.reconstruction, options.input_dir, options.num_threads)
-        print(f"[colsfm] export: coloured {num_coloured}/{mapping.num_points3D} points from the source imagery")
-        write_colmap_model(options.output_dir, mapping.reconstruction)
-        # `camera_to_world` comes straight off the adjusted reconstruction, so it stays
-        # consistent with whatever extrinsics were just written next to it.
-        optimised: FramesMeta = mapped_meta.with_camera_to_world(
-            optimised_camera_poses(mapping.reconstruction), "ALIGNMENT"
-        )
-        write_frames_meta(options.output_dir / KEYFRAME_METADATA_SUBPATH, optimised)
-        written: list[Path] = write_pose_files(options.output_dir, optimised)
-        print(f"[colsfm] export: sparse/ model, {KEYFRAME_METADATA_SUBPATH}, {len(written)} TUM files")
+        run_export_stage(options, mapped_meta, mapping)
 
     summary: PipelineSummary = PipelineSummary(
-        input_dir=options.input_dir,
-        output_dir=options.output_dir,
-        config_dir=options.config_dir,
+        options=options,
         git_sha=git_sha(),
-        loop_closure_enabled=options.loop_closure,
-        num_input_keyframes=len(frames_meta.keyframes),
-        num_selected_keyframes=len(selected.keyframes),
-        num_rig_frames=len(rig_frames),
-        num_pairs=len(pairs),
+        num_input_keyframes=len(selection.frames_meta.keyframes),
+        num_selected_keyframes=len(selection.selected.keyframes),
+        num_rig_frames=len(selection.rig_frames),
+        num_pairs=len(pair_selection.pairs),
         num_loop_pairs=loops.num_pairs_matched,
         num_loop_edges=len(loops.edges),
-        num_pose_graph_edges=len(edges),
-        pose_graph_translation_change_m=pose_graph_change_m,
-        num_registered_images=mapping.num_registered_images,
-        num_images_with_observations=mapping.num_images_with_observations,
-        num_points3D=mapping.num_points3D,
-        num_observations=mapping.num_observations,
-        mean_reprojection_error_px=mapping.mean_reprojection_error_px,
-        mean_track_length=mapping.mean_track_length,
+        num_pose_graph_edges=len(pose_graph.edges),
+        pose_graph_translation_change_m=pose_graph.translation_change_m,
+        mapping=MappingStats.of(mapping),
         stage_seconds=dict(clock.seconds_by_stage),
         total_seconds=time.perf_counter() - started,
-        optimize_extrinsics=options.optimize_extrinsics,
-        regularised_extrinsics=options.regularised_extrinsics,
-        extrinsic_refinement_rounds_run=rounds_run,
         extrinsic_changes=changes,
+        extrinsic_refinement_rounds_run=rounds_run,
     )
     (options.output_dir / SUMMARY_NAME).write_text(to_json(summary) + "\n")
     print(
         f"[colsfm] done in {summary.total_seconds:.2f}s | "
-        f"{summary.num_images_with_observations} images, {summary.num_points3D} points, "
-        f"{summary.mean_reprojection_error_px:.4f} px | extraction on {extraction.device}, "
-        f"{match_report.empty_pairs} empty pairs"
+        f"{summary.mapping.num_images_with_observations} images, {summary.mapping.num_points3D} points, "
+        f"{summary.mapping.mean_reprojection_error_px:.4f} px | extraction on {extraction.report.device}, "
+        f"{matching.report.empty_pairs} empty pairs"
     )
     return summary
 
@@ -912,36 +1199,20 @@ def run_stage(options: PipelineOptions, stage: CheapStageName) -> StageResult:
 
     Raises:
         FileNotFoundError: When the input metadata is missing.
+        ValueError: When no keyframe survives selection.
     """
-    if not options.frames_meta_path.is_file():
-        raise FileNotFoundError(f"No {FRAMES_META_NAME} at {options.frames_meta_path}")
-    config: CusfmConfig = read_config_directory(
-        options.config_dir,
-        KeyframeSelectionConfig(
-            min_inter_frame_distance_m=options.min_inter_frame_distance,
-            min_inter_frame_rotation_degrees=options.min_inter_frame_rotation_degrees,
-            sample_sync_threshold_microseconds=options.sample_sync_threshold_microseconds,
-        ),
-    )
-    frames_meta: FramesMeta = read_frames_meta(options.frames_meta_path)
-    selection: KeyframeSelection = select_keyframes(
-        frames_meta,
-        min_inter_frame_distance_m=config.keyframe_selection.min_inter_frame_distance_m,
-        min_inter_frame_rotation_degrees=config.keyframe_selection.min_inter_frame_rotation_degrees,
-        sample_sync_threshold_microseconds=config.keyframe_selection.sample_sync_threshold_microseconds,
-    )
-    selected: FramesMeta = apply_selection(frames_meta, selection)
-    keyframes: tuple[KeyframeMeta, ...] = selected.keyframes
+    selection: KeyframeSelectionStageResult = run_keyframe_selection_stage(options)
     pairs: list[ImagePair] = (
-        select_pairs(selected, config.pose_graph.connected_keyframe_num) if stage == "pair_selection" else []
+        run_pair_selection_stage(selection.selected, selection.config).pairs if stage == "pair_selection" else []
     )
+    rig_frames: tuple[RigFrame, ...] = selection.rig_frames
     print(
-        f"[colsfm] {stage}: {len(keyframes)}/{len(frames_meta.keyframes)} keyframes, "
-        f"{len(selected.rig_frames())} rig frames, {len(pairs)} pairs"
+        f"[colsfm] {stage}: {len(selection.selected.keyframes)}/{len(selection.frames_meta.keyframes)} keyframes, "
+        f"{len(rig_frames)} rig frames, {len(pairs)} pairs"
     )
     return StageResult(
         stage=stage,
-        num_selected_keyframes=len(keyframes),
-        num_rig_frames=len(selected.rig_frames()),
+        num_selected_keyframes=len(selection.selected.keyframes),
+        num_rig_frames=len(rig_frames),
         num_pairs=len(pairs),
     )

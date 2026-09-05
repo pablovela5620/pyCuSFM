@@ -20,25 +20,19 @@ Run:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import combinations
 from pathlib import Path
 
-import numpy as np
 import pycolmap
 import tyro
-from jaxtyping import Float64
-from numpy import ndarray
 from serde import serde
-from serde.json import to_json
 
+from colsfm.bench_report import number as format_number
+from colsfm.benchmark import write_json_report
+from colsfm.extrinsic_refinement import extrinsic_deltas
 from colsfm.frames_meta import CameraParams, FramesMeta, read_frames_meta
-
-DEGREES_PER_RADIAN: float = 180.0 / np.pi
-"""Conversion for the reported rotation deltas."""
-
-MILLIMETRES_PER_METRE: float = 1000.0
-"""Conversion for the reported translation deltas."""
 
 
 @dataclass(frozen=True)
@@ -92,6 +86,11 @@ class ExtrinsicsAuditResult:
 def _delta(label: str, before: pycolmap.Rigid3d, after: pycolmap.Rigid3d) -> ExtrinsicDelta:
     """Measure the movement between two poses.
 
+    Goes through `colsfm.extrinsic_refinement.extrinsic_deltas` on a one-camera
+    mapping, so this audit, the refinement's own per-round stopping test and
+    `colsfm.pipeline.extrinsic_changes` all report the same two quantities from
+    the same code rather than from three angle formulas.
+
     Args:
         label: Name for the report.
         before: The input transform.
@@ -100,14 +99,20 @@ def _delta(label: str, before: pycolmap.Rigid3d, after: pycolmap.Rigid3d) -> Ext
     Returns:
         Translation in millimetres and rotation in degrees.
     """
-    translation: Float64[ndarray, "3"] = np.asarray(after.translation, dtype=np.float64) - np.asarray(before.translation, dtype=np.float64)
-    relative_rotation: Float64[ndarray, "3 3"] = before.rotation.matrix().T @ after.rotation.matrix()
-    cosine: float = float(np.clip((np.trace(relative_rotation) - 1.0) / 2.0, -1.0, 1.0))
-    return ExtrinsicDelta(
-        label=label,
-        translation_millimeters=MILLIMETRES_PER_METRE * float(np.linalg.norm(translation)),
-        rotation_degrees=DEGREES_PER_RADIAN * float(np.arccos(cosine)),
-    )
+    translation_millimeters, rotation_degrees = extrinsic_deltas({0: before}, {0: after})
+    return ExtrinsicDelta(label=label, translation_millimeters=translation_millimeters, rotation_degrees=rotation_degrees)
+
+
+def _print_table(title: str, deltas: Sequence[ExtrinsicDelta]) -> None:
+    """Print one movement table to stdout.
+
+    Args:
+        title: Column heading for the label column.
+        deltas: The rows, in the order they should be printed.
+    """
+    print(f"\n{title:<46} {'mm':>8} {'deg':>8}")
+    for item in deltas:
+        print(f"{item.label:<46} {format_number(item.translation_millimeters, 3):>8} {format_number(item.rotation_degrees, 3):>8}")
 
 
 def main(config: ExtrinsicsAuditConfig) -> None:
@@ -133,33 +138,31 @@ def main(config: ExtrinsicsAuditConfig) -> None:
         label: str = f"{before_meta.cameras[first].sensor_name} -> {before_meta.cameras[second].sensor_name}"
         relative.append(_delta(label, before_pair, after_pair))
 
+    # A single shared camera yields no relative pair, and `max` over an empty
+    # sequence raises; an unmeasured maximum is 0.0, not a crash.
     result: ExtrinsicsAuditResult = ExtrinsicsAuditResult(
         input_meta=str(config.input_meta),
         refined_meta=str(config.refined_meta),
         absolute=tuple(absolute),
         relative=tuple(relative),
-        max_absolute_translation_millimeters=max(item.translation_millimeters for item in absolute),
-        max_absolute_rotation_degrees=max(item.rotation_degrees for item in absolute),
-        max_relative_translation_millimeters=max(item.translation_millimeters for item in relative),
-        max_relative_rotation_degrees=max(item.rotation_degrees for item in relative),
+        max_absolute_translation_millimeters=max((item.translation_millimeters for item in absolute), default=0.0),
+        max_absolute_rotation_degrees=max((item.rotation_degrees for item in absolute), default=0.0),
+        max_relative_translation_millimeters=max((item.translation_millimeters for item in relative), default=0.0),
+        max_relative_rotation_degrees=max((item.rotation_degrees for item in relative), default=0.0),
     )
 
-    print(f"{'absolute vehicle_T_cam':<46} {'mm':>8} {'deg':>8}")
-    for item in absolute:
-        print(f"{item.label:<46} {item.translation_millimeters:>8.3f} {item.rotation_degrees:>8.3f}")
-    print(f"\n{'relative cam_i_T_cam_j (gauge-free)':<46} {'mm':>8} {'deg':>8}")
-    for item in sorted(relative, key=lambda entry: entry.translation_millimeters, reverse=True):
-        print(f"{item.label:<46} {item.translation_millimeters:>8.3f} {item.rotation_degrees:>8.3f}")
+    _print_table("absolute vehicle_T_cam", absolute)
+    _print_table(
+        "relative cam_i_T_cam_j (gauge-free)",
+        sorted(relative, key=lambda entry: entry.translation_millimeters, reverse=True),
+    )
     print(
-        f"\nmax absolute {result.max_absolute_translation_millimeters:.2f} mm / "
-        f"{result.max_absolute_rotation_degrees:.2f} deg; "
-        f"max relative {result.max_relative_translation_millimeters:.2f} mm / "
-        f"{result.max_relative_rotation_degrees:.2f} deg"
+        f"\nmax absolute {format_number(result.max_absolute_translation_millimeters)} mm / "
+        f"{format_number(result.max_absolute_rotation_degrees)} deg; "
+        f"max relative {format_number(result.max_relative_translation_millimeters)} mm / "
+        f"{format_number(result.max_relative_rotation_degrees)} deg"
     )
-
-    config.output_json.parent.mkdir(parents=True, exist_ok=True)
-    config.output_json.write_text(to_json(result))
-    print(f"wrote {config.output_json}")
+    print(f"wrote {write_json_report(config.output_json, result)}")
 
 
 if __name__ == "__main__":

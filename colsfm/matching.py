@@ -80,11 +80,13 @@ from numpy import ndarray
 
 from colsfm.database import (
     ImagePair,
+    Keypoints,
     KeypointsXY,
     MatchIndices,
     delete_two_view_geometries,
     pair_inlier_counts,
     raw_match_counts,
+    read_keypoints_batch,
 )
 from colsfm.features import DeviceChoice, ResolvedDevice, resolve_device
 from colsfm.pairs import write_pair_list
@@ -380,12 +382,12 @@ def cap_verified_matches(database_path: Path, pairs: Sequence[ImagePair], max_ma
         Total inlier matches removed across every pair.
     """
     removed: int = 0
+    first_image_ids: list[int] = sorted({pair[0] for pair in pairs})
+    # `read_keypoints_batch` owns the "leading xy columns" rule; spelling it a second time
+    # here is how the two readers drifted to different dtypes in the first place.
+    keypoints_by_image_id: dict[int, Keypoints] = read_keypoints_batch(database_path, first_image_ids)
     with pycolmap.Database.open(database_path) as database:
-        first_image_ids: list[int] = sorted({pair[0] for pair in pairs})
         sizes: dict[int, tuple[int, int]] = _image_sizes(database, first_image_ids)
-        keypoints_by_image_id: dict[int, KeypointsXY] = {
-            image_id: np.ascontiguousarray(database.read_keypoints(image_id)[:, :2]) for image_id in first_image_ids
-        }
         for image_id1, image_id2 in pairs:
             geometry: pycolmap.TwoViewGeometry = database.read_two_view_geometry(image_id1, image_id2)
             inliers: MatchIndices = np.asarray(geometry.inlier_matches, dtype=np.int64)

@@ -41,8 +41,19 @@ import pyceres
 import pycolmap
 from jaxtyping import Float
 
+from colsfm.ceres_pose import (
+    CeresSolveOptions,
+    PoseBlocks,
+    SolverStats,
+    attach_quaternion_manifolds,
+    pose_parameter_blocks,
+    rigid3d_from_parameter_blocks,
+    skew_matrix,
+    solver_options,
+    solver_stats,
+)
+
 EdgeKind: TypeAlias = Literal["consecutive", "loop"]
-LinearSolverChoice: TypeAlias = Literal["SPARSE_SCHUR", "SPARSE_NORMAL_CHOLESKY"]
 Information6: TypeAlias = Float[np.ndarray, "6 6"]
 Vector6: TypeAlias = Float[np.ndarray, "6"]
 Matrix3: TypeAlias = Float[np.ndarray, "3 3"]
@@ -237,14 +248,6 @@ def rotation_matrix_from_quat_xyzw(quat_xyzw: QuaternionXYZW, out: Matrix3) -> M
     return out
 
 
-def skew_matrix(vector: Vector3, out: Matrix3) -> Matrix3:
-    """Write the skew-symmetric matrix of a 3-vector into `out`."""
-    out[0, 0], out[0, 1], out[0, 2] = 0.0, -vector[2], vector[1]
-    out[1, 0], out[1, 1], out[1, 2] = vector[2], 0.0, -vector[0]
-    out[2, 0], out[2, 1], out[2, 2] = -vector[1], vector[0], 0.0
-    return out
-
-
 def _log_so3(rotation: Matrix3, out: Vector3) -> float:
     """Write the rotation vector of `rotation` into `out` and return its angle in radians.
 
@@ -394,28 +397,10 @@ class RelativePoseCost(pyceres.CostFunction):
         return True
 
 
-@dataclass(frozen=True, slots=True)
-class PoseGraphSolveOptions:
-    """Ceres settings, mirroring `BundleAdjustmentSolver::Solve` (spec §7 "Solver options")."""
-
-    linear_solver: LinearSolverChoice = "SPARSE_NORMAL_CHOLESKY"
-    """The blob hard-codes SPARSE_SCHUR, but a pose graph has no Schur structure to exploit
-    (every parameter block is a pose), so the normal-equation Cholesky is the honest choice
-    and measured slightly faster here. SPARSE_SCHUR is accepted and gives the same optimum."""
-    max_num_iterations: int = 200
-    """`optimization_config.max_num_iterations` in the shipped isaac/av configs."""
-    num_threads: int = 1
-    """The blob uses 8. The residual here is evaluated in Python, so Ceres' worker threads
-    serialise on the GIL and 8 threads measured ~30% SLOWER than 1 on a 1000-node graph.
-    Raise it only if the cost function ever moves to C++."""
-    function_tolerance: float = 1e-6
-    """Ceres default, which the blob leaves untouched."""
-    gradient_tolerance: float = 1e-10
-    """Ceres default, which the blob leaves untouched."""
-    parameter_tolerance: float = 1e-8
-    """Ceres default, which the blob leaves untouched."""
-    minimizer_progress_to_stdout: bool = False
-    """The isaac config sets this true; off by default here to keep library output quiet."""
+PoseGraphSolveOptions: TypeAlias = CeresSolveOptions
+"""Ceres settings for the solve; the shared `colsfm.ceres_pose.CeresSolveOptions`, whose
+defaults are this stage's (spec §7 "Solver options") and which the extrinsic refinement
+now shares."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -491,15 +476,12 @@ def solve_pose_graph(
     if anchor not in node_by_id:
         raise ValueError(f"anchor rig id {anchor} has no node")
 
-    quaternions: dict[int, QuaternionXYZW] = {}
-    translations: dict[int, Vector3] = {}
-    for rig_id, node in node_by_id.items():
-        quat: QuaternionXYZW = np.asarray(node.world_T_rig.rotation.quat, dtype=np.float64).copy()
-        quat /= np.linalg.norm(quat)
-        if quat[3] < 0.0:  # the blob sign-flips so that w >= 0; harmless, kept for parity
-            quat = -quat
-        quaternions[rig_id] = quat
-        translations[rig_id] = np.asarray(node.world_T_rig.translation, dtype=np.float64).copy()
+    # The blob sign-flips every quaternion so that `w >= 0`; harmless, kept for parity.
+    poses: dict[int, PoseBlocks] = {
+        rig_id: pose_parameter_blocks(node.world_T_rig, canonical_sign=True)
+        for rig_id, node in node_by_id.items()
+    }
+    quaternions: dict[int, QuaternionXYZW] = {rig_id: blocks.quat_xyzw for rig_id, blocks in poses.items()}
 
     problem: pyceres.Problem = pyceres.Problem()
     manifold: pyceres.EigenQuaternionManifold = pyceres.EigenQuaternionManifold()
@@ -508,34 +490,28 @@ def solve_pose_graph(
         problem.add_residual_block(
             cost,
             None,
-            [quaternions[edge.source], translations[edge.source], quaternions[edge.target], translations[edge.target]],
+            [
+                poses[edge.source].quat_xyzw,
+                poses[edge.source].translation,
+                poses[edge.target].quat_xyzw,
+                poses[edge.target].translation,
+            ],
         )
-    for rig_id, quat in quaternions.items():
-        if problem.has_parameter_block(quat):
-            problem.set_manifold(quat, manifold)
+    attach_quaternion_manifolds(problem, quaternions, manifold)
     if not problem.has_parameter_block(quaternions[anchor]):
         raise ValueError(f"anchor rig id {anchor} takes part in no edge")
-    problem.set_parameter_block_constant(quaternions[anchor])
-    problem.set_parameter_block_constant(translations[anchor])
+    problem.set_parameter_block_constant(poses[anchor].quat_xyzw)
+    problem.set_parameter_block_constant(poses[anchor].translation)
 
-    ceres_options: pyceres.SolverOptions = pyceres.SolverOptions()
-    ceres_options.linear_solver_type = getattr(pyceres.LinearSolverType, solve_options.linear_solver)
-    ceres_options.max_num_iterations = solve_options.max_num_iterations
-    ceres_options.num_threads = solve_options.num_threads
-    ceres_options.function_tolerance = solve_options.function_tolerance
-    ceres_options.gradient_tolerance = solve_options.gradient_tolerance
-    ceres_options.parameter_tolerance = solve_options.parameter_tolerance
-    ceres_options.minimizer_progress_to_stdout = solve_options.minimizer_progress_to_stdout
     summary: pyceres.SolverSummary = pyceres.SolverSummary()
-    pyceres.solve(ceres_options, problem, summary)
+    pyceres.solve(solver_options(solve_options), problem, summary)
     if not summary.IsSolutionUsable():
-        print(f"Optimization failed: {summary.message}")
-        print(f"Termination type: {summary.termination_type}")
+        print(f"[colsfm] pose graph solve failed ({summary.termination_type}): {summary.message}")
 
-    optimised: dict[int, pycolmap.Rigid3d] = {}
-    for rig_id, quat in quaternions.items():
-        unit: QuaternionXYZW = quat / np.linalg.norm(quat)
-        optimised[rig_id] = pycolmap.Rigid3d(pycolmap.Rotation3d(unit), translations[rig_id].copy())
+    optimised: dict[int, pycolmap.Rigid3d] = {
+        rig_id: rigid3d_from_parameter_blocks(blocks.quat_xyzw, blocks.translation)
+        for rig_id, blocks in poses.items()
+    }
 
     residual_norms: Float[np.ndarray, "n_edges"] = np.array(
         [
@@ -550,13 +526,14 @@ def solve_pose_graph(
         dtype=np.float64,
     )
 
+    solved: SolverStats = solver_stats(summary)
     return PoseGraphResult(
         world_T_rig=optimised,
         anchor_rig_id=anchor,
-        iterations=int(summary.num_successful_steps) + int(summary.num_unsuccessful_steps),
-        initial_cost=float(summary.initial_cost),
-        final_cost=float(summary.final_cost),
-        termination=str(summary.termination_type).rsplit(".", maxsplit=1)[-1],
+        iterations=solved.iterations,
+        initial_cost=solved.initial_cost,
+        final_cost=solved.final_cost,
+        termination=solved.termination,
         is_solution_usable=bool(summary.IsSolutionUsable()),
         brief_report=summary.BriefReport(),
         edge_residual_norms=residual_norms,

@@ -57,6 +57,9 @@ DistortionCoefficients: TypeAlias = Float64[ndarray, "num_coefficients"]
 JSON_INDENT: Final[int] = 2
 """Indent cuSFM's own writer uses, so our output diffs cleanly against the blob's."""
 
+FRAMES_META_NAME: Final[str] = "frames_meta.json"
+"""The metadata file name, in an input directory and in every output directory."""
+
 
 @dataclass(frozen=True, slots=True)
 class KeyframeMeta:
@@ -259,7 +262,7 @@ class FramesMeta:
             pose: pycolmap.Rigid3d | None = world_T_cam_by_keyframe_id.get(int(entry.id))
             if pose is None:
                 continue
-            _write_rigid_transform(entry.camera_to_world, pose)
+            write_rigid_transform(entry.camera_to_world, pose)
         if initial_pose_type is not None:
             message.initial_pose_type = message.DESCRIPTOR.fields_by_name["initial_pose_type"].enum_type.values_by_name[
                 initial_pose_type
@@ -288,7 +291,7 @@ class FramesMeta:
             pose: pycolmap.Rigid3d | None = vehicle_T_cam_by_camera_params_id.get(int(camera_params_id))
             if pose is None:
                 continue
-            _write_rigid_transform(camera_sensor.sensor_meta_data.sensor_to_vehicle_transform, pose)
+            write_rigid_transform(camera_sensor.sensor_meta_data.sensor_to_vehicle_transform, pose)
         return parse_message(message)
 
     def filtered(
@@ -339,7 +342,7 @@ def _rigid_transform(transform: Message) -> pycolmap.Rigid3d:
     )
 
 
-def _write_rigid_transform(transform: Message, pose: pycolmap.Rigid3d) -> None:
+def write_rigid_transform(transform: Message, pose: pycolmap.Rigid3d) -> None:
     """Overwrite a `RigidTransform3d` message in place from a `Rigid3d`.
 
     Args:

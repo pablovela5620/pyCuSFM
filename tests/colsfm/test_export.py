@@ -11,6 +11,7 @@ from jaxtyping import UInt8
 from numpy import ndarray
 
 from colsfm.export import (
+    KEYFRAME_METADATA_SUBPATH,
     RuntimeRecord,
     append_runtime_record,
     colour_points_from_images,
@@ -19,14 +20,14 @@ from colsfm.export import (
     write_optimised_frames_meta,
     write_pose_files,
 )
-from colsfm.frames_meta import FramesMeta, read_frames_meta
-from colsfm.geometry import parse_tum_line, quaternion_wxyz
+from colsfm.frames_meta import FramesMeta, KeyframeMeta, read_frames_meta
+from colsfm.geometry import TumPose, parse_tum_line, quaternion_wxyz
 
 
 @pytest.fixture(scope="module")
 def optimised_meta(galileo_run_dir: Path) -> FramesMeta:
     """The blob's post-BA metadata, the input `extract_pose_from_map_main` was given."""
-    return read_frames_meta(galileo_run_dir / "kpmap" / "keyframes" / "frames_meta.json")
+    return read_frames_meta(galileo_run_dir / KEYFRAME_METADATA_SUBPATH)
 
 
 def test_colmap_model_round_trips_through_write_text(galileo_run_dir: Path, tmp_path: Path) -> None:
@@ -130,15 +131,15 @@ def test_camera_frame_export_writes_the_stored_poses(optimised_meta: FramesMeta,
     assert not (tmp_path / "output_poses" / "merged_pose_file.tum").exists()
     assert len(written) == len(optimised_meta.cameras)
 
-    keyframes_by_id = optimised_meta.keyframe_by_id()
-    camera_zero_keyframes = [k for k in optimised_meta.keyframes if k.camera_params_id == 0]
+    camera_zero_keyframes: list[KeyframeMeta] = [k for k in optimised_meta.keyframes if k.camera_params_id == 0]
     sensor_name: str = optimised_meta.cameras[0].sensor_name
     lines: list[str] = (tmp_path / "output_poses" / "0" / f"camera_name-{sensor_name}_pose_file.tum").read_text().splitlines()
     assert len(lines) == len(camera_zero_keyframes)
     for line in lines:
-        parsed = parse_tum_line(line)
-        expected = next(k for k in camera_zero_keyframes if k.timestamp_microseconds == parsed.timestamp_microseconds)
-        assert keyframes_by_id[expected.keyframe_id] is expected
+        parsed: TumPose = parse_tum_line(line)
+        expected: KeyframeMeta = next(
+            keyframe for keyframe in camera_zero_keyframes if keyframe.timestamp_microseconds == parsed.timestamp_microseconds
+        )
         assert np.allclose(parsed.world_T_body.translation, expected.world_T_cam.translation, atol=1e-12)
 
 
@@ -153,9 +154,10 @@ def test_optimised_frames_meta_matches_the_blob_output(galileo_run_dir: Path, tm
     ba_output: FramesMeta = read_frames_meta(galileo_run_dir / "kpmap" / "keyframes" / "frames_meta.json")
     optimised_poses = {keyframe.keyframe_id: keyframe.world_T_cam for keyframe in ba_output.keyframes}
 
-    path: Path = write_optimised_frames_meta(tmp_path, ba_input, optimised_poses)
-    assert path == tmp_path / "kpmap" / "keyframes" / "frames_meta.json"
+    returned: FramesMeta = write_optimised_frames_meta(tmp_path, ba_input, optimised_poses)
+    path: Path = tmp_path / KEYFRAME_METADATA_SUBPATH
     written: FramesMeta = read_frames_meta(path)
+    assert [keyframe.keyframe_id for keyframe in returned.keyframes] == [keyframe.keyframe_id for keyframe in written.keyframes]
 
     assert written.initial_pose_type == "ALIGNMENT" == ba_output.initial_pose_type
     assert [k.keyframe_id for k in written.keyframes] == [k.keyframe_id for k in ba_input.keyframes]
@@ -180,9 +182,9 @@ def test_runtime_csv_matches_the_command_runner_format(tmp_path: Path, galileo_r
         RuntimeRecord(command="feature_extractor_main --min_inter_frame_distance 0.0", runtime_seconds=207.74518609046936),
         RuntimeRecord(command="kpmap_to_colmap --map_dir a, --output_dir b", runtime_seconds=1.4205365180969238),
     ]
-    for record in records:
-        path: Path = append_runtime_record(tmp_path, record)
-    assert path == tmp_path / "runtime.csv"
+    paths: list[Path] = [append_runtime_record(tmp_path, record) for record in records]
+    path: Path = paths[-1]
+    assert paths == [tmp_path / "runtime.csv"] * len(records)
     assert path.read_text().splitlines()[0] == blob_header
     assert read_runtime_records(path) == records
 

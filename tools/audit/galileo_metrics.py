@@ -10,13 +10,13 @@ things this module supplies:
    calibrated `vehicle_T_cam` gives a ground-truth camera centre per image.
    That is the only reference a monocular reconstruction can be scored against
    without first inventing a rig.
-2. **A similarity fit.** `colsfm.benchmark.align_rigid` deliberately holds the
-   scale at 1.0. COLMAP's monocular output has no metric scale, so it must also
-   be scored after a scale-free SIM(3) fit; both numbers are reported.
+2. **A similarity fit.** COLMAP's monocular output has no metric scale, so it
+   must also be scored after a scale-free SIM(3) fit; both numbers are reported.
+   That is `align_rigid(..., estimate_scale=True)`, the same function and the
+   same Umeyama solve as the rigid fit — this module used to carry its own copy.
 
-Everything else — `align_rigid`, `match_timestamps`, `read_ground_truth`,
-`RigTrack` — is imported from `colsfm.benchmark` unchanged so that the audit's
-numbers and the benchmark report's numbers are produced by the same code.
+Everything measured here comes from `colsfm.benchmark`, so the audit's numbers
+and the benchmark report's numbers are produced by the same code.
 """
 
 from __future__ import annotations
@@ -29,7 +29,6 @@ import numpy as np
 import pycolmap
 from jaxtyping import Float64, Int64
 from numpy import ndarray
-from scipy.spatial.transform import Rotation
 
 from colsfm.benchmark import (
     GROUND_TRUTH_TOLERANCE_MICROSECONDS,
@@ -39,113 +38,25 @@ from colsfm.benchmark import (
     RigTrack,
     align_rigid,
     match_timestamps,
-    path_length_meters,
     read_ground_truth,
 )
-from colsfm.frames_meta import CameraParams, FramesMeta, KeyframeMeta, read_frames_meta
+from colsfm.frames_meta import FRAMES_META_NAME, CameraParams, FramesMeta, KeyframeMeta, read_frames_meta
+from colsfm.geometry import Vector3, rigid3d_from_matrix
 
-DEGENERATE_VARIANCE: Final[float] = 1e-15
-"""Below this positional variance a similarity fit cannot resolve a scale."""
-
-
-@dataclass(frozen=True, slots=True)
-class SimilarityAlignment:
-    """A least-squares SIM(3) fit of one trajectory onto another."""
-
-    scale: float
-    """Scale factor taking source lengths into target lengths."""
-    target_R_source: Float64[ndarray, "3 3"]
-    """Rotation taking source positions into the target frame."""
-    target_t_source: Float64[ndarray, "3"]
-    """Translation taking source positions into the target frame, in metres."""
-    rmse_meters: float
-    """Root-mean-square residual after the fit."""
-    max_error_meters: float
-    """Largest single residual after the fit."""
-
-    def apply(self, positions: Positions) -> Positions:
-        """Map source-frame positions into the target frame.
-
-        Args:
-            positions: Float64 source positions with shape `[n, 3]`.
-
-        Returns:
-            Float64 positions with shape `[n, 3]` in the target frame.
-        """
-        return self.scale * (positions @ self.target_R_source.T) + self.target_t_source
-
-    def apply_pose(self, world_T_body: pycolmap.Rigid3d) -> pycolmap.Rigid3d:
-        """Map a source-frame pose into the target frame, scaling its translation.
-
-        Args:
-            world_T_body: A pose expressed in the source world frame.
-
-        Returns:
-            The same pose expressed in the target world frame.
-        """
-        rotation: Float64[ndarray, "3 3"] = self.target_R_source @ world_T_body.rotation.matrix()
-        translation: Float64[ndarray, "3"] = self.apply(np.asarray(world_T_body.translation, dtype=np.float64).reshape(1, 3))[0]
-        return pycolmap.Rigid3d(pycolmap.Rotation3d(Rotation.from_matrix(rotation).as_quat()), translation)
-
-
-def align_similarity(source_xyz: Positions, target_xyz: Positions) -> SimilarityAlignment:
-    """Fit `target ~ s * R @ source + t` (Umeyama, scale free).
-
-    Args:
-        source_xyz: Float64 positions to move, shape `[n, 3]`.
-        target_xyz: Float64 positions to move onto, shape `[n, 3]`.
-
-    Returns:
-        The fitted similarity plus its residual statistics.
-
-    Raises:
-        ValueError: When the two trajectories differ in length or are empty.
-    """
-    if source_xyz.shape != target_xyz.shape:
-        raise ValueError(f"alignment needs matched trajectories, got {source_xyz.shape} and {target_xyz.shape}")
-    if len(source_xyz) == 0:
-        raise ValueError("alignment needs at least one sample")
-
-    source_mean: Float64[ndarray, "3"] = source_xyz.mean(axis=0)
-    target_mean: Float64[ndarray, "3"] = target_xyz.mean(axis=0)
-    source_centred: Positions = source_xyz - source_mean
-    target_centred: Positions = target_xyz - target_mean
-
-    covariance: Float64[ndarray, "3 3"] = target_centred.T @ source_centred / len(source_xyz)
-    u_matrix, singular_values, vt_matrix = np.linalg.svd(covariance)
-    sign_fix: Float64[ndarray, "3 3"] = np.eye(3)
-    if np.linalg.det(u_matrix) * np.linalg.det(vt_matrix) < 0:
-        sign_fix[2, 2] = -1.0
-    target_R_source: Float64[ndarray, "3 3"] = u_matrix @ sign_fix @ vt_matrix
-
-    source_variance: float = float((source_centred**2).sum() / len(source_xyz))
-    scale: float = float((singular_values * np.diag(sign_fix)).sum() / source_variance) if source_variance > DEGENERATE_VARIANCE else 1.0
-    target_t_source: Float64[ndarray, "3"] = target_mean - scale * (target_R_source @ source_mean)
-    residual: Positions = (scale * (source_xyz @ target_R_source.T) + target_t_source) - target_xyz
-    distances: Float64[ndarray, "n"] = np.linalg.norm(residual, axis=1)
-    return SimilarityAlignment(
-        scale=scale,
-        target_R_source=target_R_source,
-        target_t_source=target_t_source,
-        rmse_meters=float(np.sqrt((distances**2).mean())),
-        max_error_meters=float(distances.max()),
-    )
+MIN_ALIGNMENT_SAMPLES: Final[int] = 3
+"""Below three matched samples a three-dimensional fit is not determined."""
 
 
 @dataclass(frozen=True, slots=True)
 class GalileoReference:
     """Everything the audit needs about the Galileo dataset, read once."""
 
-    input_dir: Path
-    """Directory holding `frames_meta.json`, `ground_truth.txt` and the image folders."""
     frames_meta: FramesMeta
     """The input collection: 226 keyframes, 8 cameras, the prior trajectory."""
     ground_truth: RigTrack
     """The shipped `ground_truth.txt` rig trajectory."""
     gt_center_by_image_name: dict[str, Float64[ndarray, "3"]]
     """Ground-truth camera centre per keyframe image name, in metres."""
-    gt_world_T_cam_by_image_name: dict[str, pycolmap.Rigid3d]
-    """Ground-truth `world_T_cam` per keyframe image name."""
 
 
 def read_galileo_reference(input_dir: Path) -> GalileoReference:
@@ -165,7 +76,7 @@ def read_galileo_reference(input_dir: Path) -> GalileoReference:
     Raises:
         FileNotFoundError: When the dataset ships no ground truth.
     """
-    frames_meta: FramesMeta = read_frames_meta(input_dir / "frames_meta.json")
+    frames_meta: FramesMeta = read_frames_meta(input_dir / FRAMES_META_NAME)
     ground_truth: RigTrack | None = read_ground_truth(input_dir)
     if ground_truth is None:
         raise FileNotFoundError(f"no ground_truth.txt under {input_dir}")
@@ -177,24 +88,16 @@ def read_galileo_reference(input_dir: Path) -> GalileoReference:
     )
 
     centers: dict[str, Float64[ndarray, "3"]] = {}
-    poses: dict[str, pycolmap.Rigid3d] = {}
     for keyframe_index, ground_truth_index in zip(keyframe_indices, ground_truth_indices, strict=True):
         keyframe: KeyframeMeta = keyframes[int(keyframe_index)]
         camera: CameraParams = frames_meta.cameras[keyframe.camera_params_id]
-        world_R_vehicle: Float64[ndarray, "3 3"] = ground_truth.world_R_rig[int(ground_truth_index)]
-        world_t_vehicle: Float64[ndarray, "3"] = ground_truth.world_t_rig[int(ground_truth_index)]
-        world_T_vehicle: pycolmap.Rigid3d = pycolmap.Rigid3d(pycolmap.Rotation3d(Rotation.from_matrix(world_R_vehicle).as_quat()), world_t_vehicle)
+        world_T_vehicle: pycolmap.Rigid3d = rigid3d_from_matrix(
+            ground_truth.world_R_rig[int(ground_truth_index)], ground_truth.world_t_rig[int(ground_truth_index)]
+        )
         world_T_cam: pycolmap.Rigid3d = world_T_vehicle * camera.vehicle_T_cam
-        poses[keyframe.image_name] = world_T_cam
         centers[keyframe.image_name] = np.asarray(world_T_cam.translation, dtype=np.float64)
 
-    return GalileoReference(
-        input_dir=input_dir,
-        frames_meta=frames_meta,
-        ground_truth=ground_truth,
-        gt_center_by_image_name=centers,
-        gt_world_T_cam_by_image_name=poses,
-    )
+    return GalileoReference(frames_meta=frames_meta, ground_truth=ground_truth, gt_center_by_image_name=centers)
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,10 +114,27 @@ class TrajectoryScore:
     """Scale a similarity fit would have chosen; 1.0 means metric scale survived."""
     similarity_rmse_millimeters: float
     """RMSE after a scale-free SIM(3) fit — the only fair metric for monocular COLMAP."""
-    similarity_max_millimeters: float
-    """Largest residual of that similarity fit."""
-    reference_path_length_meters: float
-    """Distance travelled along the matched reference samples."""
+
+    @staticmethod
+    def empty(num_matched: int) -> TrajectoryScore:
+        """The score of a sample set too small to fit.
+
+        `align_rigid` raises below one sample and is undetermined below three, so
+        the guard lives here once rather than in each of this module's callers.
+
+        Args:
+            num_matched: How many samples did join, for the report.
+
+        Returns:
+            A score whose every residual is NaN.
+        """
+        return TrajectoryScore(
+            num_matched=num_matched,
+            rigid_rmse_millimeters=float("nan"),
+            rigid_max_millimeters=float("nan"),
+            would_be_scale=float("nan"),
+            similarity_rmse_millimeters=float("nan"),
+        )
 
 
 def score_positions(source_xyz: Positions, target_xyz: Positions) -> TrajectoryScore:
@@ -227,26 +147,16 @@ def score_positions(source_xyz: Positions, target_xyz: Positions) -> TrajectoryS
     Returns:
         Both alignments' residual statistics, in millimetres.
     """
-    if len(source_xyz) < 3:
-        return TrajectoryScore(
-            num_matched=len(source_xyz),
-            rigid_rmse_millimeters=float("nan"),
-            rigid_max_millimeters=float("nan"),
-            would_be_scale=float("nan"),
-            similarity_rmse_millimeters=float("nan"),
-            similarity_max_millimeters=float("nan"),
-            reference_path_length_meters=0.0,
-        )
+    if len(source_xyz) < MIN_ALIGNMENT_SAMPLES:
+        return TrajectoryScore.empty(len(source_xyz))
     rigid: RigidAlignment = align_rigid(source_xyz, target_xyz)
-    similarity: SimilarityAlignment = align_similarity(source_xyz, target_xyz)
+    similarity: RigidAlignment = align_rigid(source_xyz, target_xyz, estimate_scale=True)
     return TrajectoryScore(
         num_matched=len(source_xyz),
         rigid_rmse_millimeters=MILLIMETRES_PER_METRE * rigid.rmse_meters,
         rigid_max_millimeters=MILLIMETRES_PER_METRE * rigid.max_error_meters,
         would_be_scale=rigid.would_be_scale,
         similarity_rmse_millimeters=MILLIMETRES_PER_METRE * similarity.rmse_meters,
-        similarity_max_millimeters=MILLIMETRES_PER_METRE * similarity.max_error_meters,
-        reference_path_length_meters=path_length_meters(target_xyz),
     )
 
 
@@ -270,7 +180,7 @@ def score_track_against_ground_truth(track: RigTrack, ground_truth: RigTrack) ->
 
 
 def rig_track_from_reconstruction(
-    reconstruction: pycolmap.Reconstruction, frames_meta: FramesMeta, alignment: SimilarityAlignment | None = None
+    reconstruction: pycolmap.Reconstruction, frames_meta: FramesMeta, alignment: RigidAlignment | None = None
 ) -> RigTrack:
     """Derive a rig trajectory from a plain (rig-free) COLMAP reconstruction.
 
@@ -318,26 +228,43 @@ def rig_track_from_reconstruction(
     )
 
 
-def image_center_score(reconstruction: pycolmap.Reconstruction, reference: GalileoReference) -> tuple[TrajectoryScore, SimilarityAlignment]:
+def image_center_score(
+    reconstruction: pycolmap.Reconstruction, reference: GalileoReference
+) -> tuple[TrajectoryScore, RigidAlignment]:
     """Score a reconstruction's camera centres against per-image ground truth.
+
+    The similarity fit is computed once and both returned and used for the
+    reported RMSE, so the caller's alignment is the very fit the number came from.
 
     Args:
         reconstruction: A model whose image names are the dataset's `image_name`s.
         reference: The Galileo reference bundle.
 
     Returns:
-        The score and the similarity fit it used, so callers can reuse the fit.
+        The score and the scale-estimating fit it used, so callers can reuse the fit.
 
     Raises:
         ValueError: When fewer than three registered images have ground truth.
     """
-    names: list[str] = sorted(
-        image.name for image in reconstruction.images.values() if image.has_pose and image.name in reference.gt_center_by_image_name
-    )
-    if len(names) < 3:
+    # One pass over the images: `find_image_with_name` is a linear scan, so calling it
+    # per name inside a comprehension is quadratic in the model size.
+    center_by_name: dict[str, Vector3] = {
+        image.name: np.asarray(image.cam_from_world().inverse().translation, dtype=np.float64)
+        for image in reconstruction.images.values()
+        if image.has_pose and image.name in reference.gt_center_by_image_name
+    }
+    names: list[str] = sorted(center_by_name)
+    if len(names) < MIN_ALIGNMENT_SAMPLES:
         raise ValueError(f"only {len(names)} registered images carry ground truth")
-    source_xyz: Positions = np.asarray(
-        [reconstruction.find_image_with_name(name).cam_from_world().inverse().translation for name in names], dtype=np.float64
-    ).reshape(-1, 3)
+    source_xyz: Positions = np.asarray([center_by_name[name] for name in names], dtype=np.float64).reshape(-1, 3)
     target_xyz: Positions = np.asarray([reference.gt_center_by_image_name[name] for name in names], dtype=np.float64).reshape(-1, 3)
-    return score_positions(source_xyz, target_xyz), align_similarity(source_xyz, target_xyz)
+    rigid: RigidAlignment = align_rigid(source_xyz, target_xyz)
+    similarity: RigidAlignment = align_rigid(source_xyz, target_xyz, estimate_scale=True)
+    score: TrajectoryScore = TrajectoryScore(
+        num_matched=len(names),
+        rigid_rmse_millimeters=MILLIMETRES_PER_METRE * rigid.rmse_meters,
+        rigid_max_millimeters=MILLIMETRES_PER_METRE * rigid.max_error_meters,
+        would_be_scale=rigid.would_be_scale,
+        similarity_rmse_millimeters=MILLIMETRES_PER_METRE * similarity.rmse_meters,
+    )
+    return score, similarity

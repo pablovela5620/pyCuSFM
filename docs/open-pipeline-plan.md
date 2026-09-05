@@ -122,7 +122,7 @@ Galileo (`data/bench/galileo_ext_compare.md`, NOTES.md deviation 9): **0.898 px*
 and **4.28 mm** ATE, against 1.334 px / 4.33 mm with the extrinsics fixed and 0.861 px /
 5.70 mm unregularised — the priors buy back all of the trajectory accuracy the free
 extrinsics were costing, and keep the extrinsics inside 2.8 mm where the unregularised solve
-walked 234 mm. **4/4 acceptance bounds**, 9.9 s for the stage. `--no-regularised-extrinsics`
+walked 234 mm. **4/4 acceptance bounds**, 3.2 s for the stage. `--no-regularised-extrinsics`
 keeps the plain pycolmap path for comparison. The flag stays off by default: the gain over a
 fixed-extrinsic run is 0.4 px of reprojection and 0.02 mm of ATE.
 

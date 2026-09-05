@@ -21,7 +21,15 @@ from typing import Annotated, TypeAlias
 
 import tyro
 
-from colsfm.pipeline import CheapStageName, PipelineOptions, PipelineSummary, StageResult, run_pipeline, run_stage
+from colsfm.pipeline import (
+    SUMMARY_NAME,
+    CheapStageName,
+    PipelineOptions,
+    PipelineSummary,
+    StageResult,
+    run_pipeline,
+    run_stage,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,7 +42,7 @@ class RunCommand:
     def execute(self) -> None:
         """Run the pipeline and print where the summary landed."""
         summary: PipelineSummary = run_pipeline(self.options)
-        print(f"[colsfm] summary written to {summary.output_dir / 'summary.json'}")
+        print(f"[colsfm] summary written to {summary.options.output_dir / SUMMARY_NAME}")
 
 
 @dataclass(frozen=True, slots=True)

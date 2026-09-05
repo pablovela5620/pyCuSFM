@@ -26,11 +26,10 @@ from typing import Final, TypeAlias
 import tyro
 from google.protobuf import descriptor_pb2, descriptor_pool
 
+from colsfm import REPO_ROOT
+
 DescriptorBlobs: TypeAlias = dict[str, bytes]
 """Serialised `FileDescriptorProto` bytes keyed by the proto file name."""
-
-REPO_ROOT: Final[Path] = Path(__file__).resolve().parent.parent
-"""Repo root, so defaults resolve regardless of the working directory."""
 
 SECTION_NAME: Final[str] = "protodesc_cold"
 """ELF section holding the embedded descriptors in every cuSFM binary."""
@@ -259,6 +258,10 @@ def build_descriptor_set(blobs: DescriptorBlobs) -> descriptor_pb2.FileDescripto
 
     Args:
         blobs: Serialised descriptor bytes keyed by proto file name.
+
+    The proof matters: `colsfm.schema.build_schema` adds the files in file order
+    and lets a failure propagate, so the ordering has to be right here rather than
+    rediscovered at load time.
 
     Returns:
         A `FileDescriptorSet` that a fresh `DescriptorPool` accepts in file order.

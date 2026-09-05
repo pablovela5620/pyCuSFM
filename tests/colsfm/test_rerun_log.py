@@ -6,9 +6,9 @@ gotcha 9 applies: chunk record batches carry **bare** component names
 (`Transform3D:translation`), not the entity-path-prefixed names the catalog
 dataframe API returns, so the column lookups here are deliberately unprefixed.
 
-The two runs under test are the synthetic cuSFM-layout fixtures from
-`test_benchmark`, which pytest imports by module name because `tests/colsfm`
-has no `__init__.py` and is therefore on `sys.path`.
+The two runs under test are the synthetic cuSFM-layout fixtures from `conftest`,
+which pytest imports by module name because `tests/colsfm` has no `__init__.py`
+and is therefore on `sys.path`.
 """
 
 from __future__ import annotations
@@ -19,19 +19,30 @@ import numpy as np
 import pyarrow as pa
 import pycolmap
 import pytest
+import rerun as rr
 import rerun.blueprint as rrb
 import rerun.experimental as rrx
+from conftest import BLOB_RUNTIMES, COLSFM_RUNTIMES, SYNTHETIC_ERROR_PX, transform_rig_trajectory, write_synthetic_run
 from jaxtyping import Float64, Int64, UInt8, UInt32
 from numpy import ndarray
-from test_benchmark import BLOB_RUNTIMES, COLSFM_RUNTIMES, SYNTHETIC_ERROR_PX, transform_rig_trajectory, write_synthetic_run
 
-from colsfm.benchmark import Comparison, RigTrack, RunArtifacts, compare_runs, read_ground_truth, read_run, rig_track_from_frames_meta
-from colsfm.frames_meta import FramesMeta, read_frames_meta
+from colsfm.benchmark import (
+    AcceptanceBounds,
+    Comparison,
+    RigTrack,
+    RunArtifacts,
+    compare_runs,
+    read_ground_truth,
+    read_run,
+    rig_track_from_frames_meta,
+)
+from colsfm.frames_meta import FramesMeta
 from colsfm.rerun_log import (
     RUN_A_COLOR,
     RUN_A_INDEX,
     RUN_B_INDEX,
     TIMELINE,
+    BenchmarkScene,
     TrajectorySources,
     build_blueprint,
     log_points,
@@ -40,25 +51,6 @@ from colsfm.rerun_log import (
 
 NANOSECONDS_PER_MICROSECOND: int = 1000
 """`log_rig_pose_stream` converts microsecond keyframe times to nanoseconds."""
-
-
-@pytest.fixture(scope="module")
-def galileo_input_dir(repo_root: Path) -> Path:
-    """The r2b_galileo input directory: `frames_meta.json` plus `ground_truth.txt`."""
-    return repo_root / "data" / "r2b_galileo"
-
-
-@pytest.fixture(scope="module")
-def galileo_input(galileo_input_dir: Path) -> FramesMeta:
-    """The 226-keyframe input metadata."""
-    return read_frames_meta(galileo_input_dir / "frames_meta.json")
-
-
-@pytest.fixture(scope="module")
-def three_samples(galileo_input: FramesMeta) -> FramesMeta:
-    """The first three synchronised samples, enough for a two-segment polyline."""
-    keep: list[int] = [keyframe_id for rig_frame in galileo_input.rig_frames()[:3] for keyframe_id in rig_frame.keyframe_ids]
-    return galileo_input.filtered(keep)
 
 
 @pytest.fixture(scope="module")
@@ -83,8 +75,8 @@ def runs(three_samples: FramesMeta, tmp_path_factory: pytest.TempPathFactory) ->
 
 @pytest.fixture(scope="module")
 def comparison(runs: tuple[RunArtifacts, RunArtifacts], galileo_input_dir: Path) -> Comparison:
-    """The comparison the recording is built from."""
-    return compare_runs(runs[0], runs[1], galileo_input_dir, "galileo")
+    """The comparison the recording is built from, bounds and all, as the CLI builds it."""
+    return compare_runs(runs[0], runs[1], galileo_input_dir, "galileo", AcceptanceBounds())
 
 
 @pytest.fixture(scope="module")
@@ -96,15 +88,16 @@ def sources(galileo_input: FramesMeta, galileo_input_dir: Path) -> TrajectorySou
 
 
 @pytest.fixture(scope="module")
-def recording_path(
-    comparison: Comparison,
-    runs: tuple[RunArtifacts, RunArtifacts],
-    sources: TrajectorySources,
-    tmp_path_factory: pytest.TempPathFactory,
-) -> Path:
+def scene(comparison: Comparison, runs: tuple[RunArtifacts, RunArtifacts], sources: TrajectorySources) -> BenchmarkScene:
+    """Everything the recording is logged from, in one bundle."""
+    return BenchmarkScene(comparison=comparison, run_a=runs[0], run_b=runs[1], sources=sources)
+
+
+@pytest.fixture(scope="module")
+def recording_path(scene: BenchmarkScene, tmp_path_factory: pytest.TempPathFactory) -> Path:
     """A saved `.rrd` holding the whole comparison."""
     path: Path = tmp_path_factory.mktemp("rrd") / "compare.rrd"
-    return save_comparison(path, comparison, runs[0], runs[1], sources)
+    return save_comparison(path, scene)
 
 
 @pytest.fixture(scope="module")
@@ -244,24 +237,23 @@ def test_a_polyline_has_one_segment_per_consecutive_pose(chunks: list[rrx.Chunk]
 
 
 def test_a_black_cloud_falls_back_to_the_runs_flat_colour(runs: tuple[RunArtifacts, RunArtifacts], tmp_path: Path) -> None:
-    """A run written without `--output_rgb` is all-black; it must not render invisible."""
-    import rerun as rr
+    """A run written without `--output_rgb` is all-black; it must not render invisible.
 
-    black: RunArtifacts = RunArtifacts(
-        name=runs[0].name,
-        run_dir=runs[0].run_dir,
-        reconstruction=runs[0].reconstruction,
-        frames_meta=runs[0].frames_meta,
-        track=runs[0].track,
-        points_xyz=runs[0].points_xyz,
-        points_rgb=np.zeros_like(runs[0].points_rgb),
-        runtime_seconds_by_stage=runs[0].runtime_seconds_by_stage,
-    )
+    The colours are blacked out on a *freshly read* copy of run A's model, not on
+    the fixture's, because `RunArtifacts.points_rgb()` now reads them off the
+    reconstruction every time rather than off a cached array.
+    """
+    black: RunArtifacts = read_run(runs[0].run_dir, "black")
+    for point in black.reconstruction.points3D.values():
+        point.color = np.zeros(3, dtype=np.uint8)
+    num_points: int = len(black.points_xyz())
+    assert not black.points_rgb().any()
+
     path: Path = tmp_path / "black.rrd"
     recording: rr.RecordingStream = rr.RecordingStream("colsfm_bench_black", recording_id="black")
     recording.save(str(path))
     with recording:
-        assert log_points(black, RUN_A_INDEX, RUN_A_COLOR) == len(black.points_xyz)
+        assert log_points(black, RUN_A_INDEX, RUN_A_COLOR) == num_points
     recording.flush(timeout_sec=30.0)
 
     reader: rrx.RrdReader = rrx.RrdReader(str(path))
@@ -270,7 +262,7 @@ def test_a_black_cloud_falls_back_to_the_runs_flat_colour(runs: tuple[RunArtifac
     packed: UInt32[ndarray, "n"] = column_at(saved, "/world/points/rig_00", "Points3D:colors")[0].values.to_numpy()
     channels: UInt8[ndarray, "n 4"] = np.stack([(packed >> shift) & 0xFF for shift in (24, 16, 8, 0)], axis=-1).astype(np.uint8)
 
-    assert len(channels) == len(black.points_xyz)
+    assert len(channels) == num_points
     assert {tuple(int(value) for value in row) for row in channels[:, :3]} == {RUN_A_COLOR}
 
 
@@ -280,8 +272,9 @@ def test_the_cloud_positions_survive_the_round_trip(chunks: list[rrx.Chunk], run
         column_at(chunks, "/world/points/rig_00", "Points3D:positions")[0].values.to_pylist(), dtype=np.float64
     ).reshape(-1, 3)
 
-    assert len(positions) == len(runs[0].points_xyz)
-    assert np.allclose(np.sort(positions, axis=0), np.sort(runs[0].points_xyz, axis=0), atol=1e-4)
+    expected: Float64[ndarray, "n 3"] = runs[0].points_xyz()
+    assert len(positions) == len(expected)
+    assert np.allclose(np.sort(positions, axis=0), np.sort(expected, axis=0), atol=1e-4)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

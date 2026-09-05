@@ -58,8 +58,11 @@ from simplecv.camera_parameters import (
 from simplecv.rerun_rig_logger import log_rig_pose_stream, log_rig_static
 from simplecv.rig import CameraSensor, Rig, RigCalibration, RigPoseStream, entity_id
 
-from colsfm.benchmark import Comparison, RigTrack, RunArtifacts, render_markdown_report
+from colsfm.bench_report import render_markdown_report
+from colsfm.benchmark import Comparison, RigTrack, RunArtifacts
+from colsfm.cameras import PINHOLE_FAMILY_MODELS
 from colsfm.frames_meta import CameraParams, FramesMeta
+from colsfm.geometry import Matrix3
 
 Rgb: TypeAlias = tuple[int, int, int]
 """An opaque colour, 0-255 per channel."""
@@ -134,12 +137,34 @@ class TrajectorySources:
     """Rig trajectory from `ground_truth.txt`, or None when the dataset ships none."""
 
 
-def _camera_k_matrix(camera: CameraParams) -> Float64[ndarray, "3 3"]:
+@dataclass(frozen=True, slots=True)
+class BenchmarkScene:
+    """Everything one benchmark recording is logged from.
+
+    The four travel together and never separately, and `run_a` and `run_b` are
+    the same type, so passing them positionally invited a silent swap that would
+    have drawn run B at `/world/rig_00` with run A's metrics beside it.
+    """
+
+    comparison: Comparison
+    """The result of `colsfm.benchmark.compare_runs`, rendered into the report pane."""
+    run_a: RunArtifacts
+    """Reference run's artifacts (the blob); lands at `/world/rig_00`."""
+    run_b: RunArtifacts
+    """Candidate run's artifacts (the colsfm pipeline); lands at `/world/rig_01`."""
+    sources: TrajectorySources
+    """Input and ground-truth trajectories drawn alongside the two runs."""
+
+
+def _camera_k_matrix(camera: CameraParams) -> Matrix3:
     """Pick the intrinsic matrix cuSFM's export rules pick for this model.
 
-    `PINHOLE` and `FTHETA_WINDSHIELD` are exported from the rectified 3x4
-    `projection_matrix`; `DISTORTED_PINHOLE` and `OPENCV_FISHEYE` from the 3x3
-    `camera_matrix` (export.md §3.3).
+    `colsfm.cameras.PINHOLE_FAMILY_MODELS` are exported from the rectified 3x4
+    `projection_matrix`, the distorted models from the raw 3x3 `camera_matrix`
+    (export.md §3.3). Either choice falls back to the other matrix, because a
+    dataset may ship only one of the two and the frustum is worth drawing from
+    whichever it has — which is why this does not just call
+    `colmap_camera().calibration_matrix()`.
 
     Args:
         camera: One camera's calibration.
@@ -150,16 +175,19 @@ def _camera_k_matrix(camera: CameraParams) -> Float64[ndarray, "3 3"]:
     Raises:
         ValueError: When the calibration carries neither matrix.
     """
-    if camera.projection_model in ("PINHOLE", "FTHETA_WINDSHIELD"):
-        if camera.projection_matrix is not None:
-            return np.asarray(camera.projection_matrix[:3, :3], dtype=np.float64)
-        if camera.camera_matrix is not None:
-            return np.asarray(camera.camera_matrix, dtype=np.float64)
-    else:
-        if camera.camera_matrix is not None:
-            return np.asarray(camera.camera_matrix, dtype=np.float64)
-        if camera.projection_matrix is not None:
-            return np.asarray(camera.projection_matrix[:3, :3], dtype=np.float64)
+    from_projection: Matrix3 | None = (
+        None if camera.projection_matrix is None else np.asarray(camera.projection_matrix[:3, :3], dtype=np.float64)
+    )
+    from_camera_matrix: Matrix3 | None = (
+        None if camera.camera_matrix is None else np.asarray(camera.camera_matrix, dtype=np.float64)
+    )
+    preferred_first: bool = camera.projection_model in PINHOLE_FAMILY_MODELS
+    ordered: tuple[Matrix3 | None, Matrix3 | None] = (
+        (from_projection, from_camera_matrix) if preferred_first else (from_camera_matrix, from_projection)
+    )
+    for k_matrix in ordered:
+        if k_matrix is not None:
+            return k_matrix
     raise ValueError(f"camera {camera.camera_params_id} ({camera.sensor_name}) has neither a projection nor a camera matrix")
 
 
@@ -256,14 +284,13 @@ def log_points(artifacts: RunArtifacts, index: int, fallback_color: Rgb) -> int:
     Returns:
         The number of points logged.
     """
-    positions: Float64[ndarray, "n 3"] = artifacts.points_xyz
+    positions: Float64[ndarray, "n 3"] = artifacts.points_xyz()
     if len(positions) == 0:
         return 0
-    all_black: bool = not artifacts.points_rgb.any()
+    points_rgb: Int64[ndarray, "n 3"] = artifacts.points_rgb()
+    all_black: bool = not points_rgb.any()
     colors: UInt8[ndarray, "n 3"] = (
-        np.tile(np.asarray(fallback_color, dtype=np.uint8), (len(positions), 1))
-        if all_black
-        else artifacts.points_rgb.astype(np.uint8)
+        np.tile(np.asarray(fallback_color, dtype=np.uint8), (len(positions), 1)) if all_black else points_rgb.astype(np.uint8)
     )
     rr.log(
         f"{WORLD_PATH}/points/{entity_id('rig', index)}",
@@ -357,20 +384,17 @@ def build_blueprint(comparison: Comparison) -> rrb.Blueprint:
     )
 
 
-def log_comparison(
-    comparison: Comparison,
-    run_a: RunArtifacts,
-    run_b: RunArtifacts,
-    sources: TrajectorySources,
-) -> None:
+def log_comparison(scene: BenchmarkScene) -> None:
     """Log the whole benchmark into the active recording.
 
     Args:
-        comparison: The result of `colsfm.benchmark.compare_runs`.
-        run_a: Reference run's artifacts (the blob).
-        run_b: Candidate run's artifacts (the colsfm pipeline).
-        sources: Input and ground-truth trajectories to draw alongside.
+        scene: The comparison, both runs' artifacts, and the reference trajectories.
     """
+    comparison: Comparison = scene.comparison
+    run_a: RunArtifacts = scene.run_a
+    run_b: RunArtifacts = scene.run_b
+    sources: TrajectorySources = scene.sources
+
     rr.log("/", rr.ViewCoordinates.RFU, static=True)
     rr.send_blueprint(build_blueprint(comparison))
 
@@ -384,13 +408,13 @@ def log_comparison(
     log_trajectory(
         entity_id("rig", RUN_A_INDEX),
         run_a.track.world_t_rig,
-        source=f"A: {run_a.name} ({comparison.run_a.num_points3D} points)",
+        source=f"A: {run_a.name} ({comparison.run_a.reconstruction.num_points3D} points)",
         hue=RUN_A_COLOR,
     )
     log_trajectory(
         entity_id("rig", RUN_B_INDEX),
         run_b.track.world_t_rig,
-        source=f"B: {run_b.name} ({comparison.run_b.num_points3D} points)",
+        source=f"B: {run_b.name} ({comparison.run_b.reconstruction.num_points3D} points)",
         hue=RUN_B_COLOR,
     )
     log_trajectory(
@@ -410,23 +434,12 @@ def log_comparison(
     rr.log(REPORT_PATH, rr.TextDocument(render_markdown_report(comparison), media_type="text/markdown"), static=True)
 
 
-def save_comparison(
-    path: Path,
-    comparison: Comparison,
-    run_a: RunArtifacts,
-    run_b: RunArtifacts,
-    sources: TrajectorySources,
-    *,
-    application_id: str = "colsfm_bench",
-) -> Path:
+def save_comparison(path: Path, scene: BenchmarkScene, *, application_id: str = "colsfm_bench") -> Path:
     """Write the comparison to a standalone `.rrd`.
 
     Args:
         path: Destination `.rrd`; parent directories are created.
-        comparison: The result of `colsfm.benchmark.compare_runs`.
-        run_a: Reference run's artifacts.
-        run_b: Candidate run's artifacts.
-        sources: Input and ground-truth trajectories.
+        scene: The comparison, both runs' artifacts, and the reference trajectories.
         application_id: Rerun application id stamped into the recording.
 
     Returns:
@@ -437,21 +450,9 @@ def save_comparison(
     # `with` block flushes *and* closes the file sink, so the `.rrd` gets its
     # footer. A global recording left alive writes a footerless file the reader
     # can only rescue with a whole-file scan.
-    recording: rr.RecordingStream = rr.RecordingStream(application_id, recording_id=f"{comparison.dataset}_compare")
+    recording: rr.RecordingStream = rr.RecordingStream(application_id, recording_id=f"{scene.comparison.dataset}_compare")
     recording.save(str(path))
     with recording:
-        log_comparison(comparison, run_a, run_b, sources)
+        log_comparison(scene)
     recording.flush(timeout_sec=30.0)
     return path
-
-
-def rig_pose_timestamps_ns(track: RigTrack) -> Int64[ndarray, "n"]:
-    """Timeline values the rig poses are logged at.
-
-    Args:
-        track: A rig trajectory.
-
-    Returns:
-        Int64 nanosecond timestamps with shape `[n]`.
-    """
-    return track.timestamps_microseconds * NANOSECONDS_PER_MICROSECOND

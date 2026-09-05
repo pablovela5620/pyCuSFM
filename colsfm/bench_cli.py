@@ -12,8 +12,10 @@ pixi run -e colsfm python -m colsfm.bench_cli \
 
 Run A is the reference (the NVIDIA blob) and lands at `/world/rig_00`; run B is
 the candidate (the `colsfm` pipeline) and lands at `/world/rig_01`. The
-acceptance bounds of `docs/open-pipeline-plan.md` are checked against B, and
-only for Galileo — RoboCap ships no ground truth.
+acceptance bounds of `docs/open-pipeline-plan.md` are checked against B on every
+dataset: they are all relative to run A, so they mean the same thing wherever a
+reference run exists, and `check_acceptance` drops the rows a dataset cannot
+support — RoboCap ships no `ground_truth.txt`, so it gets no ATE row.
 """
 
 from __future__ import annotations
@@ -23,24 +25,20 @@ from pathlib import Path
 
 import tyro
 
+from colsfm.bench_report import render_markdown_report, write_markdown_report
 from colsfm.benchmark import (
     AcceptanceBounds,
+    AcceptanceCheck,
     Comparison,
-    DatasetName,
     RunArtifacts,
     compare_runs,
-    print_comparison,
     read_ground_truth,
     read_run,
     rig_track_from_frames_meta,
     write_json_report,
-    write_markdown_report,
 )
-from colsfm.frames_meta import FramesMeta, read_frames_meta
-from colsfm.rerun_log import TrajectorySources, save_comparison
-
-INPUT_FRAMES_META_NAME: str = "frames_meta.json"
-"""The dataset's input metadata, beside `ground_truth.txt` when one is shipped."""
+from colsfm.frames_meta import FRAMES_META_NAME, FramesMeta, read_frames_meta
+from colsfm.rerun_log import BenchmarkScene, TrajectorySources, save_comparison
 
 
 @dataclass(frozen=True)
@@ -53,8 +51,8 @@ class BenchConfig:
     """Candidate run's `.../cusfm` directory — the colsfm pipeline; becomes `rig_01`."""
     input_dir: Path
     """Dataset input directory holding `frames_meta.json` and maybe `ground_truth.txt`."""
-    dataset: DatasetName = "galileo"
-    """Which dataset these runs reconstruct; acceptance bounds apply to Galileo only."""
+    dataset: str = "galileo"
+    """Label for these runs' dataset; it names the report and the recording, nothing else."""
     name_a: str = "blob"
     """Short label for run A in the report and in the recording's metadata."""
     name_b: str = "colsfm"
@@ -66,7 +64,7 @@ class BenchConfig:
     json_report: Path | None = None
     """Write the pyserde JSON dump here; defaults to `report` with a `.json` suffix."""
     bounds: AcceptanceBounds = field(default_factory=AcceptanceBounds)
-    """Acceptance bounds; the plan's values unless overridden on the command line."""
+    """Acceptance bounds checked against run B; the plan's values unless overridden."""
 
 
 def run(config: BenchConfig) -> Comparison:
@@ -83,7 +81,7 @@ def run(config: BenchConfig) -> Comparison:
     run_a: RunArtifacts = read_run(config.run_a, config.name_a)
     run_b: RunArtifacts = read_run(config.run_b, config.name_b)
     comparison: Comparison = compare_runs(run_a, run_b, config.input_dir, config.dataset, config.bounds)
-    print_comparison(comparison)
+    print(render_markdown_report(comparison))
 
     if config.report is not None:
         print(f"[bench] report -> {write_markdown_report(config.report, comparison)}")
@@ -92,18 +90,24 @@ def run(config: BenchConfig) -> Comparison:
         print(f"[bench] json   -> {write_json_report(json_path, comparison)}")
 
     if config.save is not None:
-        input_meta: FramesMeta = read_frames_meta(config.input_dir / INPUT_FRAMES_META_NAME)
+        input_meta: FramesMeta = read_frames_meta(config.input_dir / FRAMES_META_NAME)
         sources: TrajectorySources = TrajectorySources(
             input_track=rig_track_from_frames_meta(input_meta),
             ground_truth=read_ground_truth(config.input_dir),
         )
-        print(f"[bench] rerun  -> {save_comparison(config.save, comparison, run_a, run_b, sources)}")
+        scene: BenchmarkScene = BenchmarkScene(comparison=comparison, run_a=run_a, run_b=run_b, sources=sources)
+        print(f"[bench] rerun  -> {save_comparison(config.save, scene)}")
 
-    failed: list[str] = [check.name for check in comparison.acceptance if not check.passed]
-    if failed:
-        print(f"[bench] acceptance FAILED: {', '.join(failed)}")
-    elif comparison.acceptance:
-        print(f"[bench] acceptance passed: {len(comparison.acceptance)}/{len(comparison.acceptance)} bounds met")
+    if comparison.acceptance:
+        # A check whose bound could not be measured is neither met nor failed.
+        measurable: list[AcceptanceCheck] = [check for check in comparison.acceptance if check.passed is not None]
+        failed: list[str] = [check.name for check in measurable if not check.passed]
+        print(
+            f"[bench] acceptance: {len(measurable) - len(failed)}/{len(comparison.acceptance)} bounds met, "
+            f"{len(comparison.acceptance) - len(measurable)} not measurable"
+        )
+        if failed:
+            print(f"[bench] acceptance FAILED: {', '.join(failed)}")
     return comparison
 
 

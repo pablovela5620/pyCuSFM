@@ -74,7 +74,7 @@ from typing import Final
 import pycolmap
 
 from colsfm.cameras import colmap_cameras
-from colsfm.frames_meta import FramesMeta, RigFrame
+from colsfm.frames_meta import FramesMeta, KeyframeMeta, RigFrame
 
 RIG_ID: Final[int] = 1
 """The single rig every reconstruction carries; cuSFM has no multi-rig concept."""
@@ -230,18 +230,37 @@ def build_rig(frames_meta: FramesMeta, reference_camera_params_id: int | None = 
     return rig
 
 
+@dataclass(frozen=True, slots=True)
+class PosedModel:
+    """A reconstruction and the rig reference it was built with, which belong together.
+
+    Every inverse-bookkeeping question — what is this camera's
+    `sensor_to_vehicle_transform`, where is this rig frame's vehicle pose — needs both
+    halves, and pairing them by hand at each call site is how a vehicle-referenced model
+    ends up read as a camera-referenced one. `build_reconstruction` returns the pair, so
+    nothing downstream has to re-derive it.
+    """
+
+    reconstruction: pycolmap.Reconstruction
+    """The model: one rig, one frame per `synced_sample_id`, one image per keyframe."""
+    reference: RigReference
+    """Where the rig origin sits, and the fixed `vehicle_T_cam_ref` bridge back to the vehicle."""
+
+
 def build_reconstruction(
     frames_meta: FramesMeta,
     cameras: dict[int, pycolmap.Camera] | None = None,
     reference_camera_params_id: int | None = None,
-) -> pycolmap.Reconstruction:
+) -> PosedModel:
     """Build a registered, pose-carrying reconstruction with no 3D points yet.
 
     Every rig frame is registered, so `IncrementalTriangulator` will triangulate
-    against the supplied trajectory rather than re-estimating it. Cameras get
-    `has_prior_focal_length = True`: the calibration comes from the metadata, and
-    leaving the flag false silently degrades every downstream two-view geometry
-    (pycolmap-capabilities.md §5).
+    against the supplied trajectory rather than re-estimating it. Every camera
+    carries `has_prior_focal_length = True` — the calibration comes from the
+    metadata, and leaving the flag false silently degrades every downstream
+    two-view geometry (pycolmap-capabilities.md §5). That flag is set where the
+    cameras are made, in `colsfm.cameras.colmap_camera`, so a caller-supplied
+    `cameras` map from `colmap_cameras` already carries it.
 
     Args:
         frames_meta: The parsed `frames_meta.json`.
@@ -252,9 +271,8 @@ def build_reconstruction(
             other job wants the vehicle. See the module docstring.
 
     Returns:
-        A reconstruction with one rig, one frame per `synced_sample_id` and one
-        image per keyframe, all frames registered. Every `cam_T_world` is the
-        same whichever reference was asked for.
+        The model and the `RigReference` it was built with. Every `cam_T_world` is
+        the same whichever reference was asked for.
 
     Raises:
         KeyError: When a keyframe names a `camera_params_id` the cameras lack,
@@ -265,32 +283,71 @@ def build_reconstruction(
     reconstruction: pycolmap.Reconstruction = pycolmap.Reconstruction()
     resolved_cameras: dict[int, pycolmap.Camera] = colmap_cameras(frames_meta) if cameras is None else cameras
     for camera_params_id in sorted(resolved_cameras):
-        camera: pycolmap.Camera = resolved_cameras[camera_params_id]
-        camera.has_prior_focal_length = True
-        reconstruction.add_camera(camera)
+        reconstruction.add_camera(resolved_cameras[camera_params_id])
     reconstruction.add_rig(build_rig(frames_meta, reference_camera_params_id))
 
-    keyframe_by_id = frames_meta.keyframe_by_id()
+    keyframe_by_id: dict[int, KeyframeMeta] = frames_meta.keyframe_by_id()
     for rig_frame in frames_meta.rig_frames():
         frame: pycolmap.Frame = pycolmap.Frame()
         frame.frame_id = rig_frame.synced_sample_id
         frame.rig_id = RIG_ID
         frame.rig_from_world = reference_T_vehicle * rig_frame.world_T_vehicle.inverse()
         for keyframe_id in rig_frame.keyframe_ids:
-            camera_params_id: int = keyframe_by_id[keyframe_id].camera_params_id
-            frame.add_data_id(pycolmap.data_t(camera_sensor_id(camera_params_id), keyframe_id))
+            frame.add_data_id(
+                pycolmap.data_t(camera_sensor_id(keyframe_by_id[keyframe_id].camera_params_id), keyframe_id)
+            )
         reconstruction.add_frame(frame)
         reconstruction.register_frame(frame.frame_id)
-
-    for rig_frame in frames_meta.rig_frames():
+        # The images go in after their frame is registered, so one pass over the rig
+        # frames builds the whole model.
         for keyframe_id in rig_frame.keyframe_ids:
-            keyframe = keyframe_by_id[keyframe_id]
+            keyframe: KeyframeMeta = keyframe_by_id[keyframe_id]
             image: pycolmap.Image = pycolmap.Image(
                 name=keyframe.image_name, camera_id=keyframe.camera_params_id, image_id=keyframe_id
             )
             image.frame_id = rig_frame.synced_sample_id
             reconstruction.add_image(image)
-    return reconstruction
+    return PosedModel(reconstruction=reconstruction, reference=reference)
+
+
+def registered_image_names(reconstruction: pycolmap.Reconstruction) -> set[str]:
+    """Names of the images that observe at least one 3D point.
+
+    **This is not `colsfm.mapping.registered_image_ids`.** That one means "belongs to a
+    registered frame", which every image of a `build_reconstruction` model does from the
+    start, whether or not it ever sees a point. *This* one is the sense `colsfm.benchmark`,
+    `colsfm.export` and the audits use — a COLMAP text export writes exactly these images
+    with a non-empty track list, and the blob's own `sparse/` holds 28 of Galileo's 32
+    keyframes for the same reason.
+
+    Args:
+        reconstruction: The model.
+
+    Returns:
+        The image names with at least one observation.
+    """
+    return {image.name for image in reconstruction.images.values() if image.num_points3D > 0}
+
+
+def num_registered_images(reconstruction: pycolmap.Reconstruction) -> int:
+    """Count the images that observe at least one 3D point.
+
+    **This is not `colsfm.mapping.registered_image_ids`.** See
+    `registered_image_names`, whose cardinality this is: the count a COLMAP export
+    writes, and the one `colsfm.benchmark`, `colsfm.export` and the audits compare
+    against the blob.
+
+    Args:
+        reconstruction: The model.
+
+    Returns:
+        The number of images with at least one observation.
+
+    Note:
+        `Image.num_points2D` is a method while `Image.num_points3D` is a
+        property — one of pycolmap 4.2's several method/property splits.
+    """
+    return sum(1 for image in reconstruction.images.values() if image.num_points3D > 0)
 
 
 def gauge_camera_params_id(frames_meta: FramesMeta) -> int:

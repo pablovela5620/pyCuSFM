@@ -31,6 +31,9 @@ from scipy.spatial.transform import Rotation
 Vector3: TypeAlias = Float64[ndarray, "3"]
 """A 3-vector: a translation in metres or a rotation axis."""
 
+Matrix3: TypeAlias = Float64[ndarray, "3 3"]
+"""A rotation matrix."""
+
 QuaternionWXYZ: TypeAlias = Float64[ndarray, "4"]
 """A quaternion in COLMAP's `w x y z` order."""
 
@@ -42,6 +45,9 @@ TUM_DECIMALS: Final[int] = 16
 
 MICROSECONDS_PER_SECOND: Final[float] = 1e6
 """Timestamps are integer microseconds everywhere except inside a TUM line."""
+
+MILLIMETRES_PER_METRE: Final[float] = 1000.0
+"""Everything is stored in metres; extrinsic and trajectory errors are reported in mm."""
 
 DEFAULT_AXIS: Final[Vector3] = np.array([1.0, 0.0, 0.0])
 """Axis reported for a zero rotation, where the true axis is undefined."""
@@ -87,6 +93,23 @@ def rigid3d_from_axis_angle_degrees(*, axis_xyz: Vector3, angle_degrees: float, 
     unit_axis_xyz: Vector3 = DEFAULT_AXIS if norm == 0.0 else axis_xyz / norm
     rotation_vector: Vector3 = unit_axis_xyz * np.deg2rad(angle_degrees)
     quaternion_xyzw: QuaternionXYZW = Rotation.from_rotvec(rotation_vector).as_quat()
+    return pycolmap.Rigid3d(pycolmap.Rotation3d(quaternion_xyzw), np.asarray(translation_xyz, dtype=np.float64))
+
+
+def rigid3d_from_matrix(rotation_matrix: Matrix3, translation_xyz: Vector3) -> pycolmap.Rigid3d:
+    """Build a `Rigid3d` from a rotation matrix and a translation.
+
+    `pycolmap.Rotation3d` takes a quaternion, so every caller that holds a matrix
+    would otherwise spell the same `Rotation.from_matrix(...).as_quat()` detour.
+
+    Args:
+        rotation_matrix: Float64 rotation matrix with shape `[3, 3]`.
+        translation_xyz: Float64 translation in metres with shape `[3]`.
+
+    Returns:
+        The equivalent rigid transform.
+    """
+    quaternion_xyzw: QuaternionXYZW = Rotation.from_matrix(np.asarray(rotation_matrix, dtype=np.float64)).as_quat()
     return pycolmap.Rigid3d(pycolmap.Rotation3d(quaternion_xyzw), np.asarray(translation_xyz, dtype=np.float64))
 
 
@@ -155,8 +178,7 @@ def relative_rotation_degrees(world_T_source: pycolmap.Rigid3d, world_T_target: 
     Returns:
         The rotation angle in degrees, in `[0, 180]`.
     """
-    rotation_vector: Vector3 = Rotation.from_quat(relative_pose(world_T_source, world_T_target).rotation.quat).as_rotvec()
-    return float(np.rad2deg(np.linalg.norm(rotation_vector)))
+    return float(np.rad2deg(world_T_source.rotation.angle_to(world_T_target.rotation)))
 
 
 def format_tum_line(timestamp_microseconds: int, world_T_body: pycolmap.Rigid3d) -> str:

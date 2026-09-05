@@ -5,7 +5,8 @@ Seams under test (all public):
 * `find_loop_edges` — retrieval, verification, banding, rig conversion, gating.
 * `select_best_candidates` — the `SelectBestCandidates` banding rule.
 * `is_good_match` / `minimum_time_gap_seconds` / `session_duration_seconds` — the gates.
-* `estimate_relative_camera_pose` / `calibrated_cameras` — the two-view verification.
+* `LoopClosureConfig.from_pose_graph` — the config profile's loop gates.
+* `colsfm.rig_geometry.calibrated_cameras` — the cameras the estimators need.
 
 The scene is a synthetic rig walking a square and coming back along its first side, so
 there is one true revisit with a known ground-truth relative pose. Its images are 3-D
@@ -15,7 +16,7 @@ is a plain `match_fn`, so nothing here needs a GPU, a network or the matching wo
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Final
 
@@ -23,32 +24,38 @@ import numpy as np
 import pycolmap
 import pytest
 from google.protobuf.message import Message
-from jaxtyping import Bool, Float32, Float64, Int
+from jaxtyping import Float32, Float64, Int
+from loop_helpers import ProjectedPoints, matcher_from_point_indices, project_and_mask
 from numpy import ndarray
 from scipy.spatial.transform import Rotation
 
+from colsfm.config import PoseGraphConfig, read_config_directory
+from colsfm.database import read_keypoints_batch
 from colsfm.frames_meta import FramesMeta, parse_message, read_frames_meta
+from colsfm.geometry import rigid3d_from_matrix
 from colsfm.loop_closure import (
+    LoopCandidate,
     LoopClosureConfig,
     LoopClosureResult,
     MatchFunction,
     RetrievalHit,
-    calibrated_cameras,
     find_loop_edges,
     is_good_match,
     minimum_time_gap_seconds,
     select_best_candidates,
     session_duration_seconds,
 )
-from colsfm.loop_pose import Matches
+from colsfm.loop_pose import Keypoints, RigPoseConfig
 from colsfm.pose_graph import PoseGraphEdge, RigNode, gate_loop_edges, sequential_edges, solve_pose_graph
 from colsfm.retrieval import (
     ALIKED_DESCRIPTOR_DIM,
+    GOOD_SCORE_THRESHOLD,
+    BruteForceConfig,
     RetrievalConfig,
     RetrievalIndex,
     build_retrieval_index,
-    default_good_score_threshold,
 )
+from colsfm.rig_geometry import calibrated_cameras
 from colsfm.schema import KEYFRAMES_METADATA_COLLECTION, load_schema
 
 REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
@@ -56,6 +63,9 @@ REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 
 GALILEO_KEYFRAMES_META: Final[Path] = REPO_ROOT / "data/cusfm_runs/galileo/cusfm/keyframes/frames_meta.json"
 """The 226-keyframe blob run, used to check the temporal gate against real timestamps."""
+
+LOOP_CLOSURE_CONFIG_DIR: Final[Path] = REPO_ROOT / "data/cusfm_configs/loop-closure-fixed"
+"""The one shipped profile whose loop gates are not proto3's zeros."""
 
 RIG_PERIOD_US: Final[int] = 500_000
 """Half a second between rig frames, so a 48-frame sequence spans 23.5 s."""
@@ -101,20 +111,6 @@ class SquareRigScene:
     """How many rig frames the sequence has."""
 
 
-def _rigid(rotation_matrix: Float64[ndarray, "3 3"], translation: Float64[ndarray, "3"]) -> pycolmap.Rigid3d:
-    """Build a `Rigid3d` from a rotation matrix and a translation.
-
-    Args:
-        rotation_matrix: Float64 rotation with shape `[3, 3]`.
-        translation: Float64 translation in metres with shape `[3]`.
-
-    Returns:
-        The rigid transform.
-    """
-    quaternion_xyzw: Float64[ndarray, "4"] = Rotation.from_matrix(rotation_matrix).as_quat()
-    return pycolmap.Rigid3d(pycolmap.Rotation3d(quaternion_xyzw), np.asarray(translation, dtype=np.float64))
-
-
 def _square_trajectory(side_frames: int = 10, side_meters: float = 4.0, revisit_frames: int = 8, lateral_offset_m: float = 0.3) -> list[pycolmap.Rigid3d]:
     """Walk a square, then retrace the first side 30 cm to the left.
 
@@ -141,10 +137,10 @@ def _square_trajectory(side_frames: int = 10, side_meters: float = 4.0, revisit_
             position: Float64[ndarray, "3"] = np.array(
                 [corners[side][0] + directions[side][0] * step * frame, corners[side][1] + directions[side][1] * step * frame, 0.0]
             )
-            poses.append(_rigid(Rotation.from_euler("z", yaws_deg[side], degrees=True).as_matrix(), position))
+            poses.append(rigid3d_from_matrix(Rotation.from_euler("z", yaws_deg[side], degrees=True).as_matrix(), position))
     for frame in range(revisit_frames):
         position = np.array([step * frame, lateral_offset_m, 0.0])
-        poses.append(_rigid(Rotation.from_euler("z", 0.0, degrees=True).as_matrix(), position))
+        poses.append(rigid3d_from_matrix(Rotation.from_euler("z", 0.0, degrees=True).as_matrix(), position))
     return poses
 
 
@@ -158,39 +154,9 @@ def _camera_extrinsics(baseline_m: float = 0.15) -> dict[int, pycolmap.Rigid3d]:
         `vehicle_T_cam` per `camera_params_id`; 0 is the left camera, 1 the right.
     """
     return {
-        0: _rigid(VEHICLE_R_CAMERA, np.array([0.0, baseline_m / 2.0, 0.0])),
-        1: _rigid(VEHICLE_R_CAMERA, np.array([0.0, -baseline_m / 2.0, 0.0])),
+        0: rigid3d_from_matrix(VEHICLE_R_CAMERA, np.array([0.0, baseline_m / 2.0, 0.0])),
+        1: rigid3d_from_matrix(VEHICLE_R_CAMERA, np.array([0.0, -baseline_m / 2.0, 0.0])),
     }
-
-
-def _project(
-    cam_T_world: pycolmap.Rigid3d, points_xyz: Float64[ndarray, "n_points 3"]
-) -> tuple[Float64[ndarray, "n_points 2"], Bool[ndarray, "n_points"], Float64[ndarray, "n_points"]]:
-    """Project world points into a pinhole camera and say which land on the sensor.
-
-    Args:
-        cam_T_world: Pose of the world in the camera frame.
-        points_xyz: Float64 world points with shape `[n_points, 3]`.
-
-    Returns:
-        Pixel coordinates `[n_points, 2]`, a visibility mask `[n_points]`, and the depth
-        along the optical axis `[n_points]`.
-    """
-    rotated: Float64[ndarray, "n_points 3"] = points_xyz @ np.asarray(cam_T_world.rotation.matrix(), dtype=np.float64).T
-    in_camera: Float64[ndarray, "n_points 3"] = rotated + np.asarray(cam_T_world.translation, dtype=np.float64)
-    depth: Float64[ndarray, "n_points"] = in_camera[:, 2]
-    safe_depth: Float64[ndarray, "n_points"] = np.where(depth > 1e-6, depth, 1.0)
-    pixels: Float64[ndarray, "n_points 2"] = np.stack(
-        [
-            FOCAL_LENGTH_PX * in_camera[:, 0] / safe_depth + IMAGE_WIDTH / 2.0,
-            FOCAL_LENGTH_PX * in_camera[:, 1] / safe_depth + IMAGE_HEIGHT / 2.0,
-        ],
-        axis=1,
-    )
-    visible: Bool[ndarray, "n_points"] = (
-        (depth > 0.5) & (pixels[:, 0] >= 0.0) & (pixels[:, 0] < IMAGE_WIDTH) & (pixels[:, 1] >= 0.0) & (pixels[:, 1] < IMAGE_HEIGHT)
-    )
-    return pixels, visible, depth
 
 
 def _projection_matrix_message(message: Message) -> None:
@@ -269,9 +235,9 @@ def _build_frames_meta(
 def make_square_rig_scene(tmp_path: Path, n_points: int = 12000, pixel_noise_px: float = 0.5, seed: int = 3) -> SquareRigScene:
     """Build the whole synthetic scene: poses, points, images, database and index.
 
-    Priors written into `frames_meta.json` carry 2 mm / 0.1 deg of noise, so the metric
-    scale a loop edge takes from them (`docs/spec/generate_association_main.md` §7.3) is not
-    the ground truth and the accuracy assertions are not tautological.
+    Priors written into `frames_meta.json` carry 2 mm / 0.1 deg of noise, so the local
+    odometry the metric map is triangulated from is not the ground truth and the accuracy
+    assertions are not tautological.
 
     Args:
         tmp_path: Directory the COLMAP database is written into.
@@ -281,6 +247,9 @@ def make_square_rig_scene(tmp_path: Path, n_points: int = 12000, pixel_noise_px:
 
     Returns:
         The scene.
+
+    Raises:
+        ValueError: When a keyframe sees fewer landmarks than the scene needs.
     """
     generator: np.random.Generator = np.random.default_rng(seed)
     trajectory: list[pycolmap.Rigid3d] = _square_trajectory()
@@ -297,14 +266,23 @@ def make_square_rig_scene(tmp_path: Path, n_points: int = 12000, pixel_noise_px:
     point_descriptors /= np.linalg.norm(point_descriptors, axis=1, keepdims=True)
 
     world_T_rig: dict[int, pycolmap.Rigid3d] = {}
-    world_T_cam_true: dict[int, pycolmap.Rigid3d] = {}
     world_T_cam_prior: dict[int, pycolmap.Rigid3d] = {}
     camera_of_keyframe: dict[int, int] = {}
     rig_of_keyframe: dict[int, int] = {}
     timestamps_us: dict[int, int] = {}
-    keypoints_by_keyframe: dict[int, Float64[ndarray, "n_keypoints 2"]] = {}
+    keypoints_by_keyframe: dict[int, Keypoints] = {}
     point_index_by_keypoint: dict[int, Int[ndarray, "n_keypoints"]] = {}
     descriptors_by_keyframe: dict[int, Float32[ndarray, "n_keypoints 128"]] = {}
+    cameras: dict[int, pycolmap.Camera] = {
+        camera_id: pycolmap.Camera(
+            camera_id=camera_id,
+            model="PINHOLE",
+            width=IMAGE_WIDTH,
+            height=IMAGE_HEIGHT,
+            params=[FOCAL_LENGTH_PX, FOCAL_LENGTH_PX, IMAGE_WIDTH / 2.0, IMAGE_HEIGHT / 2.0],
+        )
+        for camera_id in extrinsics
+    }
 
     for rig_index, pose in enumerate(trajectory):
         rig_id: int = rig_index + 1
@@ -312,17 +290,17 @@ def make_square_rig_scene(tmp_path: Path, n_points: int = 12000, pixel_noise_px:
         for camera_id, vehicle_T_cam in extrinsics.items():
             keyframe_id: int = rig_index * len(extrinsics) + camera_id + 1
             world_T_camera: pycolmap.Rigid3d = pose * vehicle_T_cam
-            pixels, visible, depth = _project(world_T_camera.inverse(), points_xyz)
-            # Nearest first: a two-view estimate constrains the translation component ALONG
-            # the optical axis far more weakly than the two lateral ones, and near points
-            # are what fix it. With the far points included the direction error on a 0.3 m
-            # revisit baseline reaches 2 deg, i.e. 12 mm of translation error.
-            visible_indices: Int[ndarray, "n_visible"] = np.flatnonzero(visible)
-            chosen: Int[ndarray, "n_keypoints"] = visible_indices[np.argsort(depth[visible_indices])][:KEYPOINTS_PER_IMAGE]
+            projected: ProjectedPoints = project_and_mask(
+                world_T_camera.inverse(), cameras[camera_id], points_xyz, min_depth_m=0.5, max_depth_m=np.inf
+            )
+            # Nearest first: a resection constrains the translation component ALONG the
+            # optical axis far more weakly than the two lateral ones, and near points are
+            # what fix it.
+            visible_indices: Int[ndarray, "n_visible"] = np.flatnonzero(projected.visible)
+            chosen: Int[ndarray, "n_keypoints"] = visible_indices[np.argsort(projected.depth_m[visible_indices])][:KEYPOINTS_PER_IMAGE]
             if len(chosen) < KEYPOINTS_PER_IMAGE:
                 raise ValueError(f"keyframe {keyframe_id} sees only {len(chosen)} points; scatter more landmarks")
-            observed: Float64[ndarray, "n_keypoints 2"] = pixels[chosen] + generator.standard_normal((len(chosen), 2)) * pixel_noise_px
-            keypoints_by_keyframe[keyframe_id] = observed
+            keypoints_by_keyframe[keyframe_id] = projected.pixels[chosen] + generator.standard_normal((len(chosen), 2)) * pixel_noise_px
             point_index_by_keypoint[keyframe_id] = chosen
             noisy_descriptors: Float32[ndarray, "n_keypoints 128"] = point_descriptors[chosen] + generator.standard_normal(
                 (len(chosen), ALIKED_DESCRIPTOR_DIM)
@@ -330,7 +308,6 @@ def make_square_rig_scene(tmp_path: Path, n_points: int = 12000, pixel_noise_px:
             descriptors_by_keyframe[keyframe_id] = np.ascontiguousarray(
                 noisy_descriptors / np.linalg.norm(noisy_descriptors, axis=1, keepdims=True)
             )
-            world_T_cam_true[keyframe_id] = world_T_camera
             world_T_cam_prior[keyframe_id] = pycolmap.Rigid3d(
                 pycolmap.Rotation3d(
                     (Rotation.from_quat(world_T_camera.rotation.quat) * Rotation.from_rotvec(generator.standard_normal(3) * np.deg2rad(0.1))).as_quat()
@@ -342,20 +319,22 @@ def make_square_rig_scene(tmp_path: Path, n_points: int = 12000, pixel_noise_px:
             timestamps_us[keyframe_id] = rig_index * RIG_PERIOD_US
 
     database_path: Path = tmp_path / "database.db"
-    database: pycolmap.Database = pycolmap.Database.open(str(database_path))
     frames_meta: FramesMeta = _build_frames_meta(world_T_cam_prior, camera_of_keyframe, rig_of_keyframe, timestamps_us, extrinsics)
-    for camera_id, camera in calibrated_cameras(frames_meta).items():
-        database.write_camera(camera, use_camera_id=True)
-        del camera_id
-    for keyframe_id, keypoints in keypoints_by_keyframe.items():
-        database.write_image(
-            pycolmap.Image(image_id=keyframe_id, name=f"cam{camera_of_keyframe[keyframe_id]}/{keyframe_id}.png", camera_id=camera_of_keyframe[keyframe_id]),
-            use_image_id=True,
-        )
-        database.write_keypoints(keyframe_id, np.ascontiguousarray(keypoints, dtype=np.float32))
-    database.close()
+    with pycolmap.Database.open(str(database_path)) as database:
+        for camera in calibrated_cameras(frames_meta).values():
+            database.write_camera(camera, use_camera_id=True)
+        for keyframe_id, keypoints in keypoints_by_keyframe.items():
+            database.write_image(
+                pycolmap.Image(
+                    image_id=keyframe_id, name=f"cam{camera_of_keyframe[keyframe_id]}/{keyframe_id}.png", camera_id=camera_of_keyframe[keyframe_id]
+                ),
+                use_image_id=True,
+            )
+            database.write_keypoints(keyframe_id, np.ascontiguousarray(keypoints, dtype=np.float32))
 
-    index: RetrievalIndex = build_retrieval_index(descriptors_by_keyframe, RetrievalConfig(max_descriptors_per_image=KEYPOINTS_PER_IMAGE))
+    index: RetrievalIndex = build_retrieval_index(
+        descriptors_by_keyframe, RetrievalConfig(brute_force=BruteForceConfig(max_descriptors_per_image=KEYPOINTS_PER_IMAGE))
+    )
     return SquareRigScene(
         frames_meta=frames_meta,
         database_path=database_path,
@@ -368,7 +347,7 @@ def make_square_rig_scene(tmp_path: Path, n_points: int = 12000, pixel_noise_px:
 
 
 def make_match_function(scene: SquareRigScene, outlier_ratio: float = 0.25, seed: int = 11) -> MatchFunction:
-    """Build a `match_fn` from the known point correspondences, with gross outliers added.
+    """Build a `match_fn` from the scene's known correspondences, with gross outliers added.
 
     Args:
         scene: The synthetic scene.
@@ -378,23 +357,7 @@ def make_match_function(scene: SquareRigScene, outlier_ratio: float = 0.25, seed
     Returns:
         A callable `match_fn(image_id_a, image_id_b) -> Int[ndarray, "n_matches 2"]`.
     """
-    generator: np.random.Generator = np.random.default_rng(seed)
-
-    def match_fn(image_id_a: int, image_id_b: int) -> Matches:
-        """Return true correspondences plus a fixed fraction of random wrong pairs."""
-        points_a: Int[ndarray, "n_a"] = scene.point_index_by_keypoint[image_id_a]
-        points_b: Int[ndarray, "n_b"] = scene.point_index_by_keypoint[image_id_b]
-        position_in_b: dict[int, int] = {int(point): position for position, point in enumerate(points_b)}
-        true_matches: list[tuple[int, int]] = [
-            (position, position_in_b[int(point)]) for position, point in enumerate(points_a) if int(point) in position_in_b
-        ]
-        n_outliers: int = round(outlier_ratio * len(true_matches))
-        outliers: list[tuple[int, int]] = [
-            (int(generator.integers(len(points_a))), int(generator.integers(len(points_b)))) for _ in range(n_outliers)
-        ]
-        return np.array(true_matches + outliers, dtype=np.int64).reshape(-1, 2)
-
-    return match_fn
+    return matcher_from_point_indices(scene.point_index_by_keypoint, outlier_ratio, seed)
 
 
 @pytest.fixture(scope="module")
@@ -433,18 +396,19 @@ def test_the_stage_is_off_by_default(scene: SquareRigScene, match_fn: MatchFunct
     assert result.diagnostics.queries == 0
 
 
-def test_the_score_gate_falls_back_to_the_index_backend_and_can_be_overridden(
+def test_the_score_gate_is_one_constant_and_can_be_overridden(
     scene: SquareRigScene, match_fn: MatchFunction, loop_result: LoopClosureResult
 ) -> None:
-    """`good_score_threshold` is None by default and resolves against the index's backend.
+    """`good_score_threshold` is None by default and resolves to `GOOD_SCORE_THRESHOLD`.
 
-    The two `colsfm.retrieval` backends score different quantities, so one hard-coded
-    constant would be right for at most one of them. The diagnostics report the value that
-    was actually applied, exactly as they do for the temporal gap.
+    The two `colsfm.retrieval` backends score different quantities, but both calibrations
+    landed on the same 0.1, so there is one constant rather than a per-backend table. The
+    diagnostics report the value that was actually applied, exactly as they do for the
+    temporal gap.
     """
     assert LoopClosureConfig().good_score_threshold is None
     assert scene.index.backend == "brute_force"
-    assert loop_result.diagnostics.good_score_threshold == default_good_score_threshold("brute_force")
+    assert loop_result.diagnostics.good_score_threshold == GOOD_SCORE_THRESHOLD
 
     strict: LoopClosureResult = find_loop_edges(
         scene.frames_meta, scene.database_path, scene.index, LoopClosureConfig(enabled=True, good_score_threshold=0.99), match_fn
@@ -454,13 +418,40 @@ def test_the_score_gate_falls_back_to_the_index_backend_and_can_be_overridden(
     assert strict.edges == []
 
 
+def test_the_funnel_counters_reconcile(loop_result: LoopClosureResult) -> None:
+    """Every retrieval hit the index examined is accounted for by exactly one gate.
+
+    The counters used to come from two different queries — one gated, one not — so
+    `candidates_retrieved` and `rejected_by_time` described different candidate sets and the
+    printed funnel did not compose. They now come from the same ranking walk.
+    """
+    diagnostics = loop_result.diagnostics
+    assert diagnostics.queries > 0
+    assert diagnostics.candidates_retrieved > 0
+    assert diagnostics.rejected_by_time > 0
+    survivors: int = (
+        diagnostics.candidates_retrieved - diagnostics.rejected_by_time - diagnostics.rejected_by_score - diagnostics.rejected_by_same_rig
+    )
+    assert survivors >= diagnostics.after_banding >= diagnostics.after_deduplication
+    measured: int = (
+        diagnostics.rejected_no_matches
+        + diagnostics.rejected_by_geometry
+        + diagnostics.rejected_by_is_good
+        + diagnostics.rejected_by_direction
+        + diagnostics.verified
+    )
+    assert measured == diagnostics.after_deduplication
+    assert diagnostics.verified == len(loop_result.candidates)
+    assert diagnostics.edges == len(loop_result.edges) <= diagnostics.verified
+
+
 def test_loop_edges_recover_the_ground_truth_relative_rig_pose(scene: SquareRigScene, loop_result: LoopClosureResult) -> None:
     """Every emitted edge is within 1 cm and 0.5 deg of the true rig-to-rig transform.
 
-    The rotation and the translation *direction* come from the images through
-    `estimate_two_view_geometry`; only the magnitude comes from the priors, which carry
-    2 mm of noise. So this checks the essential-matrix estimate, the prior-pose scale and
-    the camera-to-rig conversion together.
+    Rotation, translation direction and translation *magnitude* all come from the images
+    through the local metric map and the generalized resection; the priors only place the
+    source rig's own neighbours, and they carry 2 mm of noise. So this checks the
+    triangulation, the resection and the rig conventions together.
     """
     assert loop_result.edges, f"no loop edges: {loop_result.diagnostics}"
     for edge in loop_result.edges:
@@ -480,6 +471,100 @@ def test_loop_edges_link_the_outbound_track_to_its_retrace(scene: SquareRigScene
     for low, high in linked:
         assert high - low >= scene.revisit_offset - 4
     print(f"loop closure diagnostics: {loop_result.diagnostics}")
+
+
+@pytest.fixture(scope="module")
+def clean_match_fn(scene: SquareRigScene) -> MatchFunction:
+    """A matcher with no gross outliers, for the comparisons between two whole runs.
+
+    Both generalized estimators are RANSAC and pycolmap's `set_random_seed` does not reach
+    them, so a pair sitting on the inlier gate falls either way between two runs of the same
+    code. Dropping the 25 % outliers narrows that band — what is left of it comes from the
+    keypoint noise and the landmark depth error, which RANSAC still has to sample against —
+    so the runs being compared differ over as few pairs as this scene allows.
+    """
+    return make_match_function(scene, outlier_ratio=0.0)
+
+
+@pytest.fixture(scope="module")
+def serial_result(scene: SquareRigScene, clean_match_fn: MatchFunction) -> LoopClosureResult:
+    """The reference run: one worker thread, the outlier-free matcher."""
+    return find_loop_edges(scene.frames_meta, scene.database_path, scene.index, LoopClosureConfig(enabled=True, num_threads=1), clean_match_fn)
+
+
+def _poses_by_rig_pair(result: LoopClosureResult) -> dict[tuple[int, int], pycolmap.Rigid3d]:
+    """Index a run's edges by the unordered rig pair they connect.
+
+    Args:
+        result: A finished loop-closure run.
+
+    Returns:
+        The measured `source_T_target` per unordered rig pair.
+    """
+    return {(min(edge.source, edge.target), max(edge.source, edge.target)): edge.source_T_target for edge in result.edges}
+
+
+def test_the_thread_count_does_not_reach_the_result(scene: SquareRigScene, clean_match_fn: MatchFunction, serial_result: LoopClosureResult) -> None:
+    """Eight workers measure the same pairs in the same order and get the same poses.
+
+    A threading bug in this stage would be one of two things: a worker reading another
+    group's local map, which puts metres of error into a pose, or the results coming back
+    out of submission order, which reorders the edge list the caller solves. Both are
+    checked here — the poses on every shared rig pair agree to a millimetre against edges a
+    metre long, and both runs' candidates come back in `(source rig, rig pair)` order.
+
+    What is *not* checked is bit equality: both generalized estimators are RANSAC and
+    pycolmap's `set_random_seed` does not reach them, so two runs of identical code pick
+    slightly different support sets — measured on this scene, that moves a pose by about
+    0.1 mm and flips roughly one edge in ten across the inlier gate, whether the second run
+    is threaded or serial.
+    """
+    assert LoopClosureConfig().num_threads >= 1
+    threaded: LoopClosureResult = find_loop_edges(
+        scene.frames_meta, scene.database_path, scene.index, LoopClosureConfig(enabled=True, num_threads=8), clean_match_fn
+    )
+    assert threaded.diagnostics.after_deduplication == serial_result.diagnostics.after_deduplication
+    for result in (serial_result, threaded):
+        keys: list[tuple[int, tuple[int, int]]] = [
+            (
+                candidate.hit.source_rig_id,
+                (min(candidate.hit.source_rig_id, candidate.hit.target_rig_id), max(candidate.hit.source_rig_id, candidate.hit.target_rig_id)),
+            )
+            for candidate in result.candidates
+        ]
+        assert keys == sorted(keys), "the measured pairs must come back in the order the shortlist was walked in"
+
+    serial_poses: dict[tuple[int, int], pycolmap.Rigid3d] = _poses_by_rig_pair(serial_result)
+    threaded_poses: dict[tuple[int, int], pycolmap.Rigid3d] = _poses_by_rig_pair(threaded)
+    shared: set[tuple[int, int]] = set(serial_poses) & set(threaded_poses)
+    assert len(shared) >= 0.8 * max(len(serial_poses), len(threaded_poses)), f"{len(shared)} shared of {len(serial_poses)}/{len(threaded_poses)}"
+    assert [pair for pair in serial_poses if pair in shared] == [pair for pair in threaded_poses if pair in shared]
+    for pair in shared:
+        np.testing.assert_allclose(threaded_poses[pair].translation, serial_poses[pair].translation, atol=1e-3)
+        np.testing.assert_allclose(threaded_poses[pair].rotation.matrix(), serial_poses[pair].rotation.matrix(), atol=1e-3)
+
+
+def test_reading_the_keypoints_once_and_passing_them_in_replaces_the_database_read(
+    scene: SquareRigScene, clean_match_fn: MatchFunction, serial_result: LoopClosureResult
+) -> None:
+    """`find_loop_edges(keypoints=...)` skips the database read and measures the same pairs.
+
+    The pipeline runs the stage twice — once to learn the pair list, once for real — and the
+    read is 148 MB on RoboCap, so it must be possible to do it once. That the pre-read map
+    really is all the stage needs from the database is checked by pointing the database
+    argument at a path that does not exist: without the keypoints, the same call raises.
+    """
+    keypoints: dict[int, Keypoints] = read_keypoints_batch(scene.database_path, scene.index.image_ids, dtype=np.float64)
+    assert len(keypoints) == len(scene.index.image_ids)
+    absent: Path = Path("no/such/database.db")
+    reused: LoopClosureResult = find_loop_edges(
+        scene.frames_meta, absent, scene.index, LoopClosureConfig(enabled=True, num_threads=1), clean_match_fn, keypoints=keypoints
+    )
+    assert reused.diagnostics.after_deduplication == serial_result.diagnostics.after_deduplication
+    shared: set[tuple[int, int]] = set(_poses_by_rig_pair(reused)) & set(_poses_by_rig_pair(serial_result))
+    assert len(shared) >= 0.8 * len(serial_result.edges)
+    with pytest.raises(FileNotFoundError):
+        find_loop_edges(scene.frames_meta, absent, scene.index, LoopClosureConfig(enabled=True), clean_match_fn)
 
 
 def test_loop_edges_reduce_trajectory_error_when_the_odometry_drifts(scene: SquareRigScene, loop_result: LoopClosureResult) -> None:
@@ -540,11 +625,26 @@ def test_stored_weights_scale_the_information_matrix_by_the_inlier_count(scene: 
         np.testing.assert_array_equal(edge.information, np.eye(6))
 
     inliers_by_pair: dict[tuple[int, int], int] = {
-        (candidate.source_rig_id, candidate.target_rig_id): candidate.num_inliers for candidate in weighted_run.candidates
+        (candidate.hit.source_rig_id, candidate.hit.target_rig_id): candidate.estimate.num_inliers for candidate in weighted_run.candidates
     }
     for edge in weighted_run.edges:
         expected: float = inliers_by_pair[(edge.source, edge.target)] * config.loop_residual_weight
         np.testing.assert_allclose(edge.information, np.eye(6) * expected)
+
+
+def test_a_candidate_keeps_its_hit_and_its_measurement_whole(loop_result: LoopClosureResult) -> None:
+    """`LoopCandidate` composes the retrieval hit with the metric estimate.
+
+    Neither half is re-flattened into the other, so a reader can tell at a glance which
+    numbers retrieval decided and which the estimator measured.
+    """
+    assert loop_result.candidates
+    candidate: LoopCandidate = loop_result.candidates[0]
+    assert isinstance(candidate.hit, RetrievalHit)
+    assert candidate.hit.source_rig_id != candidate.hit.target_rig_id
+    assert 0.0 <= candidate.hit.score <= 1.0
+    assert candidate.estimate.num_inliers <= candidate.estimate.num_observations
+    assert candidate.estimate.num_landmarks > 0
 
 
 # --------------------------------------------------------------------------------------
@@ -613,6 +713,40 @@ def test_is_good_accepts_a_strong_pair_and_rejects_a_weak_one() -> None:
     assert is_good_match(num_inliers=30, num_matches=100, config=config) is False
     assert is_good_match(num_inliers=50, num_matches=200, config=config) is False
     assert is_good_match(num_inliers=0, num_matches=0, config=config) is False
+
+
+def test_the_inlier_floor_is_declared_once() -> None:
+    """`LoopClosureConfig.min_inliers` reads the estimator's own floor rather than copying it.
+
+    They are the blob's one `min_matches_num` (spec §6.6): the estimator refuses to solve on
+    fewer, and `is_good_match` refuses to accept fewer. Two fields would have needed a
+    `dataclasses.replace` at every call site to stay equal.
+    """
+    assert LoopClosureConfig().min_inliers == RigPoseConfig().min_inliers
+    raised: LoopClosureConfig = LoopClosureConfig(rig_pose=replace(RigPoseConfig(), min_inliers=99))
+    assert raised.min_inliers == 99
+    assert is_good_match(num_inliers=99, num_matches=100, config=raised) is False
+    assert is_good_match(num_inliers=100, num_matches=100, config=raised) is True
+
+
+def test_the_config_profile_supplies_the_loop_gates() -> None:
+    """`from_pose_graph` maps `pose_graph_config.pb.txt` onto the stage's gate fields.
+
+    Read off the shipped `loop-closure-fixed` profile rather than a hand-built config,
+    because the point of the classmethod is that the pipeline no longer spells the five
+    assignments at its call site — and the profile's own 1.0 m / 10 deg are what a real run
+    gets.
+    """
+    if not LOOP_CLOSURE_CONFIG_DIR.is_dir():
+        pytest.skip(f"the loop-closure config profile is not present at {LOOP_CLOSURE_CONFIG_DIR}")
+    pose_graph: PoseGraphConfig = read_config_directory(LOOP_CLOSURE_CONFIG_DIR).pose_graph
+    config: LoopClosureConfig = LoopClosureConfig.from_pose_graph(pose_graph)
+    assert config.enabled is True
+    assert config.loop_closure_interval_ratio == pose_graph.loop_closure_interval_ratio
+    assert config.max_translation_m == pose_graph.loop_edge_translation_threshold_meters == 1.0
+    assert config.max_rotation_deg == pose_graph.loop_edge_rotation_threshold_degrees == 10.0
+    assert config.loop_residual_weight == pose_graph.loop_residual_weight
+    assert LoopClosureConfig.from_pose_graph(pose_graph, enabled=False).enabled is False
 
 
 def _loop_edge(translation_m: float, rotation_deg: float) -> PoseGraphEdge:

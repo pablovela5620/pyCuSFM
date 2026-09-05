@@ -11,6 +11,11 @@ pose files. See `docs/open-pipeline-plan.md` for the plan of record and
 from __future__ import annotations
 
 import os
+from pathlib import Path
+from typing import Final
+
+REPO_ROOT: Final[Path] = Path(__file__).resolve().parent.parent
+"""Repo root, so vendored data and default config directories resolve from any cwd."""
 
 if os.environ.get("PIXI_DEV_MODE") == "1":
     from beartype.claw import beartype_this_package

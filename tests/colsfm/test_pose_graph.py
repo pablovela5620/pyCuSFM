@@ -5,14 +5,13 @@ Seams under test (all public):
 * `sequential_edges` / `loop_edge_information` / `gate_loop_edges` — graph construction.
 * `solve_pose_graph` — the Ceres problem and its result.
 
-The Galileo parity tests read the shipped cuSFM artifacts directly with the small
-readers in this file; they deliberately do not import `colsfm.frames_meta`, which is
-owned by another worker and not a dependency of the pose-graph stage.
+The Galileo parity tests read the shipped cuSFM artifacts through `colsfm.frames_meta`;
+the one reader left in this file is `read_vehicle_pose_graph`, because
+`vehicle_pose_graph.pb.txt` is a text proto no production module parses.
 """
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import time
@@ -26,7 +25,11 @@ import pytest
 from jaxtyping import Float
 from scipy.spatial.transform import Rotation
 
+from colsfm import REPO_ROOT
+from colsfm.frames_meta import FramesMeta, read_frames_meta
+from colsfm.geometry import rigid3d_from_axis_angle_degrees
 from colsfm.pose_graph import (
+    Information6,
     PoseGraphEdge,
     PoseGraphSolveOptions,
     RelativePoseCost,
@@ -40,7 +43,8 @@ from colsfm.pose_graph import (
     solve_pose_graph,
 )
 
-REPO_ROOT: Path = Path(__file__).resolve().parents[2]
+# `colsfm.REPO_ROOT` rather than the `repo_root` fixture: these paths are needed by the
+# `skipif` markers below, which pytest evaluates at import time, where no fixture exists.
 # The two archived galileo runs differ in more than size: the 4-rig one ran the stock isaac
 # config and logs "0 loop constraints", while the 29-rig one under `cusfm/` used a locally
 # patched config with the loop gates opened and produced 8 loop edges
@@ -101,48 +105,36 @@ def read_text_proto(text: str) -> TextProto:
     return parsed
 
 
-def rigid_from_axis_angle(message: dict[str, object]) -> pycolmap.Rigid3d:
-    """Build a `Rigid3d` from a `protos.common.geometry.RigidTransform3d` JSON object.
+def rigid_from_text_proto(message: TextProto) -> pycolmap.Rigid3d:
+    """Build a `Rigid3d` from a text-proto `RigidTransform3d`.
 
-    The proto stores a unit axis plus an angle in DEGREES, and omits zero-valued
-    fields (proto3), so every component defaults to 0.
+    The proto stores a unit axis plus an angle in DEGREES and omits zero-valued fields
+    (proto3), so every component defaults to 0.
 
     Args:
-        message: The decoded JSON object with `axis_angle` and `translation`.
+        message: The parsed `axis_angle` / `translation` block.
 
     Returns:
-        The transform, with the rotation converted to radians.
+        The transform.
     """
-    axis_angle: dict[str, float] = message.get("axis_angle", {})
-    translation_json: dict[str, float] = message.get("translation", {})
-    axis: Float[np.ndarray, "3"] = np.array(
-        [axis_angle.get("x", 0.0), axis_angle.get("y", 0.0), axis_angle.get("z", 0.0)], dtype=np.float64
-    )
-    angle_rad: float = np.deg2rad(axis_angle.get("angle_degrees", 0.0))
-    translation: Float[np.ndarray, "3"] = np.array(
-        [translation_json.get("x", 0.0), translation_json.get("y", 0.0), translation_json.get("z", 0.0)], dtype=np.float64
-    )
-    quat_xyzw: Float[np.ndarray, "4"] = Rotation.from_rotvec(axis * angle_rad).as_quat()
-    return pycolmap.Rigid3d(pycolmap.Rotation3d(quat_xyzw), translation)
-
-
-def rigid_from_text_proto(message: TextProto) -> pycolmap.Rigid3d:
-    """Same as `rigid_from_axis_angle` but for a text-proto `RigidTransform3d`."""
     axis_angle: TextProto = message["axis_angle"][0]
     translation_proto: TextProto = message["translation"][0]
-    plain: dict[str, object] = {
-        "axis_angle": {key: float(values[0]) for key, values in axis_angle.items()},
-        "translation": {key: float(values[0]) for key, values in translation_proto.items()},
-    }
-    return rigid_from_axis_angle(plain)
+    return rigid3d_from_axis_angle_degrees(
+        axis_xyz=np.array([float(axis_angle.get(key, [0.0])[0]) for key in ("x", "y", "z")], dtype=np.float64),
+        angle_degrees=float(axis_angle.get("angle_degrees", [0.0])[0]),
+        translation_xyz=np.array(
+            [float(translation_proto.get(key, [0.0])[0]) for key in ("x", "y", "z")], dtype=np.float64
+        ),
+    )
 
 
 def read_rig_nodes(frames_meta_path: Path) -> list[RigNode]:
-    """Group camera keyframes into rig nodes, exactly as `ComputeVehicleFrames` does.
+    """Read a `frames_meta.json` as rig nodes, the way `ComputeVehicleFrames` groups them.
 
-    The rig pose is not stored in the file. Per `docs/spec/pose_graph_main.md` §4 it is
-    derived from the LOWEST-id camera keyframe of the synced sample:
-    `world_T_rig = world_T_camera(ref) * sensor_to_vehicle_transform(ref)^-1`.
+    `FramesMeta.rig_frames` already applies the spec's rule: the rig pose comes from the
+    LOWEST-id camera keyframe of the synced sample, as
+    `world_T_rig = world_T_camera(ref) * sensor_to_vehicle_transform(ref)^-1`
+    (`docs/spec/pose_graph_main.md` §4).
 
     Args:
         frames_meta_path: Path to a `keyframes/frames_meta.json`.
@@ -150,33 +142,31 @@ def read_rig_nodes(frames_meta_path: Path) -> list[RigNode]:
     Returns:
         One `RigNode` per `synced_sample_id`, sorted by rig id.
     """
-    document: dict[str, object] = json.loads(frames_meta_path.read_text())
-    rig_T_cam: dict[int, pycolmap.Rigid3d] = {
-        int(camera_id): rigid_from_axis_angle(params["sensor_meta_data"]["sensor_to_vehicle_transform"])
-        for camera_id, params in document["camera_params_id_to_camera_params"].items()
-    }
-    grouped: dict[int, list[dict[str, object]]] = {}
-    for keyframe in document["keyframes_metadata"]:
-        grouped.setdefault(int(keyframe["synced_sample_id"]), []).append(keyframe)
-    nodes: list[RigNode] = []
-    for rig_id in sorted(grouped):
-        reference: dict[str, object] = min(grouped[rig_id], key=lambda entry: int(entry["id"]))
-        world_T_cam: pycolmap.Rigid3d = rigid_from_axis_angle(reference["camera_to_world"])
-        camera_id: int = int(reference.get("camera_params_id", 0))
-        nodes.append(
-            RigNode(
-                rig_id=rig_id,
-                world_T_rig=world_T_cam * rig_T_cam[camera_id].inverse(),
-                timestamp_us=int(reference["timestamp_microseconds"]),
-            )
+    return [
+        RigNode(
+            rig_id=rig_frame.synced_sample_id,
+            world_T_rig=rig_frame.world_T_vehicle,
+            timestamp_us=rig_frame.timestamp_microseconds,
         )
-    return nodes
+        for rig_frame in read_frames_meta(frames_meta_path).rig_frames()
+    ]
 
 
 def read_vehicle_poses(vehicle_frames_meta_path: Path) -> dict[int, pycolmap.Rigid3d]:
-    """Read `vehicle_frames_meta.json`, the blob's optimised rig poses, keyed by rig id."""
-    document: dict[str, object] = json.loads(vehicle_frames_meta_path.read_text())
-    return {int(entry["id"]): rigid_from_axis_angle(entry["camera_to_world"]) for entry in document["keyframes_metadata"]}
+    """Read `vehicle_frames_meta.json`, the blob's optimised rig poses, keyed by rig id.
+
+    The blob writes the rig poses into the same `KeyframesMetadataCollection` shape it
+    writes camera poses into, with `id` holding the rig id and `camera_to_world` holding
+    `world_T_rig`.
+
+    Args:
+        vehicle_frames_meta_path: Path to a `vehicle_frames_meta.json`.
+
+    Returns:
+        `world_T_rig` per rig id.
+    """
+    vehicle_meta: FramesMeta = read_frames_meta(vehicle_frames_meta_path)
+    return {keyframe.keyframe_id: keyframe.world_T_cam for keyframe in vehicle_meta.keyframes}
 
 
 def read_vehicle_pose_graph(pose_graph_path: Path) -> list[PoseGraphEdge]:
@@ -267,6 +257,30 @@ def make_square_loop(n_nodes: int = 200, rotation_bias_deg: float = 0.02, seed: 
     )
 
 
+def truth_loop_edge(loop: SquareLoop, source: int, target: int, information: Information6 | None = None) -> PoseGraphEdge:
+    """A loop edge whose measurement is the ground truth's own relative pose.
+
+    Every loop test builds the same thing: a revisit constraint that tells the solver
+    where two drifted nodes really are with respect to each other.
+
+    Args:
+        loop: The synthetic trajectory, for its ground-truth poses.
+        source: `rig_id` the edge starts at.
+        target: `rig_id` the edge ends at.
+        information: The 6x6 weight; the identity when None.
+
+    Returns:
+        The loop edge.
+    """
+    return PoseGraphEdge(
+        source=source,
+        target=target,
+        source_T_target=loop.truth[source].world_T_rig.inverse() * loop.truth[target].world_T_rig,
+        information=np.eye(6, dtype=np.float64) if information is None else information,
+        kind="loop",
+    )
+
+
 def position_errors(estimate: dict[int, pycolmap.Rigid3d], truth: list[RigNode]) -> Float[np.ndarray, "n"]:
     """Per-node absolute position error in metres, no alignment (node 0 is the anchor)."""
     return np.array([float(np.linalg.norm(estimate[node.rig_id].translation - node.world_T_rig.translation)) for node in truth])
@@ -354,15 +368,7 @@ def test_gate_loop_edges_rejects_everything_at_the_shipped_zero_thresholds() -> 
     """The shipped isaac/av configs leave both thresholds at the proto3 default 0.0."""
     loop: SquareLoop = make_square_loop(n_nodes=8)
     edges: list[PoseGraphEdge] = sequential_edges(loop.odometry, connected_keyframe_num=1)
-    edges.append(
-        PoseGraphEdge(
-            source=1,
-            target=0,
-            source_T_target=loop.truth[1].world_T_rig.inverse() * loop.truth[0].world_T_rig,
-            information=np.eye(6),
-            kind="loop",
-        )
-    )
+    edges.append(truth_loop_edge(loop, source=1, target=0))
 
     kept: list[PoseGraphEdge] = gate_loop_edges(edges, max_translation_m=0.0, max_rotation_deg=0.0)
 
@@ -477,12 +483,8 @@ def test_consistent_odometry_without_loops_leaves_the_trajectory_untouched() -> 
 def test_one_loop_closure_cuts_the_drift_error_by_more_than_five_times() -> None:
     loop: SquareLoop = make_square_loop(n_nodes=200)
     edges: list[PoseGraphEdge] = sequential_edges(loop.odometry, connected_keyframe_num=1)
-    closure: PoseGraphEdge = PoseGraphEdge(
-        source=199,
-        target=0,
-        source_T_target=loop.truth[199].world_T_rig.inverse() * loop.truth[0].world_T_rig,
-        information=loop_edge_information(score=100.0, loop_residual_weight=1.0),
-        kind="loop",
+    closure: PoseGraphEdge = truth_loop_edge(
+        loop, source=199, target=0, information=loop_edge_information(score=100.0, loop_residual_weight=1.0)
     )
 
     before: Float[np.ndarray, "n"] = position_errors({node.rig_id: node.world_T_rig for node in loop.odometry}, loop.truth)
@@ -498,15 +500,7 @@ def test_one_loop_closure_cuts_the_drift_error_by_more_than_five_times() -> None
 def test_the_anchor_defaults_to_the_source_of_the_first_edge_and_stays_fixed() -> None:
     loop: SquareLoop = make_square_loop(n_nodes=20)
     edges: list[PoseGraphEdge] = sequential_edges(loop.odometry, connected_keyframe_num=1)
-    edges.append(
-        PoseGraphEdge(
-            source=19,
-            target=0,
-            source_T_target=loop.truth[19].world_T_rig.inverse() * loop.truth[0].world_T_rig,
-            information=np.eye(6) * 100.0,
-            kind="loop",
-        )
-    )
+    edges.append(truth_loop_edge(loop, source=19, target=0, information=np.eye(6) * 100.0))
 
     result = solve_pose_graph(loop.odometry, edges)
     assert result.anchor_rig_id == 0
@@ -521,15 +515,7 @@ def test_both_sparse_linear_solvers_reach_the_same_optimum() -> None:
     """The blob hard-codes SPARSE_SCHUR; a pose graph has no Schur structure to exploit."""
     loop: SquareLoop = make_square_loop(n_nodes=60)
     edges: list[PoseGraphEdge] = sequential_edges(loop.odometry, connected_keyframe_num=1)
-    edges.append(
-        PoseGraphEdge(
-            source=59,
-            target=0,
-            source_T_target=loop.truth[59].world_T_rig.inverse() * loop.truth[0].world_T_rig,
-            information=np.eye(6) * 100.0,
-            kind="loop",
-        )
-    )
+    edges.append(truth_loop_edge(loop, source=59, target=0, information=np.eye(6) * 100.0))
 
     cholesky = solve_pose_graph(loop.odometry, edges, options=PoseGraphSolveOptions(linear_solver="SPARSE_NORMAL_CHOLESKY"))
     schur = solve_pose_graph(loop.odometry, edges, options=PoseGraphSolveOptions(linear_solver="SPARSE_SCHUR"))
@@ -542,15 +528,7 @@ def test_both_sparse_linear_solvers_reach_the_same_optimum() -> None:
 def test_apply_rig_update_replaces_poses_and_keeps_identity_and_time() -> None:
     loop: SquareLoop = make_square_loop(n_nodes=12)
     edges: list[PoseGraphEdge] = sequential_edges(loop.odometry, connected_keyframe_num=1)
-    edges.append(
-        PoseGraphEdge(
-            source=11,
-            target=0,
-            source_T_target=loop.truth[11].world_T_rig.inverse() * loop.truth[0].world_T_rig,
-            information=np.eye(6) * 100.0,
-            kind="loop",
-        )
-    )
+    edges.append(truth_loop_edge(loop, source=11, target=0, information=np.eye(6) * 100.0))
     result = solve_pose_graph(loop.odometry, edges)
 
     updated: list[RigNode] = apply_rig_update(loop.odometry, result.world_T_rig)
@@ -695,17 +673,7 @@ def test_a_thousand_node_graph_solves_within_one_second() -> None:
     edges: list[PoseGraphEdge] = sequential_edges(loop.odometry, connected_keyframe_num=1)
     assert len(edges) == 999
     for index in range(50):
-        source: int = 999 - index
-        target: int = index
-        edges.append(
-            PoseGraphEdge(
-                source=source,
-                target=target,
-                source_T_target=loop.truth[source].world_T_rig.inverse() * loop.truth[target].world_T_rig,
-                information=np.eye(6) * 10.0,
-                kind="loop",
-            )
-        )
+        edges.append(truth_loop_edge(loop, source=999 - index, target=index, information=np.eye(6) * 10.0))
 
     before: Float[np.ndarray, "n"] = position_errors({node.rig_id: node.world_T_rig for node in loop.odometry}, loop.truth)
     started: float = time.perf_counter()

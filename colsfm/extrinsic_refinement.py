@@ -100,6 +100,10 @@ It stops when a round moves no extrinsic by more than 0.1 mm / 0.005 deg, or aft
 `num_rounds`. `ExtrinsicRefinementOptions.regularised = False` restores the plain
 pycolmap path (`run_mapping(..., optimize_extrinsics=True)`) for comparison.
 
+`refine_extrinsics` takes an already-mapped `MappingResult` and keeps adjusting its
+model: the caller maps its camera-referenced `PosedModel` once and the alternation
+picks up from there, rather than the same database being mapped twice.
+
 ## Deliberate deviations
 
 1. **The reference camera's extrinsic is pinned**, because COLMAP requires the rig's
@@ -131,10 +135,23 @@ from typing import Final, TypeAlias
 import numpy as np
 import pyceres
 import pycolmap
-from jaxtyping import Bool, Float
+from jaxtyping import Bool, Float64, Int64
 from numpy import ndarray
 
+from colsfm.ceres_pose import (
+    CeresSolveOptions,
+    LinearSolver,
+    PoseBlocks,
+    SolverStats,
+    attach_quaternion_manifolds,
+    batched_skew,
+    pose_parameter_blocks,
+    rigid3d_from_parameter_blocks,
+    solver_options,
+    solver_stats,
+)
 from colsfm.config import BundleAdjustmentConfig, VisionMappingConfig
+from colsfm.geometry import MILLIMETRES_PER_METRE, Matrix3, Vector3
 from colsfm.mapping import (
     MappingOptions,
     MappingResult,
@@ -150,25 +167,19 @@ from colsfm.pose_graph import (
     quaternion_plus_jacobian_transpose,
     rotation_matrix_from_quat_xyzw,
 )
-from colsfm.reconstruction import RIG_ID, RigReference, camera_sensor_id
+from colsfm.reconstruction import RIG_ID, PosedModel, RigReference, camera_sensor_id
 
-QuaternionXYZW: TypeAlias = Float[ndarray, "4"]
-"""Unit quaternion in Eigen order, the layout `pyceres.EigenQuaternionManifold` wants."""
-
-Vector3: TypeAlias = Float[ndarray, "3"]
-"""A translation or a rotation vector, metres or radians."""
-
-Matrix3: TypeAlias = Float[ndarray, "3 3"]
-"""A rotation matrix."""
-
-PointsInVehicle: TypeAlias = Float[ndarray, "n_obs 3"]
+PointsInVehicle: TypeAlias = Float64[ndarray, "n_obs 3"]
 """Observed 3D points expressed in the vehicle (FLU) frame of their own rig instant."""
 
-PixelObservations: TypeAlias = Float[ndarray, "n_obs 2"]
+PixelObservations: TypeAlias = Float64[ndarray, "n_obs 2"]
 """Measured keypoint positions in pixels."""
 
 CameraPairKey: TypeAlias = tuple[int, int]
 """Two `camera_params_id`s, ascending; one inter-camera extrinsic constraint."""
+
+EXTRINSIC_LINEAR_SOLVER: Final[LinearSolver] = "SPARSE_NORMAL_CHOLESKY"
+"""The extrinsics-only problem has a handful of pose blocks and no Schur structure."""
 
 _SMALL_SQUARED_NORM: Final[float] = 1e-8
 """Below this squared residual the Cauchy scale is taken from its series expansion."""
@@ -197,7 +208,7 @@ class ExtrinsicRefinementOptions:
     """Ceiling on the (A)-then-(B) rounds; the tolerances below normally stop it first.
     Block-coordinate descent converges linearly, and on Galileo the per-round motion decays
     by only ~0.88 per round: 0.47, 0.25, 0.18, 0.15, ... mm, reaching the tolerances after
-    **19 rounds** and 9.9 s. Three rounds would stop at a third of the final extrinsic move,
+    **19 rounds** and 3.2 s. Three rounds would stop at a third of the final extrinsic move,
     a worse ATE (4.38 mm against 4.28) and a worse reprojection error (0.956 px against
     0.898). A dataset whose bundle adjustment is expensive — RoboCap's is ~20 s a round —
     wants a smaller ceiling."""
@@ -206,17 +217,24 @@ class ExtrinsicRefinementOptions:
     rotation_tolerance_deg: float = 0.005
     """Stop once no extrinsic rotated further than this in a round."""
     extrinsic_translation_sigma_m: float = 0.01
-    """`BundleAdjustmentConfig.extrinsic_error_meters`; one sigma of the extrinsic priors."""
+    """`BundleAdjustmentConfig.extrinsic_error_meters`; one sigma of the extrinsic priors.
+    `solve_extrinsics` uses whatever this says, but `refine_extrinsics` OVERRIDES it with
+    the mapping configuration's own value: the two must agree, and the config is the
+    authority. The default is the shipped isaac number, kept so a standalone
+    `solve_extrinsics` call is still the blob's problem."""
     extrinsic_rotation_sigma_deg: float = 2.0
-    """`BundleAdjustmentConfig.extrinsic_error_degrees`; one sigma of the extrinsic priors."""
+    """`BundleAdjustmentConfig.extrinsic_error_degrees`; one sigma of the extrinsic priors.
+    Overridden from the configuration by `refine_extrinsics`, like the field above."""
     reprojection_sigma_px: float = 4.0
-    """`BundleAdjustmentConfig.reprojection_error_standard_deviation`; whitens the pixel residual."""
+    """`BundleAdjustmentConfig.reprojection_error_standard_deviation`; whitens the pixel
+    residual. Overridden from the configuration by `refine_extrinsics`."""
     use_absolute_prior: bool = True
     """Add the per-camera `absolute_extrinsic` blocks. Off only for ablations."""
     use_relative_prior: bool = True
     """Add the per-camera-pair `relative_extrinsic` blocks. Off only for ablations."""
     max_num_iterations: int = 200
-    """`BundleAdjustmentConfig.max_num_iterations`, applied to the extrinsics-only solve."""
+    """`BundleAdjustmentConfig.max_num_iterations`, applied to the extrinsics-only solve.
+    Overridden from the configuration by `refine_extrinsics`."""
     num_threads: int = 1
     """Ceres threads for the extrinsics-only solve. The residuals are Python, so worker
     threads serialise on the GIL; `colsfm.pose_graph` measured 8 threads slower than 1."""
@@ -275,21 +293,53 @@ class ExtrinsicRefinementRound:
 
 @dataclass(frozen=True, slots=True)
 class ExtrinsicRefinementResult:
-    """What `refine_extrinsics` produced."""
+    """What `refine_extrinsics` produced.
+
+    The extrinsics and the elapsed time are read straight off `mapping`, which is a
+    live view of the adjusted model (`colsfm.mapping.MappingResult`); duplicating them
+    here is what let the two disagree.
+    """
 
     mapping: MappingResult
-    """The mapping result, with the round-by-round statistics of the base pass and its
-    final counters brought up to date with the alternation that followed."""
-    refined_extrinsics: dict[int, pycolmap.Rigid3d]
-    """`vehicle_T_cam` per `camera_params_id` after the refinement."""
+    """The mapping result: the round-by-round statistics of the pass that produced the
+    model, with the timings extended to cover the alternation that followed."""
     rounds: tuple[ExtrinsicRefinementRound, ...]
     """Per-round statistics of the alternation; empty when `regularised` was False."""
     converged: bool
     """Whether a round fell inside both tolerances rather than exhausting `num_rounds`."""
     regularised: bool
-    """Whether the prior-carrying path ran."""
-    seconds: float
-    """Wall-clock seconds for the whole stage, the base mapping pass included."""
+    """Whether the prior-carrying path ran; the pipeline reports it and nothing derives
+    from it."""
+
+    @property
+    def refined_extrinsics(self) -> dict[int, pycolmap.Rigid3d]:
+        """`vehicle_T_cam` per `camera_params_id` after the refinement.
+
+        Returns:
+            The extrinsics read back out of the adjusted rig.
+
+        Raises:
+            ValueError: When the mapping result reports none, which cannot happen for a
+                model this function accepted — it needs a camera-referenced rig — and
+                would mean the model was swapped underneath it.
+        """
+        refined: dict[int, pycolmap.Rigid3d] | None = self.mapping.refined_extrinsics
+        if refined is None:
+            raise ValueError(
+                "the refined model reports no extrinsics: its rig reference is not a "
+                "camera, so `refine_extrinsics` cannot have produced it"
+            )
+        return refined
+
+    @property
+    def seconds(self) -> float:
+        """Wall-clock seconds for the whole stage, the mapping pass included.
+
+        Returns:
+            `mapping.total_seconds`, which `refine_extrinsics` extends to cover the
+            alternation.
+        """
+        return self.mapping.total_seconds
 
 
 # ======================================================================================
@@ -316,55 +366,164 @@ class CameraObservations:
     """The measured keypoint of each observation, pixels."""
 
 
+@dataclass(frozen=True, slots=True)
+class ImageObservationIndex:
+    """Which points one image observes, and where in that image it saw them."""
+
+    frame_id: int
+    """The rig instant this image belongs to; picks the pose to fold in."""
+    point3D_ids: Int64[ndarray, " n_obs"]
+    """The observed point ids, in the image's own `points2D` order."""
+    observed_px: PixelObservations
+    """The measured keypoint of each of those observations, pixels."""
+
+
+@dataclass(frozen=True, slots=True)
+class CameraObservationIndex:
+    """One camera's share of the observation graph, without any geometry folded in.
+
+    This is the half of `CameraObservations` that a round of the alternation cannot
+    change: `solve_bundle_adjustment` moves poses and points but adds and removes no
+    observation, so the images, the point ids and the pixels are the same every round
+    and are built once. Only the geometry has to be gathered again.
+    """
+
+    camera_params_id: int
+    """The camera these observations belong to."""
+    camera: pycolmap.Camera
+    """Its intrinsics, used batched through `Camera.img_from_cam`."""
+    images: tuple[ImageObservationIndex, ...]
+    """Its images that observe at least one point, in ascending image id order."""
+
+
+def build_observation_index(reconstruction: pycolmap.Reconstruction) -> dict[int, CameraObservationIndex]:
+    """Index every observation by camera and image, once, for the whole alternation.
+
+    Args:
+        reconstruction: A posed, triangulated model.
+
+    Returns:
+        One `CameraObservationIndex` per `camera_params_id` that owns at least one
+        observation, keyed by that id.
+    """
+    images_by_camera: dict[int, list[ImageObservationIndex]] = {}
+    for image_id in sorted(reconstruction.images):
+        image: pycolmap.Image = reconstruction.image(image_id)
+        point3D_ids: list[int] = []
+        observed: list[Vector3] = []
+        for point2D in image.points2D:
+            if not point2D.has_point3D():
+                continue
+            point3D_ids.append(int(point2D.point3D_id))
+            observed.append(point2D.xy)
+        if not point3D_ids:
+            continue
+        images_by_camera.setdefault(image.camera_id, []).append(
+            ImageObservationIndex(
+                frame_id=image.frame_id,
+                point3D_ids=np.asarray(point3D_ids, dtype=np.int64),
+                observed_px=np.asarray(observed, dtype=np.float64),
+            )
+        )
+    return {
+        camera_params_id: CameraObservationIndex(
+            camera_params_id=camera_params_id,
+            camera=reconstruction.camera(camera_params_id),
+            images=tuple(images),
+        )
+        for camera_params_id, images in sorted(images_by_camera.items())
+    }
+
+
+def _sorted_points(
+    reconstruction: pycolmap.Reconstruction,
+) -> tuple[Int64[ndarray, " n_points"], Float64[ndarray, "n_points 3"]]:
+    """Read every current point position out in one pass, sorted by point id.
+
+    Args:
+        reconstruction: The model to read.
+
+    Returns:
+        Ascending point3D ids and their world positions in the same order, so that a
+        `searchsorted` turns an observation's point id into a row.
+    """
+    point3D_ids: list[int] = []
+    positions: list[Vector3] = []
+    for point3D_id, point in reconstruction.points3D.items():
+        point3D_ids.append(int(point3D_id))
+        positions.append(point.xyz)
+    if not point3D_ids:
+        return np.empty(0, dtype=np.int64), np.empty((0, 3), dtype=np.float64)
+    ids: Int64[ndarray, " n_points"] = np.asarray(point3D_ids, dtype=np.int64)
+    points_xyz: Float64[ndarray, "n_points 3"] = np.asarray(positions, dtype=np.float64)
+    order: Int64[ndarray, " n_points"] = np.argsort(ids)
+    return ids[order], points_xyz[order]
+
+
 def camera_observations(
-    reconstruction: pycolmap.Reconstruction, rig_reference: RigReference
+    reconstruction: pycolmap.Reconstruction,
+    rig_reference: RigReference,
+    index: Mapping[int, CameraObservationIndex] | None = None,
 ) -> dict[int, CameraObservations]:
     """Fold the frozen rig poses and points into per-camera observation arrays.
+
+    Only this half is per-round work: it is one pass over `points3D` plus fancy
+    indexing, where the index it reads (`build_observation_index`) is built once. An
+    observation whose point has disappeared since the index was built is dropped rather
+    than raising — `solve_bundle_adjustment` inside the alternation filters nothing, so
+    that is not expected to happen, but a caller may hand in any model.
 
     Args:
         reconstruction: A posed, triangulated model built on a camera-referenced rig.
         rig_reference: How that rig was built, from `colsfm.reconstruction.rig_reference`.
+        index: A prebuilt observation index for this model, or None to build one.
 
     Returns:
         One `CameraObservations` per `camera_params_id` that owns at least one
         observation, keyed by that id.
     """
+    resolved_index: Mapping[int, CameraObservationIndex] = (
+        build_observation_index(reconstruction) if index is None else index
+    )
     vehicle_T_world_by_frame_id: dict[int, pycolmap.Rigid3d] = {
         frame_id: world_T_vehicle.inverse()
         for frame_id, world_T_vehicle in rig_reference.world_T_vehicle_by_frame_id(reconstruction).items()
     }
-    points_by_camera: dict[int, list[PointsInVehicle]] = {}
-    pixels_by_camera: dict[int, list[PixelObservations]] = {}
-    for image_id in sorted(reconstruction.images):
-        image: pycolmap.Image = reconstruction.image(image_id)
-        vehicle_T_world: pycolmap.Rigid3d | None = vehicle_T_world_by_frame_id.get(image.frame_id)
-        if vehicle_T_world is None:
-            continue
-        observed: list[Float[ndarray, "2"]] = []
-        world_points: list[Vector3] = []
-        for point2D in image.points2D:
-            if not point2D.has_point3D():
-                continue
-            observed.append(point2D.xy)
-            world_points.append(reconstruction.point3D(point2D.point3D_id).xyz)
-        if not observed:
-            continue
-        points_xyz: Float[ndarray, "n_image_obs 3"] = np.asarray(world_points, dtype=np.float64)
-        points_by_camera.setdefault(image.camera_id, []).append(
-            points_xyz @ np.asarray(vehicle_T_world.rotation.matrix(), dtype=np.float64).T
-            + np.asarray(vehicle_T_world.translation, dtype=np.float64)
-        )
-        pixels_by_camera.setdefault(image.camera_id, []).append(np.asarray(observed, dtype=np.float64))
+    point3D_ids, points_xyz = _sorted_points(reconstruction)
 
-    return {
-        camera_params_id: CameraObservations(
+    observations: dict[int, CameraObservations] = {}
+    for camera_params_id, camera_index in sorted(resolved_index.items()):
+        points_in_vehicle: list[PointsInVehicle] = []
+        pixels: list[PixelObservations] = []
+        for image_index in camera_index.images:
+            vehicle_T_world: pycolmap.Rigid3d | None = vehicle_T_world_by_frame_id.get(image_index.frame_id)
+            if vehicle_T_world is None:
+                continue
+            rows: Int64[ndarray, " n_obs"] = np.clip(
+                np.searchsorted(point3D_ids, image_index.point3D_ids), 0, max(len(point3D_ids) - 1, 0)
+            )
+            present: Bool[ndarray, " n_obs"] = (
+                np.zeros(len(image_index.point3D_ids), dtype=bool)
+                if len(point3D_ids) == 0
+                else point3D_ids[rows] == image_index.point3D_ids
+            )
+            if not present.any():
+                continue
+            world_points: PointsInVehicle = points_xyz[rows[present]]
+            points_in_vehicle.append(
+                world_points @ np.asarray(vehicle_T_world.rotation.matrix(), dtype=np.float64).T
+                + np.asarray(vehicle_T_world.translation, dtype=np.float64)
+            )
+            pixels.append(image_index.observed_px[present])
+        if not points_in_vehicle:
+            continue
+        observations[camera_params_id] = CameraObservations(
             camera_params_id=camera_params_id,
-            camera=reconstruction.camera(camera_params_id),
-            points_in_vehicle=np.ascontiguousarray(np.concatenate(chunks, axis=0)),
-            observed_px=np.ascontiguousarray(np.concatenate(pixels_by_camera[camera_params_id], axis=0)),
+            camera=camera_index.camera,
+            points_in_vehicle=np.ascontiguousarray(np.concatenate(points_in_vehicle, axis=0)),
+            observed_px=np.ascontiguousarray(np.concatenate(pixels, axis=0)),
         )
-        for camera_params_id, chunks in sorted(points_by_camera.items())
-    }
+    return observations
 
 
 def co_observed_camera_pairs(reconstruction: pycolmap.Reconstruction) -> dict[CameraPairKey, int]:
@@ -416,7 +575,7 @@ class RepeatedCauchyLoss(pyceres.LossFunction):
             raise ValueError(f"multiplicity must be at least 1, got {multiplicity}")
         self._multiplicity: float = float(multiplicity)
 
-    def Evaluate(self, squared_norm: float, out: Float[ndarray, "3"]) -> None:
+    def Evaluate(self, squared_norm: float, out: Float64[ndarray, "3"]) -> None:
         """Write `multiplicity * [rho, rho', rho'']` of `CauchyLoss(1.0)` into `out`.
 
         The trampoline pyceres 2.6 installs is the C++ signature `Evaluate(double, double*)`,
@@ -434,7 +593,7 @@ class RepeatedCauchyLoss(pyceres.LossFunction):
         out[2] = -self._multiplicity / denominator**2
 
 
-def cauchy_square_root_scale(squared_norm: Float[ndarray, " n_obs"]) -> tuple[Float[ndarray, " n_obs"], Float[ndarray, " n_obs"]]:
+def cauchy_square_root_scale(squared_norm: Float64[ndarray, " n_obs"]) -> tuple[Float64[ndarray, " n_obs"], Float64[ndarray, " n_obs"]]:
     """Per-observation `sqrt(rho(s)/s)` of `CauchyLoss(1.0)` and the derivative of `rho(s)/s`.
 
     Multiplying a residual by the first return value makes its squared norm equal
@@ -449,11 +608,11 @@ def cauchy_square_root_scale(squared_norm: Float[ndarray, " n_obs"]) -> tuple[Fl
         series `rho(s)/s = 1 - s/2 + s^2/3` supplies both, since the closed forms are
         `0/0` there.
     """
-    squared: Float[ndarray, " n_obs"] = np.asarray(squared_norm, dtype=np.float64)
+    squared: Float64[ndarray, " n_obs"] = np.asarray(squared_norm, dtype=np.float64)
     is_small: Bool[ndarray, " n_obs"] = squared < _SMALL_SQUARED_NORM
-    safe: Float[ndarray, " n_obs"] = np.where(is_small, 1.0, squared)
-    ratio: Float[ndarray, " n_obs"] = np.where(is_small, 1.0 - 0.5 * squared, np.log1p(safe) / safe)
-    derivative: Float[ndarray, " n_obs"] = np.where(
+    safe: Float64[ndarray, " n_obs"] = np.where(is_small, 1.0, squared)
+    ratio: Float64[ndarray, " n_obs"] = np.where(is_small, 1.0 - 0.5 * squared, np.log1p(safe) / safe)
+    derivative: Float64[ndarray, " n_obs"] = np.where(
         is_small, -0.5 + (2.0 / 3.0) * squared, (safe / (1.0 + safe) - np.log1p(safe)) / safe**2
     )
     return np.sqrt(ratio), derivative
@@ -496,9 +655,9 @@ class RigReprojectionCost(pyceres.CostFunction):
         self._inverse_sigma: float = 1.0 / reprojection_sigma_px
         self._num_observations: int = num_observations
         self._vehicle_R_cam: Matrix3 = np.empty((3, 3), dtype=np.float64)
-        self._plus_jacobian_t: Float[ndarray, "3 4"] = np.empty((3, 4), dtype=np.float64)
+        self._plus_jacobian_t: Float64[ndarray, "3 4"] = np.empty((3, 4), dtype=np.float64)
 
-    def _projection_jacobian(self, points_in_cam: Float[ndarray, "n_obs 3"]) -> Float[ndarray, "n_obs 2 3"]:
+    def _projection_jacobian(self, points_in_cam: Float64[ndarray, "n_obs 3"]) -> Float64[ndarray, "n_obs 2 3"]:
         """Central-difference `d img_from_cam / d p_cam`, six batched projections.
 
         Args:
@@ -507,12 +666,12 @@ class RigReprojectionCost(pyceres.CostFunction):
         Returns:
             A 2x3 Jacobian per observation, pixels per metre.
         """
-        step: Float[ndarray, " n_obs"] = _PROJECTION_STEP_SCALE * np.maximum(
+        step: Float64[ndarray, " n_obs"] = _PROJECTION_STEP_SCALE * np.maximum(
             1.0, np.abs(points_in_cam).max(axis=1)
         )
-        jacobian: Float[ndarray, "n_obs 2 3"] = np.empty((self._num_observations, 2, 3), dtype=np.float64)
+        jacobian: Float64[ndarray, "n_obs 2 3"] = np.empty((self._num_observations, 2, 3), dtype=np.float64)
         for axis in range(3):
-            offset: Float[ndarray, "n_obs 3"] = np.zeros_like(points_in_cam)
+            offset: Float64[ndarray, "n_obs 3"] = np.zeros_like(points_in_cam)
             offset[:, axis] = step
             forward: PixelObservations = self._camera.img_from_cam(points_in_cam + offset)
             backward: PixelObservations = self._camera.img_from_cam(points_in_cam - offset)
@@ -523,33 +682,33 @@ class RigReprojectionCost(pyceres.CostFunction):
         """Evaluate the whitened, robustified residual and, when asked, ambient Jacobians."""
         quat_xyzw, vehicle_t_cam = parameters
         vehicle_R_cam: Matrix3 = rotation_matrix_from_quat_xyzw(quat_xyzw, self._vehicle_R_cam)
-        points_in_cam: Float[ndarray, "n_obs 3"] = (self._points_in_vehicle - vehicle_t_cam) @ vehicle_R_cam
+        points_in_cam: Float64[ndarray, "n_obs 3"] = (self._points_in_vehicle - vehicle_t_cam) @ vehicle_R_cam
         error: PixelObservations = (self._camera.img_from_cam(points_in_cam) - self._observed_px) * self._inverse_sigma
-        squared_norm: Float[ndarray, " n_obs"] = np.einsum("ij,ij->i", error, error)
+        squared_norm: Float64[ndarray, " n_obs"] = np.einsum("ij,ij->i", error, error)
         scale, ratio_derivative = cauchy_square_root_scale(squared_norm)
         residuals[:] = (scale[:, None] * error).ravel()
 
         if jacobians is None or (jacobians[0] is None and jacobians[1] is None):
             return True
 
-        projection_jacobian: Float[ndarray, "n_obs 2 3"] = self._projection_jacobian(points_in_cam)
-        point_jacobian: Float[ndarray, "n_obs 3 6"] = np.empty(
+        projection_jacobian: Float64[ndarray, "n_obs 2 3"] = self._projection_jacobian(points_in_cam)
+        point_jacobian: Float64[ndarray, "n_obs 3 6"] = np.empty(
             (self._num_observations, 3, _LOCAL_PARAMETERS), dtype=np.float64
         )
-        point_jacobian[:, :, :3] = _batched_skew(points_in_cam)
+        point_jacobian[:, :, :3] = batched_skew(points_in_cam)
         point_jacobian[:, :, 3:] = -vehicle_R_cam.T
-        local_jacobian: Float[ndarray, "n_obs 2 6"] = self._inverse_sigma * (projection_jacobian @ point_jacobian)
+        local_jacobian: Float64[ndarray, "n_obs 2 6"] = self._inverse_sigma * (projection_jacobian @ point_jacobian)
 
         # d(g r)/dp with g = sqrt(rho(s)/s): the scaling plus the rank-one term that makes
         # the returned residual an exact function of the parameters, so that the analytic
         # Jacobian survives a finite-difference check.
-        error_times_jacobian: Float[ndarray, "n_obs 6"] = np.einsum("ni,nij->nj", error, local_jacobian)
-        robust: Float[ndarray, "n_obs 2 6"] = (
+        error_times_jacobian: Float64[ndarray, "n_obs 6"] = np.einsum("ni,nij->nj", error, local_jacobian)
+        robust: Float64[ndarray, "n_obs 2 6"] = (
             scale[:, None, None] * local_jacobian
             + (ratio_derivative / scale)[:, None, None] * error[:, :, None] * error_times_jacobian[:, None, :]
         )
         if jacobians[0] is not None:
-            plus_jacobian_t: Float[ndarray, "3 4"] = quaternion_plus_jacobian_transpose(
+            plus_jacobian_t: Float64[ndarray, "3 4"] = quaternion_plus_jacobian_transpose(
                 quat_xyzw, self._plus_jacobian_t
             )
             jacobians[0][:] = (robust[:, :, :3] @ plus_jacobian_t).ravel()
@@ -558,28 +717,152 @@ class RigReprojectionCost(pyceres.CostFunction):
         return True
 
 
-def _batched_skew(vectors: Float[ndarray, "n 3"]) -> Float[ndarray, "n 3 3"]:
-    """Skew-symmetric matrix of every row of `vectors`.
-
-    Args:
-        vectors: One 3-vector per row.
-
-    Returns:
-        `skew(v)` per row, so that `skew(v) @ w == np.cross(v, w)`.
-    """
-    skew: Float[ndarray, "n 3 3"] = np.zeros((vectors.shape[0], 3, 3), dtype=np.float64)
-    skew[:, 0, 1] = -vectors[:, 2]
-    skew[:, 0, 2] = vectors[:, 1]
-    skew[:, 1, 0] = vectors[:, 2]
-    skew[:, 1, 2] = -vectors[:, 0]
-    skew[:, 2, 0] = -vectors[:, 1]
-    skew[:, 2, 1] = vectors[:, 0]
-    return skew
-
-
 # ======================================================================================
 # solve (A): extrinsics only
 # ======================================================================================
+
+
+def _add_reprojection_blocks(
+    problem: pyceres.Problem,
+    poses: Mapping[int, PoseBlocks],
+    observations: Mapping[int, CameraObservations],
+    reference_camera_params_id: int,
+    reprojection_sigma_px: float,
+    costs: list[pyceres.CostFunction],
+) -> tuple[int, int]:
+    """Add one vectorised reprojection block per free camera.
+
+    Args:
+        problem: The problem being built.
+        poses: The parameter arrays per `camera_params_id`.
+        observations: That round's frozen points and pixels per camera.
+        reference_camera_params_id: The pinned rig origin, which gets no block: its
+            extrinsic never moves, so its residual would be constant and Ceres would
+            drop it anyway.
+        reprojection_sigma_px: Whitening sigma, in pixels.
+        costs: Kept-alive list every cost is appended to; pyceres holds raw pointers
+            into it and a dropped reference is a segfault, not an error.
+
+    Returns:
+        The number of blocks added and the number of scalar residuals in them.
+    """
+    num_blocks: int = 0
+    num_residuals: int = 0
+    for camera_params_id, camera_obs in observations.items():
+        if camera_params_id == reference_camera_params_id:
+            continue
+        blocks: PoseBlocks = poses[camera_params_id]
+        cost: RigReprojectionCost = RigReprojectionCost(camera_obs, reprojection_sigma_px)
+        costs.append(cost)
+        problem.add_residual_block(cost, None, [blocks.quat_xyzw, blocks.translation])
+        num_blocks += 1
+        num_residuals += 2 * int(camera_obs.points_in_vehicle.shape[0])
+    return num_blocks, num_residuals
+
+
+def _add_absolute_priors(
+    problem: pyceres.Problem,
+    poses: Mapping[int, PoseBlocks],
+    calibration_vehicle_T_cam: Mapping[int, pycolmap.Rigid3d],
+    reference_camera_params_id: int,
+    information: Information6,
+    identity: PoseBlocks,
+    costs: list[pyceres.CostFunction],
+    losses: list[pyceres.LossFunction],
+) -> int:
+    """Add the blob's `absolute_extrinsic` block for every free camera (Eq. 14).
+
+    `RelativePoseCost` against a constant identity source IS the absolute prior: its
+    error is `measurement^-1 * (I^-1 * vehicle_T_cam)`.
+
+    Args:
+        problem: The problem being built.
+        poses: The parameter arrays per `camera_params_id`.
+        calibration_vehicle_T_cam: The calibration each prior pulls towards.
+        reference_camera_params_id: The pinned rig origin. It would give a block whose
+            every parameter is constant; the blob counts such a block (8 on Galileo,
+            one inert) but Ceres' `Program::RemoveFixedBlocks` evaluates it with a null
+            residual pointer, which segfaults the pyceres 2.6 trampoline. It
+            contributes nothing, so it is left out.
+        information: The 6x6 weight both prior groups share.
+        identity: The constant identity source, owned by the caller so that it outlives
+            the problem; set constant here once a block references it.
+        costs: Kept-alive list for the cost functions.
+        losses: Kept-alive list for the loss functions.
+
+    Returns:
+        The number of blocks added.
+    """
+    num_blocks: int = 0
+    for camera_params_id in sorted(poses):
+        if camera_params_id == reference_camera_params_id:
+            continue
+        blocks: PoseBlocks = poses[camera_params_id]
+        cost: RelativePoseCost = RelativePoseCost(calibration_vehicle_T_cam[camera_params_id], information)
+        loss: pyceres.CauchyLoss = pyceres.CauchyLoss(1.0)
+        costs.append(cost)
+        losses.append(loss)
+        problem.add_residual_block(
+            cost, loss, [identity.quat_xyzw, identity.translation, blocks.quat_xyzw, blocks.translation]
+        )
+        num_blocks += 1
+    if num_blocks:
+        problem.set_parameter_block_constant(identity.quat_xyzw)
+        problem.set_parameter_block_constant(identity.translation)
+    return num_blocks
+
+
+def _add_relative_priors(
+    problem: pyceres.Problem,
+    poses: Mapping[int, PoseBlocks],
+    calibration_vehicle_T_cam: Mapping[int, pycolmap.Rigid3d],
+    pair_counts: Mapping[CameraPairKey, int],
+    information: Information6,
+    costs: list[pyceres.CostFunction],
+    losses: list[pyceres.LossFunction],
+) -> tuple[int, int]:
+    """Add one `relative_extrinsic` block per co-observed camera pair (Eq. 6).
+
+    Each block carries its pair's rig-frame multiplicity through
+    `RepeatedCauchyLoss`, which is exactly equivalent to the blob's repeated blocks
+    (see the module docstring).
+
+    Args:
+        problem: The problem being built.
+        poses: The parameter arrays per `camera_params_id`.
+        calibration_vehicle_T_cam: The calibration the relative measurement comes from.
+        pair_counts: Rig frames per co-observed camera pair.
+        information: The 6x6 weight both prior groups share.
+        costs: Kept-alive list for the cost functions.
+        losses: Kept-alive list for the loss functions.
+
+    Returns:
+        The number of blocks added, and the number of blob blocks they stand for.
+    """
+    num_blocks: int = 0
+    num_frames: int = 0
+    for (lower, higher), count in pair_counts.items():
+        if lower not in poses or higher not in poses:
+            continue
+        # `higher_T_lower`, the calibrated relative pose the blob preserves (Eq. 6).
+        measured: pycolmap.Rigid3d = calibration_vehicle_T_cam[higher].inverse() * calibration_vehicle_T_cam[lower]
+        cost: RelativePoseCost = RelativePoseCost(measured, information)
+        loss: RepeatedCauchyLoss = RepeatedCauchyLoss(count)
+        costs.append(cost)
+        losses.append(loss)
+        problem.add_residual_block(
+            cost,
+            loss,
+            [
+                poses[higher].quat_xyzw,
+                poses[higher].translation,
+                poses[lower].quat_xyzw,
+                poses[lower].translation,
+            ],
+        )
+        num_blocks += 1
+        num_frames += count
+    return num_blocks, num_frames
 
 
 def solve_extrinsics(
@@ -587,6 +870,8 @@ def solve_extrinsics(
     rig_reference: RigReference,
     calibration_vehicle_T_cam: Mapping[int, pycolmap.Rigid3d],
     options: ExtrinsicRefinementOptions | None = None,
+    observations: Mapping[int, CameraObservations] | None = None,
+    pair_counts: Mapping[CameraPairKey, int] | None = None,
 ) -> tuple[dict[int, pycolmap.Rigid3d], ExtrinsicSolveStats]:
     """Refine every free `vehicle_T_cam` with rig poses and points held fixed.
 
@@ -601,7 +886,13 @@ def solve_extrinsics(
         rig_reference: How that rig was built.
         calibration_vehicle_T_cam: `vehicle_T_cam` per `camera_params_id` as the input
             calibration declared it — the mean of both priors.
-        options: Sigmas and solver settings; the defaults when None.
+        options: Sigmas and solver settings; the defaults when None. `refine_extrinsics`
+            derives the sigmas from the mapping configuration before calling this.
+        observations: This round's folded-in observations, from `camera_observations`;
+            gathered here when None. The alternation passes them so the observation
+            index behind them is built once rather than once per round.
+        pair_counts: Co-observed camera pairs, from `co_observed_camera_pairs`; computed
+            here when None. They never change during the alternation.
 
     Returns:
         The refined `vehicle_T_cam` per `camera_params_id`, and what the solve contained.
@@ -611,7 +902,8 @@ def solve_extrinsics(
             reconstruction has no calibration to be primed from.
     """
     resolved: ExtrinsicRefinementOptions = ExtrinsicRefinementOptions() if options is None else options
-    if rig_reference.camera_params_id is None:
+    reference_camera_params_id: int | None = rig_reference.camera_params_id
+    if reference_camera_params_id is None:
         raise ValueError(
             "extrinsic refinement needs a camera-referenced rig: the vehicle-body reference "
             "owns no images, so COLMAP freezes every extrinsic (NOTES.md gotcha 13)"
@@ -623,13 +915,10 @@ def solve_extrinsics(
     if missing:
         raise ValueError(f"no calibration extrinsic for camera_params_id {sorted(missing)}")
 
-    quaternions: dict[int, QuaternionXYZW] = {}
-    translations: dict[int, Vector3] = {}
-    for camera_params_id, vehicle_T_cam in current.items():
-        quat: QuaternionXYZW = np.asarray(vehicle_T_cam.rotation.quat, dtype=np.float64).copy()
-        quaternions[camera_params_id] = quat / np.linalg.norm(quat)
-        translations[camera_params_id] = np.asarray(vehicle_T_cam.translation, dtype=np.float64).copy()
-
+    poses: dict[int, PoseBlocks] = {
+        camera_params_id: pose_parameter_blocks(vehicle_T_cam)
+        for camera_params_id, vehicle_T_cam in current.items()
+    }
     information: Information6 = default_information(
         relative_rotation_sigma_deg=resolved.extrinsic_rotation_sigma_deg,
         relative_translation_sigma_m=resolved.extrinsic_translation_sigma_m,
@@ -639,104 +928,68 @@ def solve_extrinsics(
     # Kept alive for the lifetime of the problem: pyceres holds raw pointers into these.
     costs: list[pyceres.CostFunction] = []
     losses: list[pyceres.LossFunction] = []
+    identity: PoseBlocks = pose_parameter_blocks(pycolmap.Rigid3d())
 
-    observations: dict[int, CameraObservations] = camera_observations(reconstruction, rig_reference)
-    num_reprojection_residuals: int = 0
-    num_reprojection_blocks: int = 0
-    for camera_params_id, camera_obs in observations.items():
-        # The reference camera's extrinsic is the rig origin and never moves, so its
-        # reprojection block would be constant; Ceres would drop it anyway.
-        if camera_params_id == rig_reference.camera_params_id:
-            continue
-        cost: RigReprojectionCost = RigReprojectionCost(camera_obs, resolved.reprojection_sigma_px)
-        costs.append(cost)
-        problem.add_residual_block(cost, None, [quaternions[camera_params_id], translations[camera_params_id]])
-        num_reprojection_blocks += 1
-        num_reprojection_residuals += 2 * int(camera_obs.points_in_vehicle.shape[0])
-
-    identity_quat: QuaternionXYZW = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
-    identity_translation: Vector3 = np.zeros(3, dtype=np.float64)
+    resolved_observations: Mapping[int, CameraObservations] = (
+        camera_observations(reconstruction, rig_reference) if observations is None else observations
+    )
+    num_reprojection_blocks, num_reprojection_residuals = _add_reprojection_blocks(
+        problem,
+        poses,
+        resolved_observations,
+        reference_camera_params_id,
+        resolved.reprojection_sigma_px,
+        costs,
+    )
     num_absolute_blocks: int = 0
     if resolved.use_absolute_prior:
-        for camera_params_id in sorted(current):
-            # The pinned reference camera would give a block whose every parameter is
-            # constant. The blob counts such a block (8 on Galileo, one inert) but Ceres'
-            # `Program::RemoveFixedBlocks` evaluates it with a null residual pointer, which
-            # segfaults the pyceres 2.6 trampoline. It contributes nothing, so it is left out.
-            if camera_params_id == rig_reference.camera_params_id:
-                continue
-            # `RelativePoseCost` against a constant identity source IS the absolute prior:
-            # its error is `measurement^-1 * (I^-1 * vehicle_T_cam)`.
-            absolute_cost: RelativePoseCost = RelativePoseCost(
-                calibration_vehicle_T_cam[camera_params_id], information
-            )
-            absolute_loss: pyceres.CauchyLoss = pyceres.CauchyLoss(1.0)
-            costs.append(absolute_cost)
-            losses.append(absolute_loss)
-            problem.add_residual_block(
-                absolute_cost,
-                absolute_loss,
-                [identity_quat, identity_translation, quaternions[camera_params_id], translations[camera_params_id]],
-            )
-            num_absolute_blocks += 1
-    if num_absolute_blocks:
-        problem.set_parameter_block_constant(identity_quat)
-        problem.set_parameter_block_constant(identity_translation)
-
-    pair_counts: dict[CameraPairKey, int] = co_observed_camera_pairs(reconstruction) if resolved.use_relative_prior else {}
-    num_relative_blocks: int = 0
-    num_relative_frames: int = 0
-    for (lower, higher), count in pair_counts.items():
-        if lower not in quaternions or higher not in quaternions:
-            continue
-        # `higher_T_lower`, the calibrated relative pose the blob preserves (Eq. 6).
-        measured: pycolmap.Rigid3d = (
-            calibration_vehicle_T_cam[higher].inverse() * calibration_vehicle_T_cam[lower]
+        num_absolute_blocks = _add_absolute_priors(
+            problem, poses, calibration_vehicle_T_cam, reference_camera_params_id, information, identity, costs, losses
         )
-        relative_cost: RelativePoseCost = RelativePoseCost(measured, information)
-        relative_loss: RepeatedCauchyLoss = RepeatedCauchyLoss(count)
-        costs.append(relative_cost)
-        losses.append(relative_loss)
-        problem.add_residual_block(
-            relative_cost,
-            relative_loss,
-            [quaternions[higher], translations[higher], quaternions[lower], translations[lower]],
-        )
-        num_relative_blocks += 1
-        num_relative_frames += count
+    resolved_pairs: Mapping[CameraPairKey, int] = {}
+    if resolved.use_relative_prior:
+        resolved_pairs = co_observed_camera_pairs(reconstruction) if pair_counts is None else pair_counts
+    num_relative_blocks, num_relative_frames = _add_relative_priors(
+        problem, poses, calibration_vehicle_T_cam, resolved_pairs, information, costs, losses
+    )
 
-    for camera_params_id, quat in quaternions.items():
-        if problem.has_parameter_block(quat):
-            problem.set_manifold(quat, manifold)
-        if camera_params_id == rig_reference.camera_params_id and problem.has_parameter_block(quat):
-            problem.set_parameter_block_constant(quat)
-            problem.set_parameter_block_constant(translations[camera_params_id])
+    attach_quaternion_manifolds(
+        problem, {camera_params_id: blocks.quat_xyzw for camera_params_id, blocks in poses.items()}, manifold
+    )
+    reference_blocks: PoseBlocks = poses[reference_camera_params_id]
+    if problem.has_parameter_block(reference_blocks.quat_xyzw):
+        problem.set_parameter_block_constant(reference_blocks.quat_xyzw)
+        problem.set_parameter_block_constant(reference_blocks.translation)
 
-    ceres_options: pyceres.SolverOptions = pyceres.SolverOptions()
-    ceres_options.linear_solver_type = pyceres.LinearSolverType.SPARSE_NORMAL_CHOLESKY
-    ceres_options.max_num_iterations = resolved.max_num_iterations
-    ceres_options.num_threads = resolved.num_threads
-    ceres_options.minimizer_progress_to_stdout = False
     summary: pyceres.SolverSummary = pyceres.SolverSummary()
-    pyceres.solve(ceres_options, problem, summary)
+    pyceres.solve(
+        solver_options(
+            CeresSolveOptions(
+                linear_solver=EXTRINSIC_LINEAR_SOLVER,
+                max_num_iterations=resolved.max_num_iterations,
+                num_threads=resolved.num_threads,
+            )
+        ),
+        problem,
+        summary,
+    )
 
-    refined: dict[int, pycolmap.Rigid3d] = {}
-    for camera_params_id, quat in quaternions.items():
-        unit: QuaternionXYZW = quat / np.linalg.norm(quat)
-        refined[camera_params_id] = pycolmap.Rigid3d(
-            pycolmap.Rotation3d(unit), translations[camera_params_id].copy()
-        )
+    refined: dict[int, pycolmap.Rigid3d] = {
+        camera_params_id: rigid3d_from_parameter_blocks(blocks.quat_xyzw, blocks.translation)
+        for camera_params_id, blocks in poses.items()
+    }
+    solved: SolverStats = solver_stats(summary)
     stats: ExtrinsicSolveStats = ExtrinsicSolveStats(
-        num_cameras=len(quaternions),
+        num_cameras=len(poses),
         num_reprojection_blocks=num_reprojection_blocks,
         num_reprojection_residuals=num_reprojection_residuals,
         num_absolute_prior_blocks=num_absolute_blocks,
         num_relative_prior_blocks=num_relative_blocks,
         num_relative_prior_frames=num_relative_frames,
-        iterations=int(summary.num_successful_steps) + int(summary.num_unsuccessful_steps),
-        initial_cost=float(summary.initial_cost),
-        final_cost=float(summary.final_cost),
-        termination=str(summary.termination_type).rsplit(".", maxsplit=1)[-1],
+        iterations=solved.iterations,
+        initial_cost=solved.initial_cost,
+        final_cost=solved.final_cost,
+        termination=solved.termination,
         seconds=time.perf_counter() - started,
     )
     return refined, stats
@@ -792,7 +1045,8 @@ def extrinsic_deltas(
             continue
         updated: pycolmap.Rigid3d = after[camera_params_id]
         translation_mm.append(
-            float(np.linalg.norm(np.asarray(updated.translation) - np.asarray(previous.translation))) * 1e3
+            float(np.linalg.norm(np.asarray(updated.translation) - np.asarray(previous.translation)))
+            * MILLIMETRES_PER_METRE
         )
         rotation_deg.append(float(np.rad2deg((previous.rotation.inverse() * updated.rotation).angle())))
     if not translation_mm:
@@ -806,78 +1060,109 @@ def extrinsic_deltas(
 
 
 def refine_extrinsics(
-    reconstruction: pycolmap.Reconstruction,
+    mapping: MappingResult,
     database_path: Path,
     mapping_config: VisionMappingConfig,
-    ba_config: BundleAdjustmentConfig,
     mapping_options: MappingOptions,
-    rig_reference: RigReference,
     calibration_vehicle_T_cam: Mapping[int, pycolmap.Rigid3d],
     options: ExtrinsicRefinementOptions | None = None,
 ) -> ExtrinsicRefinementResult:
-    """Map the scene, then alternate extrinsics-only solves with bundle adjustment.
+    """Alternate extrinsics-only solves with bundle adjustment, on an already-mapped model.
 
     ```
-    run_mapping(..., optimize_extrinsics=False)          # the base pass
+    (the caller has already run run_mapping on a camera-referenced model)
     for k in 0 .. num_rounds - 1:
         (A) solve_extrinsics(...)                        # poses and points frozen
         (B) bundle adjustment with sensor_from_rig fixed # extrinsics frozen
         stop when this round moved no extrinsic past the tolerances
     ```
 
+    The mapping pass is the caller's, not this function's: under
+    `--optimize-extrinsics` the pipeline builds **one** camera-referenced `PosedModel`,
+    maps it once and hands the adjusted result here, instead of mapping the same
+    database twice.
+
     With `options.regularised` False the whole thing collapses to
-    `run_mapping(..., optimize_extrinsics=True)`, the unregularised pycolmap path.
+    `run_mapping(..., optimize_extrinsics=True)` — the unregularised pycolmap path,
+    kept for comparison — run on that same already-adjusted model.
+
+    The three sigmas and the iteration ceiling in `options` are **overridden** from
+    `mapping_config.bundle_adjustment`: the pyceres problem and the pycolmap bundle
+    adjustment it alternates with have to whiten by the same numbers, and the
+    configuration is the authority on what those are.
 
     Args:
-        reconstruction: A camera-referenced, posed reconstruction to map and adjust.
-        database_path: COLMAP database with keypoints and verified two-view geometries.
-        mapping_config: `vision_mapping_config.pb.txt`.
-        ba_config: The `BundleAdjustmentConfig` inside it.
+        mapping: What `run_mapping` returned for a camera-referenced `PosedModel`; its
+            reconstruction is adjusted further, in place.
+        database_path: COLMAP database with keypoints and verified two-view geometries;
+            read only by the unregularised path.
+        mapping_config: `vision_mapping_config.pb.txt`, including the
+            `BundleAdjustmentConfig` every sigma comes from.
         mapping_options: Command-line style mapper knobs; `optimize_extrinsics` is
             overridden by this function.
-        rig_reference: How the reconstruction's rig was built.
         calibration_vehicle_T_cam: The input `vehicle_T_cam` per `camera_params_id`, which
             is what both priors pull towards.
         options: Refinement settings; the defaults when None.
 
     Returns:
-        The refined extrinsics, the updated mapping result and the per-round statistics.
+        The updated mapping result and the per-round statistics; the refined extrinsics
+        are read off the result's own model.
     """
-    resolved: ExtrinsicRefinementOptions = ExtrinsicRefinementOptions() if options is None else options
+    ba_config: BundleAdjustmentConfig = mapping_config.bundle_adjustment
+    resolved: ExtrinsicRefinementOptions = dataclasses.replace(
+        ExtrinsicRefinementOptions() if options is None else options,
+        extrinsic_translation_sigma_m=ba_config.extrinsic_error_meters,
+        extrinsic_rotation_sigma_deg=ba_config.extrinsic_error_degrees,
+        reprojection_sigma_px=ba_config.reprojection_error_standard_deviation,
+        max_num_iterations=ba_config.max_num_iterations,
+    )
+    reconstruction: pycolmap.Reconstruction = mapping.reconstruction
+    rig_reference: RigReference = mapping.reference
     started: float = time.perf_counter()
 
     if not resolved.regularised:
         unregularised: MappingResult = run_mapping(
-            reconstruction,
+            PosedModel(reconstruction=reconstruction, reference=rig_reference),
             database_path,
             mapping_config,
-            ba_config,
             dataclasses.replace(mapping_options, optimize_extrinsics=True),
-            rig_reference=rig_reference,
         )
-        assert unregularised.refined_extrinsics is not None, "run_mapping returns them whenever it refines"
         return ExtrinsicRefinementResult(
-            mapping=unregularised,
-            refined_extrinsics=unregularised.refined_extrinsics,
+            mapping=dataclasses.replace(
+                unregularised,
+                bundle_adjustment_seconds=mapping.bundle_adjustment_seconds
+                + unregularised.bundle_adjustment_seconds,
+                total_seconds=mapping.total_seconds + (time.perf_counter() - started),
+            ),
             rounds=(),
             converged=True,
             regularised=False,
-            seconds=time.perf_counter() - started,
         )
 
     base_options: MappingOptions = dataclasses.replace(mapping_options, optimize_extrinsics=False)
-    mapping: MappingResult = run_mapping(reconstruction, database_path, mapping_config, ba_config, base_options)
-    # The same gauge `run_mapping` picked for the base pass: the frame owning the lowest
-    # registered image id, which is cuSFM's own choice (spec §6.3).
+    # The same gauge `run_mapping` picked for the mapping pass: the frame owning the
+    # lowest registered image id, which is cuSFM's own choice (spec §6.3).
     gauge_frame_id: int = reconstruction.image(min(registered_image_ids(reconstruction))).frame_id
     ba_options: pycolmap.BundleAdjustmentOptions = bundle_adjustment_options(ba_config, base_options)
+    # Neither of these changes across the rounds: bundle adjustment moves poses and
+    # points but adds and removes no observation, so which image saw which point — and
+    # therefore which cameras co-observed — is fixed. Only the geometry is re-gathered.
+    observation_index: dict[int, CameraObservationIndex] = build_observation_index(reconstruction)
+    pair_counts: dict[CameraPairKey, int] = co_observed_camera_pairs(reconstruction)
 
     rounds: list[ExtrinsicRefinementRound] = []
     converged: bool = False
     for round_index in range(resolved.num_rounds):
         round_started: float = time.perf_counter()
         before: dict[int, pycolmap.Rigid3d] = rig_reference.vehicle_T_cam_by_camera_params_id(reconstruction)
-        refined, stats = solve_extrinsics(reconstruction, rig_reference, calibration_vehicle_T_cam, resolved)
+        refined, stats = solve_extrinsics(
+            reconstruction,
+            rig_reference,
+            calibration_vehicle_T_cam,
+            resolved,
+            observations=camera_observations(reconstruction, rig_reference, observation_index),
+            pair_counts=pair_counts,
+        )
         apply_extrinsics(reconstruction, rig_reference, refined)
         _, ba_seconds = solve_bundle_adjustment(reconstruction, ba_options, gauge_frame_id, None)
         reconstruction.update_point_3d_errors()
@@ -909,23 +1194,16 @@ def refine_extrinsics(
             converged = True
             break
 
-    final_extrinsics: dict[int, pycolmap.Rigid3d] = rig_reference.vehicle_T_cam_by_camera_params_id(reconstruction)
+    # Only the timings and the "extrinsics moved" flag need replacing: every count on a
+    # `MappingResult` is a property over this very reconstruction, so they are already up
+    # to date with the alternation that just finished.
     updated: MappingResult = dataclasses.replace(
         mapping,
-        num_points3D=reconstruction.num_points3D(),
-        num_observations=reconstruction.compute_num_observations(),
-        mean_reprojection_error_px=reconstruction.compute_mean_reprojection_error(),
-        mean_track_length=reconstruction.compute_mean_track_length(),
         bundle_adjustment_seconds=mapping.bundle_adjustment_seconds
         + sum(round_stats.bundle_adjustment_seconds for round_stats in rounds),
-        total_seconds=time.perf_counter() - started,
-        refined_extrinsics=final_extrinsics,
+        total_seconds=mapping.total_seconds + (time.perf_counter() - started),
+        extrinsics_refined=True,
     )
     return ExtrinsicRefinementResult(
-        mapping=updated,
-        refined_extrinsics=final_extrinsics,
-        rounds=tuple(rounds),
-        converged=converged,
-        regularised=True,
-        seconds=time.perf_counter() - started,
+        mapping=updated, rounds=tuple(rounds), converged=converged, regularised=True
     )

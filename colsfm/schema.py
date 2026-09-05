@@ -20,6 +20,8 @@ from typing import Final, Protocol, TypeAlias, runtime_checkable
 from google.protobuf import descriptor, descriptor_pb2, descriptor_pool, message_factory
 from google.protobuf.message import Message
 
+from colsfm import REPO_ROOT
+
 MessageClass: TypeAlias = type[Message]
 """A protobuf message class built at runtime from a descriptor."""
 
@@ -45,9 +47,6 @@ class DescriptorPoolLike(Protocol):
         """Look up an enum descriptor by fully qualified name."""
         ...
 
-
-REPO_ROOT: Final[Path] = Path(__file__).resolve().parent.parent
-"""Repo root, so the vendored schema resolves regardless of the working directory."""
 
 DEFAULT_DESCRIPTOR_SET_PATH: Final[Path] = REPO_ROOT / "data" / "cusfm_schema" / "cusfm_protos.fdset"
 """Vendored `FileDescriptorSet` covering all 21 cuSFM binaries."""
@@ -108,6 +107,11 @@ def build_schema(descriptor_set_path: Path) -> CusfmSchema:
     of the process-wide registry, so importing this alongside any other protobuf
     schema cannot collide.
 
+    The set is added in file order and every failure propagates. `tools/extract_cusfm_schema.py`
+    already emits the files in dependency order, so a file whose imports do not resolve is a
+    corrupt or stale descriptor set rather than an ordering problem — the retry-to-fixpoint
+    loop this replaced could only turn that into a confusing `ValueError` several seconds later.
+
     Args:
         descriptor_set_path: Serialised `FileDescriptorSet` on disk.
 
@@ -116,7 +120,8 @@ def build_schema(descriptor_set_path: Path) -> CusfmSchema:
 
     Raises:
         FileNotFoundError: When the descriptor set is missing.
-        ValueError: When the set's files cannot be ordered so imports resolve.
+        TypeError: When a file's imports are not already in the pool, i.e. the set
+            is not in dependency order.
     """
     if not descriptor_set_path.is_file():
         raise FileNotFoundError(
@@ -124,21 +129,9 @@ def build_schema(descriptor_set_path: Path) -> CusfmSchema:
         )
     file_set: descriptor_pb2.FileDescriptorSet = descriptor_pb2.FileDescriptorSet.FromString(descriptor_set_path.read_bytes())
     pool: DescriptorPoolLike = descriptor_pool.DescriptorPool()
-    remaining: list[descriptor_pb2.FileDescriptorProto] = list(file_set.file)
-    added: list[str] = []
-    while remaining:
-        previous_count: int = len(remaining)
-        for file_descriptor in remaining.copy():
-            try:
-                pool.Add(file_descriptor)
-            except TypeError:
-                continue
-            added.append(file_descriptor.name)
-            remaining.remove(file_descriptor)
-        if len(remaining) == previous_count:
-            unresolved: list[str] = [file_descriptor.name for file_descriptor in remaining]
-            raise ValueError(f"Could not resolve protobuf dependencies for {unresolved}")
-    return CusfmSchema(pool=pool, proto_file_names=tuple(added))
+    for file_descriptor in file_set.file:
+        pool.Add(file_descriptor)
+    return CusfmSchema(pool=pool, proto_file_names=tuple(file_descriptor.name for file_descriptor in file_set.file))
 
 
 @lru_cache(maxsize=None)

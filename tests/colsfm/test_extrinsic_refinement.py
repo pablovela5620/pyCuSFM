@@ -23,6 +23,7 @@ import pycolmap
 import pytest
 from jaxtyping import Float
 from numpy import ndarray
+from scipy.spatial.transform import Rotation
 
 from colsfm.config import BundleAdjustmentConfig, CusfmConfig, read_config_directory
 from colsfm.extrinsic_refinement import (
@@ -87,15 +88,7 @@ def _look_at(position_xyz: Vector3, yaw_deg: float) -> pycolmap.Rigid3d:
     Returns:
         The `vehicle_T_cam` transform.
     """
-    yaw_rad: float = float(np.deg2rad(yaw_deg))
-    about_z: Matrix3 = np.array(
-        [
-            [np.cos(yaw_rad), -np.sin(yaw_rad), 0.0],
-            [np.sin(yaw_rad), np.cos(yaw_rad), 0.0],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=np.float64,
-    )
+    about_z: Matrix3 = Rotation.from_euler("z", yaw_deg, degrees=True).as_matrix()
     # Camera looks along its own +Z; the vehicle frame is FLU, so a camera pointing
     # forward has vehicle axes (x, y, z) = (right, down, forward) mapped accordingly.
     forward_looking: Matrix3 = np.array(
@@ -127,15 +120,7 @@ def _world_T_vehicle_at(frame_index: int) -> pycolmap.Rigid3d:
     Returns:
         The `world_T_vehicle` transform.
     """
-    yaw_rad: float = float(np.deg2rad(6.0 * frame_index))
-    world_R_vehicle: Matrix3 = np.array(
-        [
-            [np.cos(yaw_rad), -np.sin(yaw_rad), 0.0],
-            [np.sin(yaw_rad), np.cos(yaw_rad), 0.0],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=np.float64,
-    )
+    world_R_vehicle: Matrix3 = Rotation.from_euler("z", 6.0 * frame_index, degrees=True).as_matrix()
     return pycolmap.Rigid3d(
         pycolmap.Rotation3d(world_R_vehicle), np.array([0.5 * frame_index, 0.0, 0.0], dtype=np.float64)
     )
@@ -602,7 +587,7 @@ def test_the_relative_prior_alone_still_pulls_towards_the_calibration() -> None:
     assert moved_mm < 1.0
 
 
-def test_apply_extrinsics_round_trips_through_the_rig(rig_scene: RigScene) -> None:
+def test_apply_extrinsics_round_trips_through_the_rig() -> None:
     """Writing extrinsics into the rig and reading them back must be the identity."""
     scene: RigScene = build_rig_scene(num_frames=2)
     wanted: dict[int, pycolmap.Rigid3d] = {

@@ -14,7 +14,7 @@ Two backends, chosen by sequence length
 `brute_force_max_images` (500) images, **vocab** above it. Both produce the same
 `RetrievalIndex` — a symmetric `[0, 1]` score matrix over the indexed images — so
 `query`, `score` and every consumer are backend-agnostic. What differs is the score's
-definition, and therefore its calibration; see `default_good_score_threshold`.
+definition, and therefore its calibration; see `GOOD_SCORE_THRESHOLD`.
 
 **Brute force** (`docs/spec/bow.md` §9.4 Option A) scores a pair by the
 **mutual-nearest-neighbour vote ratio**:
@@ -29,17 +29,18 @@ near 0.
 
 **Vocab** (`docs/spec/bow.md` §9.4 Option C, minus the parts §9.3 says to drop) trains a
 hierarchical k-means vocabulary, encodes each image as an L1-normalised TF-IDF vector and
-scores a pair with the blob's own DBoW2 L1 score (§7.4, §9.5).
+scores a pair with the blob's own DBoW2 L1 score (§7.4, §9.5). It lives in
+`colsfm.vocab_tree`; this module owns only the backend choice and the calibration.
 
 Why brute force does not scale, measured
 ----------------------------------------
 
 The brute force is `(n_images * n_descriptors)^2 * 128` inner products, so
-`RetrievalConfig.max_total_descriptors` caps the per-image count at
+`BruteForceConfig.max_total_descriptors` caps the per-image count at
 `max_total_descriptors // n_images`. That is the knee at Galileo's 226 images (256
 descriptors each, 9.4 s) and it **breaks down** on RoboCap: 4528 images leave 22
 descriptors per image, the largest off-diagonal score is 0.227, and after the loop stage's
-temporal gate nothing clears `good_score_threshold` at all — zero loop candidates on a
+temporal gate nothing clears `GOOD_SCORE_THRESHOLD` at all — zero loop candidates on a
 124 m walk with 90 genuine revisits. Raising the cap is not a fix: giving those 4528 images
 Galileo's 256 descriptors each costs 3.4e14 FLOP, about 40 minutes at this machine's
 measured 147 GFLOP/s float32 GEMM, and using every descriptor — which is what the vocab
@@ -58,6 +59,29 @@ top-1 in the same or the stereo-paired camera / a top-3 candidate within 2 rig f
 Note that `docs/spec/bow.md` §9.4's "a couple of seconds on CPU" for Option A assumes a
 `faiss.IndexFlatIP`. faiss is **not** in the `colsfm` environment and neither is torch, so
 that figure does not transfer.
+
+Is the brute-force backend worth keeping? Measured on Galileo, both backends
+--------------------------------------------------------------------------
+
+The reuse review proposed dropping the brute force and running one backend everywhere, so
+both were measured on the same 226 Galileo keyframes and the same 2048 shipped ALIKED
+descriptors each (`data/cusfm_runs/galileo/cusfm/keyframes`), on this machine:
+
+| backend | build | descriptors per image | top-1 within 2 rigs | top-3 within 2 rigs | same-or-stereo camera | median best score |
+|---|---|---|---|---|---|---|
+| brute force (what `auto` picks here) | 11.0 s | 256 of 2048 | 194/226 | 222/226 | 226/226 | 0.148 |
+| vocab | 7.4 s | 2048, all of them | **222/226** | **226/226** | 226/226 | 0.373 |
+
+All 226 queries cost under 0.01 s on either index, because both score every pair during the
+build.
+
+The vocabulary is both faster to build and more accurate here, so the *quality* argument for
+keeping two backends is gone: `brute_force_max_images` no longer buys recall, only a second
+score definition to calibrate. What it still buys is a path whose behaviour on a short
+sequence is measured rather than extrapolated, and the vocabulary's own accuracy depends on
+a k-means fit that a 226-image corpus barely trains. The decision is left open deliberately:
+the numbers above are what it should be made on, and dropping `brute_force` would also drop
+`BruteForceConfig`, `RetrievalConfig.backend` and `brute_force_max_images` with it.
 
 The vocabulary tree, and why it is not the blob's
 -------------------------------------------------
@@ -82,18 +106,11 @@ follow cost 1.4 s together, because the scoring already happened. For comparison
 spends 162.4 s on the vocabulary, 81.0 s on the index and 75.7 s on the association stage
 (`docs/open-pipeline-plan.md`).
 
-On Galileo's 226 images the vocab backend is also the **more accurate** of the two — top-1
-within 2 rig frames for 222/226 keyframes against the brute force's 194/226, and 226/226 in
-the same or the stereo-paired camera either way. `brute_force_max_images` is therefore about
-cost and about which path has a recall figure measured on the shipped data, not about
-quality: below 500 images the brute force has no vocabulary to over-fit to a short sequence
-and its descriptor budget still buys 256 rows per image, so it stays the default there.
-
 **Descriptors are not subsampled on the vocab path**, and that is a measured decision, not
 an oversight. Keeping 512 per image cuts the build to 20.3 s but moves the median gated
 best score from 0.153 to 0.069 — the L1 score counts *shared* words, so thinning the
 descriptors thins the overlap and silently rescales the score out from under
-`good_score_threshold`. Using every descriptor is also what the blob does (§6.3: "no
+`GOOD_SCORE_THRESHOLD`. Using every descriptor is also what the blob does (§6.3: "no
 sampling, no capping"), which is what keeps its 0.1 threshold meaningful here.
 
 What is deliberately not copied from `docs/spec/bow.md`
@@ -112,6 +129,9 @@ What is deliberately not copied from `docs/spec/bow.md`
   add a second threshold to tune for no measured gain.
 * The `VocabularyNode` slab format, BIRCH incremental building, `apply_merge_before_split`
   and the 2 GB shard split (§9.3).
+* Detector-response-weighted subsampling. `_subsample` takes an even stride, because the
+  blob's `Keyframe` proto carries no per-keypoint score (`docs/spec/feature_extractor_main.md`
+  §4) and no caller ever had one to offer.
 
 Extension point for Option B (global descriptors)
 -------------------------------------------------
@@ -127,27 +147,15 @@ covers all 90 of the blob's RoboCap loop pairs.
 from __future__ import annotations
 
 import time
-import warnings
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from pathlib import Path
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Final, Literal, TypeAlias
 
 import numpy as np
-import pycolmap
-from jaxtyping import Bool, Float32, Int32, Int64
+from jaxtyping import Bool, Float32, Int32
 from numpy import ndarray
-from scipy import sparse
-from scipy.cluster.vq import kmeans2
 
-Descriptors: TypeAlias = Float32[ndarray, "n_descriptors descriptor_dim"]
-"""One image's local descriptors, one row each. ALIKED emits 128-d L2-normalised rows."""
-
-DescriptorScores: TypeAlias = Float32[ndarray, "n_descriptors"]
-"""Per-descriptor detector responses, used to pick which descriptors survive subsampling."""
-
-SimilarityMatrix: TypeAlias = Float32[ndarray, "n_images n_images"]
-"""Symmetric image-to-image scores in `[0, 1]`, with 1.0 on the diagonal."""
+from colsfm.vocab_tree import DEFAULT_VOCAB_CONFIG, Descriptors, SimilarityMatrix, VocabConfig, vocab_similarity
 
 RetrievalBackend: TypeAlias = Literal["auto", "brute_force", "vocab"]
 """How `build_retrieval_index` builds the score matrix; `auto` picks by image count."""
@@ -158,45 +166,38 @@ ResolvedBackend: TypeAlias = Literal["brute_force", "vocab"]
 ALIKED_DESCRIPTOR_DIM: Final[int] = 128
 """Descriptor width `feature_extractor_main` writes (`docs/spec/feature_extractor_main.md` §4)."""
 
-GOOD_SCORE_THRESHOLD: Final[Mapping[ResolvedBackend, float]] = {"brute_force": 0.1, "vocab": 0.1}
-"""Retrieval score a candidate must clear, per backend. See `default_good_score_threshold`."""
+GOOD_SCORE_THRESHOLD: Final[float] = 0.1
+"""Retrieval score a loop candidate must clear, on either backend.
 
+The two backends produce different quantities — a mutual-nearest-neighbour vote ratio and
+the blob's DBoW2 L1 score — so the value was calibrated twice, independently, and both
+calibrations landed on 0.1:
 
-def default_good_score_threshold(backend: ResolvedBackend) -> float:
-    """The measured `good_score_threshold` for one backend.
+* **brute_force** — 0.1 is the blob's own number reused; on Galileo the median keyframe's
+  best score is 0.15 and the median pair is below 0.02, so the gate separates near views
+  from far ones.
+* **vocab** — the blob's own DBoW2 L1 score, so the blob's own 0.1
+  (`docs/spec/generate_association_main.md` §7.1 item 4) transfers by construction, and it
+  was re-measured rather than assumed. On RoboCap's 4528 images, bucketing every top-20 hit
+  that survives the loop stage's 12.1 s temporal gate by the distance between the two rig
+  frames:
 
-    The two backends' scores are different quantities and had to be calibrated separately,
-    even though both land on 0.1:
+  | score | hits | median distance | within 1 m | within 3 m |
+  |---|---|---|---|---|
+  | [0.00, 0.05) | 742 | 2.84 m | 12 % | 55 % |
+  | [0.05, 0.10) | 31 251 | 0.95 m | 52 % | 84 % |
+  | [0.10, 0.15) | 35 555 | 0.54 m | 88 % | 99 % |
+  | [0.15, 0.20) | 16 622 | 0.43 m | 95 % | 100 % |
+  | [0.20, 1.00) | 6 390 | 0.37 m | 99 % | 100 % |
 
-    * **brute_force** — a mutual-nearest-neighbour vote ratio. 0.1 is the blob's number
-      reused; on Galileo the median keyframe's best score is 0.15 and the median pair is
-      below 0.02, so the gate separates near views from far ones.
-    * **vocab** — the blob's own DBoW2 L1 score, so the blob's own 0.1
-      (`docs/spec/generate_association_main.md` §7.1 item 4) transfers by construction, and
-      it was re-measured rather than assumed. On RoboCap's 4528 images, bucketing every
-      top-20 hit that survives the loop stage's 12.1 s temporal gate by the distance
-      between the two rig frames:
+  0.1 is where precision jumps from 52 % to 88 %, so it is the knee, not an inherited
+  constant. Raise it to 0.15 to cut the pairs handed to the matcher roughly in half at
+  95 % precision; the recall headroom is there, because the gated top-20 covers all 90 of
+  the blob's RoboCap loop pairs at either setting.
 
-      | score | hits | median distance | within 1 m | within 3 m |
-      |---|---|---|---|---|
-      | [0.00, 0.05) | 742 | 2.84 m | 12 % | 55 % |
-      | [0.05, 0.10) | 31 251 | 0.95 m | 52 % | 84 % |
-      | [0.10, 0.15) | 35 555 | 0.54 m | 88 % | 99 % |
-      | [0.15, 0.20) | 16 622 | 0.43 m | 95 % | 100 % |
-      | [0.20, 1.00) | 6 390 | 0.37 m | 99 % | 100 % |
-
-      0.1 is where precision jumps from 52 % to 88 %, so it is the knee, not an inherited
-      constant. Raise it to 0.15 to cut the pairs handed to the matcher roughly in half at
-      95 % precision; the recall headroom is there, because the gated top-20 covers all 90
-      of the blob's RoboCap loop pairs at either setting.
-
-    Args:
-        backend: The resolved backend of the index that produced the scores.
-
-    Returns:
-        The threshold in `[0, 1]`.
-    """
-    return GOOD_SCORE_THRESHOLD[backend]
+Because both numbers are the same, `RetrievalIndex` carries no per-backend threshold and
+`LoopClosureConfig.good_score_threshold` resolves to this constant; `RetrievalIndex.backend`
+stays, so a run can still report which score definition produced its numbers."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,57 +213,36 @@ class Candidate:
 
 
 @dataclass(frozen=True, slots=True)
-class RetrievalConfig:
-    """Knobs for both retrieval backends."""
+class RetrievalQuery:
+    """One `RetrievalIndex.search` answer: the hits, and what the temporal gate cost it."""
 
-    backend: RetrievalBackend = "auto"
-    """Which index to build. `auto` takes `brute_force` at or below
-    `brute_force_max_images` and `vocab` above it, because brute force is quadratic in the
-    image count and its descriptor budget collapses on a long sequence; see the module
-    docstring."""
-    brute_force_max_images: int = 500
-    """Image count at which `auto` switches to the vocab backend. Galileo's 226 images stay
-    on brute force, whose recall is measured there; RoboCap's 4528 do not, because at that
-    length `max_total_descriptors` leaves 22 descriptors per image and every score
-    collapses."""
-    seed: int = 0
-    """Seed for the vocabulary's training subsample and k-means. The vocab backend is
-    deterministic given this seed; the blob's is not, because it seeds libc `rand()` with
-    nothing (`docs/spec/bow.md` §6.5)."""
+    candidates: list[Candidate]
+    """Hits that passed the temporal gate, best first."""
+    rejected_by_time: int
+    """Hits the temporal gate dropped while filling `candidates`.
+
+    Counted inside the same ranking walk that produced the hits, so a caller's funnel
+    reconciles: `len(candidates) + rejected_by_time` is everything the index looked at."""
+
+
+@dataclass(frozen=True, slots=True)
+class BruteForceConfig:
+    """Settings of the mutual-nearest-neighbour backend."""
+
     max_descriptors_per_image: int = 256
-    """`brute_force` only. Upper bound on descriptors kept per image; the measured knee of
-    the recall/runtime curve on Galileo. The vocab backend uses every descriptor, because
-    thinning them rescales the L1 score (module docstring)."""
+    """Upper bound on descriptors kept per image; the measured knee of the recall/runtime
+    curve on Galileo. The vocab backend uses every descriptor, because thinning them
+    rescales the L1 score (module docstring)."""
     max_total_descriptors: int = 100_000
-    """`brute_force` only. Global cap, so the quadratic pass stays inside the runtime
-    budget. The per-image count becomes
-    `min(max_descriptors_per_image, max_total_descriptors // n_images)`."""
+    """Global cap, so the quadratic pass stays inside the runtime budget. The per-image
+    count becomes `min(max_descriptors_per_image, max_total_descriptors // n_images)`."""
     min_descriptor_similarity: float = 0.9
-    """`brute_force` only. Cosine floor a mutual pair must clear to vote. Measured on
-    Galileo: dropping the floor moves top-1-within-2-rig-frames from 194/226 down to
-    146/226, because unrelated images always produce a few mutual pairs by chance."""
+    """Cosine floor a mutual pair must clear to vote. Measured on Galileo: dropping the
+    floor moves top-1-within-2-rig-frames from 194/226 down to 146/226, because unrelated
+    images always produce a few mutual pairs by chance."""
     similarity_chunk_elements: int = 40_000_000
-    """`brute_force` only. Roughly how many float32 similarities to hold at once (~160 MB).
-    Only affects peak memory and cache behaviour, never the result."""
-    vocab_branching: int = 10
-    """`vocab` only. Children per vocabulary-tree node. The blob uses 9
-    (`docs/spec/bow.md` §3); 10 is the same thing with round word counts."""
-    vocab_depth: int = 5
-    """`vocab` only. Tree levels, so the vocabulary holds `vocab_branching ** vocab_depth`
-    words — 100 000 here. Measured against depth 4 on RoboCap: same top-1 recall, 1.6x
-    faster to build and a median IDF of 4.83 instead of 1.94. The blob's depth 7 is
-    degenerate (`docs/spec/bow.md` §6.8) and is not copied. Lowered automatically when the
-    training sample cannot fill the tree."""
-    vocab_training_descriptors: int = 200_000
-    """`vocab` only. Descriptors drawn (seeded, evenly across images) to train the tree.
-    200 000 trains in 6.0 s against 13.6 s for 500 000, with no measurable recall
-    difference on RoboCap."""
-    vocab_kmeans_iterations: int = 10
-    """`vocab` only. Lloyd iterations per node, matching
-    `weighted_kmeans_max_number_of_iterations` (`docs/spec/bow.md` §6.5)."""
-    vocab_assign_chunk_descriptors: int = 1_000_000
-    """`vocab` only. Descriptors held in memory per assignment pass (~500 MB at 128-d).
-    Only affects peak memory, never the result."""
+    """Roughly how many float32 similarities to hold at once (~160 MB). Only affects peak
+    memory and cache behaviour, never the result."""
 
     def __post_init__(self) -> None:
         """Reject settings that would produce an empty or meaningless index.
@@ -279,18 +259,48 @@ class RetrievalConfig:
             raise ValueError(f"min_descriptor_similarity must be a cosine in [-1, 1], got {self.min_descriptor_similarity}")
         if self.similarity_chunk_elements < 1:
             raise ValueError(f"similarity_chunk_elements must be at least 1, got {self.similarity_chunk_elements}")
+
+
+DEFAULT_BRUTE_FORCE_CONFIG: BruteForceConfig = BruteForceConfig()
+"""Shared immutable default, so `RetrievalConfig` holds no constructor call."""
+
+
+@dataclass(frozen=True, slots=True)
+class RetrievalConfig:
+    """Which retrieval backend to build, and the settings of each.
+
+    The two backends share nothing but the seed, so their knobs live in their own
+    dataclasses: a flat config invited every reader to wonder which of ten fields the
+    backend they chose actually reads.
+    """
+
+    backend: RetrievalBackend = "auto"
+    """Which index to build. `auto` takes `brute_force` at or below
+    `brute_force_max_images` and `vocab` above it, because brute force is quadratic in the
+    image count and its descriptor budget collapses on a long sequence; see the module
+    docstring."""
+    brute_force_max_images: int = 500
+    """Image count at which `auto` switches to the vocab backend. Galileo's 226 images stay
+    on brute force, whose recall is measured there; RoboCap's 4528 do not, because at that
+    length `BruteForceConfig.max_total_descriptors` leaves 22 descriptors per image and
+    every score collapses."""
+    seed: int = 0
+    """Seed for the vocabulary's training subsample and k-means. The vocab backend is
+    deterministic given this seed; the blob's is not, because it seeds libc `rand()` with
+    nothing (`docs/spec/bow.md` §6.5). The brute force is deterministic regardless."""
+    brute_force: BruteForceConfig = DEFAULT_BRUTE_FORCE_CONFIG
+    """Settings the `brute_force` backend reads; ignored by `vocab`."""
+    vocab: VocabConfig = DEFAULT_VOCAB_CONFIG
+    """Settings the `vocab` backend reads; ignored by `brute_force`."""
+
+    def __post_init__(self) -> None:
+        """Reject a backend switch that can never fire.
+
+        Raises:
+            ValueError: When `brute_force_max_images` is below one image.
+        """
         if self.brute_force_max_images < 1:
             raise ValueError(f"brute_force_max_images must be at least 1, got {self.brute_force_max_images}")
-        if self.vocab_branching < 2:
-            raise ValueError(f"vocab_branching must be at least 2, got {self.vocab_branching}")
-        if self.vocab_depth < 1:
-            raise ValueError(f"vocab_depth must be at least 1, got {self.vocab_depth}")
-        if self.vocab_training_descriptors < self.vocab_branching:
-            raise ValueError(f"vocab_training_descriptors must be at least vocab_branching, got {self.vocab_training_descriptors}")
-        if self.vocab_kmeans_iterations < 1:
-            raise ValueError(f"vocab_kmeans_iterations must be at least 1, got {self.vocab_kmeans_iterations}")
-        if self.vocab_assign_chunk_descriptors < 1:
-            raise ValueError(f"vocab_assign_chunk_descriptors must be at least 1, got {self.vocab_assign_chunk_descriptors}")
 
     def resolve_backend(self, n_images: int) -> ResolvedBackend:
         """Turn `auto` into a concrete backend for a corpus of this size.
@@ -304,44 +314,6 @@ class RetrievalConfig:
         if self.backend != "auto":
             return self.backend
         return "brute_force" if n_images <= self.brute_force_max_images else "vocab"
-
-
-@dataclass(frozen=True, slots=True)
-class VocabularyTree:
-    """A trained hierarchical k-means vocabulary, one centroid array per level.
-
-    Level `l` holds `branching ** (l + 1)` centroid rows; the children of node `n` are rows
-    `n * branching` to `(n + 1) * branching`. A leaf's index in the last level is its word
-    id, so word ids need no separate table — unlike the blob, which numbers words by their
-    rank among childless nodes in flat-array order (`docs/spec/bow.md` §6.6).
-    """
-
-    branching: int
-    """Children per node."""
-    centroids: tuple[Float32[ndarray, "n_children descriptor_dim"], ...]
-    """Centroid rows per level, `[branching ** (level + 1), descriptor_dim]` each."""
-    biases: tuple[Float32[ndarray, "n_children"], ...]
-    """`-0.5 * ||centroid||^2` per row, so the descent is one `argmax` of
-    `descriptor @ centroids.T + bias`. Rows of nodes that were never populated hold
-    `-inf`, which is what keeps an all-zero centroid from winning a descent."""
-
-    @property
-    def depth(self) -> int:
-        """How many levels the tree has.
-
-        Returns:
-            The level count; the word ids run over `branching ** depth`.
-        """
-        return len(self.centroids)
-
-    @property
-    def n_words(self) -> int:
-        """Size of the vocabulary.
-
-        Returns:
-            `branching ** depth`, including leaves no descriptor ever reaches.
-        """
-        return self.branching**self.depth
 
 
 @dataclass(frozen=True, slots=True)
@@ -360,22 +332,30 @@ class RetrievalIndex:
     """Descriptors each image contributed: the subsample size for `brute_force` (and the
     score's denominator), the mean count for `vocab`, which subsamples nothing."""
     config: RetrievalConfig
-    """Settings the index was built with."""
+    """Settings the index was built with; `backend` is derived from it."""
     build_seconds: float
     """Wall time the build took, so pipelines can report a per-stage runtime."""
-    backend: ResolvedBackend = "brute_force"
-    """Which backend produced `similarity`. Feeds `default_good_score_threshold`."""
     n_words: int = 0
     """Vocabulary size for `vocab`, 0 for `brute_force`."""
+    _position_by_image_id: dict[int, int] = field(init=False, repr=False, compare=False)
+    """Row of each image id, built once: `query` and `score` would otherwise re-scan
+    `image_ids` on every lookup (116 us per call, ~1 s per RoboCap run)."""
+
+    def __post_init__(self) -> None:
+        """Build the id-to-row lookup the accessors use."""
+        object.__setattr__(self, "_position_by_image_id", {image_id: position for position, image_id in enumerate(self.image_ids)})
 
     @property
-    def good_score_threshold(self) -> float:
-        """The measured score gate for this index's backend.
+    def backend(self) -> ResolvedBackend:
+        """Which backend produced `similarity`.
+
+        Derived rather than stored: the corpus size and the config are what chose it, and a
+        stored copy could only ever disagree with them.
 
         Returns:
-            The value `default_good_score_threshold` gives for `backend`.
+            `"brute_force"` or `"vocab"`.
         """
-        return default_good_score_threshold(self.backend)
+        return self.config.resolve_backend(len(self.image_ids))
 
     def query(
         self,
@@ -385,12 +365,6 @@ class RetrievalIndex:
         timestamps: Mapping[int, int] | None = None,
     ) -> list[Candidate]:
         """Rank the other indexed images by similarity to `image_id`.
-
-        `query_result_number = 20` is the blob's own top-N (`docs/spec/bow.md` §9.1). The
-        query image is always excluded, and so are images closer in time than
-        `min_time_gap_us` — the pose graph already has sequential edges, so a loop
-        candidate must be separated in time to add information
-        (`docs/spec/bow.md` §9.2, `docs/spec/generate_association_main.md` §6.4).
 
         Args:
             image_id: Query image id; must be in `image_ids`.
@@ -408,6 +382,44 @@ class RetrievalIndex:
             ValueError: When `min_time_gap_us` is given without `timestamps`, or
                 `top_k` is not positive.
         """
+        return self.search(image_id, top_k, min_time_gap_us, timestamps).candidates
+
+    def search(
+        self,
+        image_id: int,
+        top_k: int = 20,
+        min_time_gap_us: int | None = None,
+        timestamps: Mapping[int, int] | None = None,
+    ) -> RetrievalQuery:
+        """Rank the other indexed images, and report what the temporal gate cost.
+
+        `query_result_number = 20` is the blob's own top-N (`docs/spec/bow.md` §9.1). The
+        query image is always excluded, and so are images closer in time than
+        `min_time_gap_us` — the pose graph already has sequential edges, so a loop
+        candidate must be separated in time to add information
+        (`docs/spec/bow.md` §9.2, `docs/spec/generate_association_main.md` §6.4).
+
+        The gate is applied *inside* the ranking walk rather than to a finished top-k, so
+        all `top_k` slots stay useful on a sequence whose nearest neighbours in score are
+        its neighbours in time. That is also why the count of gated hits comes back from
+        here: deriving it from a second, ungated query would count a different set.
+
+        Args:
+            image_id: Query image id; must be in `image_ids`.
+            top_k: Maximum number of candidates to return.
+            min_time_gap_us: Minimum `|dt|` in microseconds a candidate must be from the
+                query, or None to apply no temporal gate.
+            timestamps: Capture time in microseconds per image id. Required when
+                `min_time_gap_us` is given.
+
+        Returns:
+            The candidates and the number of hits the temporal gate dropped.
+
+        Raises:
+            KeyError: When `image_id` is not indexed, or a needed timestamp is missing.
+            ValueError: When `min_time_gap_us` is given without `timestamps`, or
+                `top_k` is not positive.
+        """
         if top_k < 1:
             raise ValueError(f"top_k must be at least 1, got {top_k}")
         if min_time_gap_us is not None and timestamps is None:
@@ -416,9 +428,13 @@ class RetrievalIndex:
 
         scores: Float32[ndarray, "n_images"] = self.similarity[position]
         order: Int32[ndarray, "n_images"] = np.argsort(-scores, kind="stable").astype(np.int32)
-        query_timestamp_us: int = 0 if timestamps is None else timestamps[image_id]
+        gated: bool = min_time_gap_us is not None and timestamps is not None
+        capture_us: Mapping[int, int] = timestamps if timestamps is not None else {}
+        gap_us: int = min_time_gap_us if min_time_gap_us is not None else 0
+        query_timestamp_us: int = capture_us[image_id] if gated else 0
 
         candidates: list[Candidate] = []
+        rejected_by_time: int = 0
         for rank in order:
             if len(candidates) == top_k:
                 break
@@ -428,10 +444,11 @@ class RetrievalIndex:
             other_id: int = self.image_ids[int(rank)]
             if other_id == image_id:
                 continue
-            if min_time_gap_us is not None and timestamps is not None and abs(timestamps[other_id] - query_timestamp_us) < min_time_gap_us:
+            if gated and abs(capture_us[other_id] - query_timestamp_us) < gap_us:
+                rejected_by_time += 1
                 continue
             candidates.append(Candidate(image_id=other_id, score=score))
-        return candidates
+        return RetrievalQuery(candidates=candidates, rejected_by_time=rejected_by_time)
 
     def score(self, image_id_a: int, image_id_b: int) -> float:
         """Look up the stored score of one pair.
@@ -460,46 +477,10 @@ class RetrievalIndex:
         Raises:
             KeyError: When the id is not indexed.
         """
-        position: int = int(np.searchsorted(np.asarray(self.image_ids), image_id))
-        if position >= len(self.image_ids) or self.image_ids[position] != image_id:
+        position: int | None = self._position_by_image_id.get(image_id)
+        if position is None:
             raise KeyError(f"image id {image_id} is not in the retrieval index")
         return position
-
-
-def read_descriptors_from_database(database_path: Path, image_ids: Sequence[int] | None = None) -> dict[int, Descriptors]:
-    """Read float32 descriptors out of a COLMAP database.
-
-    COLMAP 4.2 stores descriptors as an opaque uint8 blob, so an Nx128 float32 ALIKED
-    block comes back as Nx512 uint8 and must be reinterpreted with
-    `FeatureDescriptors.to_float()` — a reinterpret, not a cast
-    (`docs/spec/pycolmap-capabilities.md` §4).
-
-    Args:
-        database_path: Path to `database.db`.
-        image_ids: Images to read, or None for every image in the database.
-
-    Returns:
-        Descriptors per image id. Images with no descriptor row are skipped.
-
-    Raises:
-        FileNotFoundError: When the database file does not exist.
-    """
-    if not database_path.is_file():
-        raise FileNotFoundError(f"No COLMAP database at {database_path}")
-    database: pycolmap.Database = pycolmap.Database.open(str(database_path))
-    try:
-        wanted: list[int] = (
-            [int(image.image_id) for image in database.read_all_images()] if image_ids is None else [int(image_id) for image_id in image_ids]
-        )
-        descriptors_by_image: dict[int, Descriptors] = {}
-        for image_id in wanted:
-            if not database.exists_descriptors(image_id):
-                continue
-            stored: pycolmap.FeatureDescriptors = database.read_descriptors(image_id)
-            descriptors_by_image[image_id] = np.ascontiguousarray(stored.to_float().data, dtype=np.float32)
-        return descriptors_by_image
-    finally:
-        database.close()
 
 
 # ======================================================================================
@@ -507,28 +488,22 @@ def read_descriptors_from_database(database_path: Path, image_ids: Sequence[int]
 # ======================================================================================
 
 
-def _subsample(descriptors: Descriptors, keep: int, scores: DescriptorScores | None) -> Descriptors:
-    """Reduce one image's descriptors to `keep` rows.
+def _subsample(descriptors: Descriptors, keep: int) -> Descriptors:
+    """Reduce one image's descriptors to `keep` rows with an even stride.
 
-    With detector responses the strongest rows win, which is what
-    `docs/spec/bow.md` §9.4 suggests; without them an even stride is used. A stride is
-    unbiased because the blob's `Keyframe` proto carries no per-keypoint score
-    (`docs/spec/feature_extractor_main.md` §4), so there is nothing to rank by, and
-    taking a prefix would bias towards whatever order the detector happened to emit.
+    A stride is unbiased because the blob's `Keyframe` proto carries no per-keypoint score
+    (`docs/spec/feature_extractor_main.md` §4), so there is nothing to rank by, and taking a
+    prefix would bias towards whatever order the detector happened to emit.
 
     Args:
         descriptors: Float32 descriptors with shape `[n_descriptors, descriptor_dim]`.
         keep: How many rows to keep; must not exceed `n_descriptors`.
-        scores: Float32 per-descriptor responses with shape `[n_descriptors]`, or None.
 
     Returns:
         Float32 descriptors with shape `[keep, descriptor_dim]`.
     """
     if len(descriptors) == keep:
         return descriptors
-    if scores is not None:
-        strongest: Int32[ndarray, "keep"] = np.argsort(-scores, kind="stable")[:keep].astype(np.int32)
-        return descriptors[np.sort(strongest)]
     stride: int = len(descriptors) // keep
     return descriptors[:: max(1, stride)][:keep]
 
@@ -537,7 +512,6 @@ def _stack_descriptors(
     descriptors_by_image: Mapping[int, Descriptors],
     image_ids: tuple[int, ...],
     keep: int,
-    scores_by_image: Mapping[int, DescriptorScores] | None,
 ) -> Float32[ndarray, "n_images keep descriptor_dim"]:
     """Subsample every image to `keep` descriptors and L2-normalise them.
 
@@ -548,22 +522,11 @@ def _stack_descriptors(
         descriptors_by_image: Descriptors per image id.
         image_ids: Image ids in the index's order.
         keep: Descriptors to keep per image.
-        scores_by_image: Detector responses per image id, or None.
 
     Returns:
         Float32 array with shape `[n_images, keep, descriptor_dim]`, rows unit-norm.
-
-    Raises:
-        ValueError: When the descriptor widths disagree.
     """
-    dim: int = int(descriptors_by_image[image_ids[0]].shape[1])
-    rows: list[Descriptors] = []
-    for image_id in image_ids:
-        descriptors: Descriptors = np.asarray(descriptors_by_image[image_id], dtype=np.float32)
-        if descriptors.shape[1] != dim:
-            raise ValueError(f"image {image_id} has {descriptors.shape[1]}-d descriptors, expected {dim}")
-        scores: DescriptorScores | None = None if scores_by_image is None else np.asarray(scores_by_image[image_id], dtype=np.float32)
-        rows.append(_subsample(descriptors, keep, scores))
+    rows: list[Descriptors] = [_subsample(np.asarray(descriptors_by_image[image_id], dtype=np.float32), keep) for image_id in image_ids]
     stacked: Float32[ndarray, "n_images keep descriptor_dim"] = np.stack(rows).astype(np.float32)
     norms: Float32[ndarray, "n_images keep 1"] = np.linalg.norm(stacked, axis=2, keepdims=True)
     return stacked / np.maximum(norms, np.float32(1e-12))
@@ -573,27 +536,25 @@ def _brute_force_similarity(
     descriptors_by_image: Mapping[int, Descriptors],
     image_ids: tuple[int, ...],
     keep: int,
-    scores_by_image: Mapping[int, DescriptorScores] | None,
-    config: RetrievalConfig,
+    config: BruteForceConfig,
 ) -> SimilarityMatrix:
     """Mutual-nearest-neighbour vote ratios over the subsampled descriptor stack.
 
     One chunked `float32` GEMM gives, for every ordered pair of images, the forward and
     backward nearest neighbour of every descriptor; a pair votes when the two agree and the
-    cosine clears `RetrievalConfig.min_descriptor_similarity`.
+    cosine clears `BruteForceConfig.min_descriptor_similarity`.
 
     Args:
         descriptors_by_image: Descriptors per image id.
         image_ids: Image ids in the index's order.
         keep: Descriptors kept per image.
-        scores_by_image: Detector responses per image id, or None.
-        config: The retrieval settings.
+        config: The brute-force settings.
 
     Returns:
         The symmetric score matrix, 1.0 on the diagonal.
     """
     n_images: int = len(image_ids)
-    stacked: Float32[ndarray, "n_images keep descriptor_dim"] = _stack_descriptors(descriptors_by_image, image_ids, keep, scores_by_image)
+    stacked: Float32[ndarray, "n_images keep descriptor_dim"] = _stack_descriptors(descriptors_by_image, image_ids, keep)
     flat: Float32[ndarray, "n_total descriptor_dim"] = np.ascontiguousarray(stacked.reshape(n_images * keep, -1))
 
     votes: SimilarityMatrix = np.zeros((n_images, n_images), dtype=np.float32)
@@ -621,347 +582,11 @@ def _brute_force_similarity(
 
 
 # ======================================================================================
-# vocabulary tree (docs/spec/bow.md §9.4 Option C)
-# ======================================================================================
-
-
-def _effective_depth(config: RetrievalConfig, n_training_descriptors: int) -> int:
-    """Deepest tree the training sample can fill, capped at `config.vocab_depth`.
-
-    A level whose nodes hold fewer than one training descriptor each cannot be clustered
-    and produces empty leaves, which cost memory and buy nothing. The bound is therefore
-    `branching ** depth <= n_training_descriptors`.
-
-    Args:
-        config: The retrieval settings.
-        n_training_descriptors: Descriptors the tree will be trained on.
-
-    Returns:
-        A depth of at least 1.
-    """
-    depth: int = 1
-    while depth < config.vocab_depth and config.vocab_branching ** (depth + 1) <= n_training_descriptors:
-        depth += 1
-    return depth
-
-
-def _training_sample(
-    descriptors_by_image: Mapping[int, Descriptors],
-    image_ids: tuple[int, ...],
-    target: int,
-    seed: int,
-) -> Float32[ndarray, "n_sample descriptor_dim"]:
-    """Draw a seeded subsample of descriptors, spread evenly over the images.
-
-    Drawing a per-image quota rather than a global random subset keeps the vocabulary from
-    over-fitting whichever part of the sequence happens to be densest, and makes the sample
-    independent of how many descriptors each image carries.
-
-    Args:
-        descriptors_by_image: Descriptors per image id.
-        image_ids: Image ids in the index's order.
-        target: How many descriptors to draw in total.
-        seed: Seed for the draw.
-
-    Returns:
-        Float32 descriptors with shape `[n_sample, descriptor_dim]`. Every image
-        contributes the same quota, so `n_sample` is `target` rounded up to a whole
-        number of images; truncating back to `target` would silently drop the tail of
-        the sequence from the training set.
-    """
-    generator: np.random.Generator = np.random.default_rng(seed)
-    quota: int = max(1, -(-target // len(image_ids)))
-    blocks: list[Descriptors] = []
-    for image_id in image_ids:
-        descriptors: Descriptors = descriptors_by_image[image_id]
-        if len(descriptors) <= quota:
-            blocks.append(np.asarray(descriptors, dtype=np.float32))
-            continue
-        chosen: Int64[ndarray, "quota"] = np.sort(generator.choice(len(descriptors), quota, replace=False))
-        blocks.append(np.asarray(descriptors[chosen], dtype=np.float32))
-    return np.ascontiguousarray(np.concatenate(blocks, axis=0))
-
-
-def _train_vocabulary(sample: Float32[ndarray, "n_sample descriptor_dim"], depth: int, config: RetrievalConfig) -> VocabularyTree:
-    """Train a hierarchical k-means vocabulary on a descriptor sample.
-
-    One `scipy.cluster.vq.kmeans2` call per node, k-means++ seeded from a per-node draw of
-    a seeded generator, so the whole tree is reproducible. The recursion is breadth-first
-    over levels rather than depth-first over nodes, which lets the level's descriptors be
-    partitioned with one sort instead of one gather per node.
-
-    Nodes holding fewer descriptors than `branching` become their own centroids and leave
-    the remaining child slots dead (`-inf` bias); the blob drops empty clusters the same
-    way (`docs/spec/bow.md` §6.4).
-
-    Args:
-        sample: Float32 training descriptors with shape `[n_sample, descriptor_dim]`.
-        depth: Levels to build.
-        config: The retrieval settings.
-
-    Returns:
-        The trained tree.
-    """
-    branching: int = config.vocab_branching
-    dim: int = int(sample.shape[1])
-    generator: np.random.Generator = np.random.default_rng(config.seed)
-    centroids_per_level: list[Float32[ndarray, "n_children descriptor_dim"]] = []
-    biases_per_level: list[Float32[ndarray, "n_children"]] = []
-
-    node_of_sample: Int64[ndarray, "n_sample"] = np.zeros(len(sample), dtype=np.int64)
-    n_nodes: int = 1
-    for _level in range(depth):
-        centroids: Float32[ndarray, "n_children descriptor_dim"] = np.zeros((n_nodes * branching, dim), dtype=np.float32)
-        live: Bool[ndarray, "n_children"] = np.zeros(n_nodes * branching, dtype=bool)
-        order: Int64[ndarray, "n_sample"] = np.argsort(node_of_sample, kind="stable")
-        bounds: Int64[ndarray, "n_nodes_plus_one"] = np.searchsorted(node_of_sample[order], np.arange(n_nodes + 1))
-        child_of_sample: Int64[ndarray, "n_sample"] = np.zeros(len(sample), dtype=np.int64)
-        for node in range(n_nodes):
-            members: Int64[ndarray, "n_members"] = order[bounds[node] : bounds[node + 1]]
-            base: int = node * branching
-            if len(members) == 0:
-                continue
-            block: Float32[ndarray, "n_members descriptor_dim"] = sample[members]
-            if len(members) < branching:
-                centroids[base : base + len(members)] = block
-                live[base : base + len(members)] = True
-                child_of_sample[members] = base + np.arange(len(members))
-                continue
-            # A node whose descriptors are all duplicates of one another makes k-means++
-            # divide by a zero squared-distance sum and leaves clusters empty, which scipy
-            # reports as a UserWarning and NumPy as a RuntimeWarning. Both are expected
-            # here and harmless: the duplicate rows collapse onto one centroid, which is
-            # what the blob's own "empty clusters are dropped" does
-            # (`docs/spec/bow.md` §6.4). Silenced around this call only.
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", category=UserWarning)
-                warnings.simplefilter("ignore", category=RuntimeWarning)
-                book, labels = kmeans2(
-                    block,
-                    branching,
-                    iter=config.vocab_kmeans_iterations,
-                    minit="++",
-                    seed=int(generator.integers(1 << 31)),
-                    check_finite=False,
-                )
-            centroids[base : base + branching] = np.asarray(book, dtype=np.float32)
-            live[base : base + branching] = True
-            child_of_sample[members] = base + np.asarray(labels, dtype=np.int64)
-        biases: Float32[ndarray, "n_children"] = np.where(
-            live, -0.5 * np.sum(centroids * centroids, axis=1), -np.inf
-        ).astype(np.float32)
-        centroids_per_level.append(centroids)
-        biases_per_level.append(biases)
-        node_of_sample = child_of_sample
-        n_nodes *= branching
-    return VocabularyTree(branching=branching, centroids=tuple(centroids_per_level), biases=tuple(biases_per_level))
-
-
-def _assign_words(descriptors: Float32[ndarray, "n_descriptors descriptor_dim"], tree: VocabularyTree) -> Int32[ndarray, "n_descriptors"]:
-    """Greedily descend every descriptor to its leaf word.
-
-    Pure greedy descent, no beam and no backtracking, exactly as
-    `VisualVocabulary::SearchFeature` does (`docs/spec/bow.md` §7.1). Nearest centroid by
-    squared L2 is `argmax(descriptor @ centroids.T - 0.5 * ||centroid||^2)`, since
-    `||descriptor||^2` is the same for every candidate — which is why the descriptors need
-    no renormalising here.
-
-    Args:
-        descriptors: Float32 descriptors with shape `[n_descriptors, descriptor_dim]`.
-        tree: The trained vocabulary.
-
-    Returns:
-        Int32 word ids with shape `[n_descriptors]`, in `[0, tree.n_words)`.
-    """
-    branching: int = tree.branching
-    node: Int64[ndarray, "n_descriptors"] = np.zeros(len(descriptors), dtype=np.int64)
-    for centroids, biases in zip(tree.centroids, tree.biases, strict=True):
-        n_nodes: int = len(centroids) // branching
-        order: Int64[ndarray, "n_descriptors"] = np.argsort(node, kind="stable")
-        bounds: Int64[ndarray, "n_nodes_plus_one"] = np.searchsorted(node[order], np.arange(n_nodes + 1))
-        child: Int64[ndarray, "n_descriptors"] = np.zeros(len(descriptors), dtype=np.int64)
-        for parent in range(n_nodes):
-            members: Int64[ndarray, "n_members"] = order[bounds[parent] : bounds[parent + 1]]
-            if len(members) == 0:
-                continue
-            base: int = parent * branching
-            candidates: Float32[ndarray, "branching descriptor_dim"] = centroids[base : base + branching]
-            affinity: Float32[ndarray, "n_members branching"] = descriptors[members] @ candidates.T + biases[base : base + branching]
-            child[members] = base + np.argmax(affinity, axis=1)
-        node = child
-    return node.astype(np.int32)
-
-
-def _bow_matrix(
-    word_of_descriptor: Int32[ndarray, "n_descriptors"],
-    image_of_descriptor: Int32[ndarray, "n_descriptors"],
-    n_images: int,
-    n_words: int,
-) -> sparse.csr_matrix:
-    """Turn word assignments into L1-normalised TF-IDF rows.
-
-    `docs/spec/bow.md` §7.2: the BoW vector is `v_w = tf_w * idf_w / sum_u (tf_u * idf_u)`
-    with raw term counts, and words of zero weight are dropped. The IDF is
-    `log(n_images / df_w)`, not the blob's integer-division variant (§6.7, §9.3): the
-    quirk's only visible effect is that a word appearing in more than half the images
-    collapses to weight 0, and `log(n_images / df)` already decays to 0 as `df` approaches
-    `n_images`.
-
-    Args:
-        word_of_descriptor: Int32 word id per descriptor, shape `[n_descriptors]`.
-        image_of_descriptor: Int32 image row per descriptor, shape `[n_descriptors]`.
-        n_images: Rows of the result.
-        n_words: Columns of the result.
-
-    Returns:
-        A `[n_images, n_words]` CSR matrix whose non-negative rows each sum to 1, except
-        rows whose every word was dropped, which are empty.
-    """
-    counts: sparse.csr_matrix = sparse.coo_matrix(
-        (np.ones(len(word_of_descriptor), dtype=np.float32), (image_of_descriptor, word_of_descriptor)),
-        shape=(n_images, n_words),
-    ).tocsr()
-    counts.sum_duplicates()
-    document_frequency: Int64[ndarray, "n_words"] = np.asarray((counts > 0).sum(axis=0)).ravel()
-    inverse_document_frequency: Float32[ndarray, "n_words"] = np.zeros(n_words, dtype=np.float32)
-    seen: Bool[ndarray, "n_words"] = document_frequency > 0
-    inverse_document_frequency[seen] = np.log(n_images / document_frequency[seen]).astype(np.float32)
-
-    weighted: sparse.csr_matrix = counts.multiply(inverse_document_frequency[None, :]).tocsr()
-    weighted.eliminate_zeros()
-    row_sums: Float32[ndarray, "n_images"] = np.asarray(weighted.sum(axis=1)).ravel()
-    row_sums[row_sums == 0.0] = 1.0
-    return (sparse.diags(1.0 / row_sums) @ weighted).tocsr().astype(np.float32)
-
-
-def l1_score(query: Mapping[int, float], document: Mapping[int, float]) -> float:
-    """The DBoW2 L1 score of two L1-normalised BoW vectors (`docs/spec/bow.md` §9.5).
-
-    `s = -0.5 * sum_{w in q & d} (|q_w - d_w| - |q_w| - |d_w|)`, which lands in `[0, 1]`
-    with 1.0 for identical vectors. This is the reference implementation the vectorised
-    inverted index in `_all_pairs_l1_score` is checked against.
-
-    Args:
-        query: Word id to weight for the query image; weights must be non-negative.
-        document: Word id to weight for the candidate image.
-
-    Returns:
-        The score in `[0, 1]`.
-    """
-    shared: set[int] = set(query) & set(document)
-    return -0.5 * sum(abs(query[word] - document[word]) - abs(query[word]) - abs(document[word]) for word in shared)
-
-
-def _all_pairs_l1_score(bow: sparse.csr_matrix) -> SimilarityMatrix:
-    """Score every image pair through the inverted index.
-
-    For non-negative weights `-0.5 * (|a - b| - a - b)` is exactly `min(a, b)`, so the
-    DBoW2 L1 score of `docs/spec/bow.md` §7.4 is the histogram intersection
-    `s(q, d) = sum_w min(q_w, d_w)`. Written that way it needs no per-query pass: walking
-    the inverted index once and adding the outer minimum of each word's posting list into
-    the score matrix scores every pair at the same time, which is why `query` is free
-    afterwards.
-
-    The cost is `sum_w df_w^2`, quadratic in the image count at a fixed vocabulary size —
-    the reason `RetrievalConfig.vocab_depth` matters as much as it does. Measured on
-    RoboCap's 4528 images: 23.2 s at 100 000 words against 44.2 s at 10 000.
-
-    Args:
-        bow: `[n_images, n_words]` CSR matrix of L1-normalised non-negative rows.
-
-    Returns:
-        The symmetric score matrix, 1.0 on the diagonal.
-    """
-    n_images: int = bow.shape[0]
-    scores: SimilarityMatrix = np.zeros((n_images, n_images), dtype=np.float32)
-    columns: sparse.csc_matrix = bow.tocsc()
-    for word in range(bow.shape[1]):
-        start: int = int(columns.indptr[word])
-        end: int = int(columns.indptr[word + 1])
-        if end - start < 2:
-            continue
-        documents: Int32[ndarray, "df"] = columns.indices[start:end]
-        weights: Float32[ndarray, "df"] = columns.data[start:end]
-        scores[np.ix_(documents, documents)] += np.minimum(weights[:, None], weights[None, :])
-    np.fill_diagonal(scores, np.float32(1.0))
-    return np.clip(scores, 0.0, 1.0, out=scores)
-
-
-def _assignment_batches(counts: Sequence[int], max_descriptors: int) -> list[tuple[int, int]]:
-    """Split the images into contiguous runs of roughly `max_descriptors` descriptors.
-
-    Assignment is a pure per-descriptor function, so batching only bounds peak memory: a
-    whole RoboCap corpus is 9.3 M descriptors, i.e. 4.7 GB at 128-d float32, and stacking
-    it in one array on top of the caller's own copy is what the batches avoid.
-
-    Args:
-        counts: Descriptor count per image, in the index's order.
-        max_descriptors: Soft upper bound on a batch; one image is never split.
-
-    Returns:
-        Half-open `[start, stop)` image ranges covering every image exactly once.
-    """
-    batches: list[tuple[int, int]] = []
-    start: int = 0
-    running: int = 0
-    for position, count in enumerate(counts):
-        running += count
-        if running >= max_descriptors:
-            batches.append((start, position + 1))
-            start = position + 1
-            running = 0
-    if start < len(counts):
-        batches.append((start, len(counts)))
-    return batches
-
-
-def _vocab_similarity(
-    descriptors_by_image: Mapping[int, Descriptors],
-    image_ids: tuple[int, ...],
-    counts: Sequence[int],
-    config: RetrievalConfig,
-) -> tuple[SimilarityMatrix, int]:
-    """Train a vocabulary, encode every image and score every pair.
-
-    Args:
-        descriptors_by_image: Descriptors per image id.
-        image_ids: Image ids in the index's order.
-        counts: Descriptor count per image, in the same order.
-        config: The retrieval settings.
-
-    Returns:
-        The symmetric score matrix and the vocabulary size.
-    """
-    n_images: int = len(image_ids)
-    sample: Float32[ndarray, "n_sample descriptor_dim"] = _training_sample(
-        descriptors_by_image, image_ids, config.vocab_training_descriptors, config.seed
-    )
-    tree: VocabularyTree = _train_vocabulary(sample, _effective_depth(config, len(sample)), config)
-    del sample
-
-    word_batches: list[Int32[ndarray, "n_batch"]] = []
-    image_batches: list[Int32[ndarray, "n_batch"]] = []
-    for start, stop in _assignment_batches(counts, config.vocab_assign_chunk_descriptors):
-        block: Float32[ndarray, "n_batch descriptor_dim"] = np.ascontiguousarray(
-            np.concatenate([np.asarray(descriptors_by_image[image_id], dtype=np.float32) for image_id in image_ids[start:stop]], axis=0)
-        )
-        word_batches.append(_assign_words(block, tree))
-        image_batches.append(np.repeat(np.arange(start, stop, dtype=np.int32), counts[start:stop]))
-
-    bow: sparse.csr_matrix = _bow_matrix(np.concatenate(word_batches), np.concatenate(image_batches), n_images, tree.n_words)
-    return _all_pairs_l1_score(bow), tree.n_words
-
-
-# ======================================================================================
 # the stage
 # ======================================================================================
 
 
-def build_retrieval_index(
-    descriptors_by_image: Mapping[int, Descriptors],
-    config: RetrievalConfig | None = None,
-    scores_by_image: Mapping[int, DescriptorScores] | None = None,
-) -> RetrievalIndex:
+def build_retrieval_index(descriptors_by_image: Mapping[int, Descriptors], config: RetrievalConfig | None = None) -> RetrievalIndex:
     """Score every image pair, with the backend `config.backend` selects.
 
     Args:
@@ -969,12 +594,9 @@ def build_retrieval_index(
             Images may carry different counts; on the brute-force path the smallest count
             caps the whole index, on the vocab path every descriptor is used.
         config: Backend choice and its settings; the defaults are the measured ones.
-        scores_by_image: Optional detector responses per image id, used by the brute-force
-            path to keep the strongest descriptors instead of an even stride. The vocab
-            path subsamples nothing and ignores it.
 
     Returns:
-        The index, with its wall-clock build time and its resolved backend recorded.
+        The index, with its wall-clock build time recorded.
 
     Raises:
         ValueError: When there are fewer than two images, an image has no descriptors, or
@@ -988,16 +610,24 @@ def build_retrieval_index(
     counts: list[int] = [int(descriptors_by_image[image_id].shape[0]) for image_id in image_ids]
     if min(counts) < 1:
         raise ValueError("every image must carry at least one descriptor")
+    # Checked here rather than per backend: the vocab path used to fail on a ragged corpus
+    # with a bare `numpy.concatenate` error deep inside the assignment pass.
+    descriptor_dim: int = int(descriptors_by_image[image_ids[0]].shape[1])
+    for image_id in image_ids:
+        width: int = int(descriptors_by_image[image_id].shape[1])
+        if width != descriptor_dim:
+            raise ValueError(f"image {image_id} has {width}-d descriptors, expected {descriptor_dim}")
     backend: ResolvedBackend = settings.resolve_backend(n_images)
 
     started: float = time.perf_counter()
     if backend == "vocab":
-        similarity, n_words = _vocab_similarity(descriptors_by_image, image_ids, counts, settings)
+        similarity, n_words = vocab_similarity(descriptors_by_image, image_ids, counts, settings.vocab, settings.seed)
         descriptors_per_image: int = sum(counts) // n_images
     else:
         n_words = 0
-        descriptors_per_image = min(settings.max_descriptors_per_image, min(counts), max(1, settings.max_total_descriptors // n_images))
-        similarity = _brute_force_similarity(descriptors_by_image, image_ids, descriptors_per_image, scores_by_image, settings)
+        brute_force: BruteForceConfig = settings.brute_force
+        descriptors_per_image = min(brute_force.max_descriptors_per_image, min(counts), max(1, brute_force.max_total_descriptors // n_images))
+        similarity = _brute_force_similarity(descriptors_by_image, image_ids, descriptors_per_image, brute_force)
     build_seconds: float = time.perf_counter() - started
 
     print(
@@ -1010,6 +640,5 @@ def build_retrieval_index(
         descriptors_per_image=descriptors_per_image,
         config=settings,
         build_seconds=build_seconds,
-        backend=backend,
         n_words=n_words,
     )

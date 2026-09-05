@@ -29,7 +29,7 @@ other cross-camera connectivity comes from loop closure.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from pathlib import Path
 
 from colsfm.database import ImagePair, image_ids_by_name
@@ -112,18 +112,17 @@ def stereo_pairs(frames_meta: FramesMeta) -> list[ImagePair]:
     return sorted(pairs)
 
 
-def select_pairs(
-    frames_meta: FramesMeta,
-    connected_keyframe_num: int = 1,
-    loop_pairs: Iterable[ImagePair] = (),
-) -> list[ImagePair]:
+def select_pairs(frames_meta: FramesMeta, connected_keyframe_num: int = 1) -> list[ImagePair]:
     """Build the whole matching pair list for a collection.
+
+    Loop pairs are deliberately absent: they only exist after retrieval and
+    verification, and `colsfm.pipeline` matches them into the same database
+    afterwards rather than re-running pair selection (see that module's
+    "Pair selection cannot see loop pairs").
 
     Args:
         frames_meta: The keyframes to match, already filtered by keyframe selection.
         connected_keyframe_num: Rig-frame lookahead for same-camera links.
-        loop_pairs: Loop-closure pairs from `colsfm.loop_closure`, in any order
-            and orientation; normalised and merged in.
 
     Returns:
         Normalised, deduplicated, sorted `(image_id1, image_id2)` pairs.
@@ -133,7 +132,6 @@ def select_pairs(
     """
     pairs: set[ImagePair] = set(consecutive_pairs(frames_meta, connected_keyframe_num))
     pairs.update(stereo_pairs(frames_meta))
-    pairs.update(_normalise(first, second) for first, second in loop_pairs)
     return sorted(pairs)
 
 

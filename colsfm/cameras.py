@@ -26,7 +26,7 @@ model. Do not mix these keypoints with COLMAP-detected features.
 
 from __future__ import annotations
 
-from typing import Final, TypeAlias
+from typing import Final, Literal, TypeAlias
 
 import numpy as np
 import pycolmap
@@ -35,8 +35,8 @@ from numpy import ndarray
 
 from colsfm.frames_meta import CameraParams, CameraProjectionModel, FramesMeta
 
-ColmapCameraModel: TypeAlias = str
-"""A COLMAP camera model name, e.g. `PINHOLE`, `FULL_OPENCV`, `OPENCV_FISHEYE`."""
+ColmapCameraModel: TypeAlias = Literal["PINHOLE", "FULL_OPENCV", "OPENCV_FISHEYE"]
+"""The three COLMAP camera models cuSFM's four projection models map onto."""
 
 CameraParameters: TypeAlias = Float64[ndarray, "num_params"]
 """COLMAP camera parameters in the model's own order."""
@@ -54,6 +54,11 @@ DISTORTION_COUNT_BY_PROJECTION_MODEL: Final[dict[CameraProjectionModel, int]] = 
     "OPENCV_FISHEYE": 4,
 }
 """How many distortion coefficients each distorted model consumes."""
+
+PINHOLE_FAMILY_MODELS: Final[frozenset[CameraProjectionModel]] = frozenset({"PINHOLE", "FTHETA_WINDSHIELD"})
+"""The two models exported from the rectified 3x4 `projection_matrix` rather than the
+raw 3x3 `camera_matrix` (export.md §3.3). `colsfm.rerun_log` picks its intrinsics the
+same way, so the membership test lives here rather than in two hardcoded tuples."""
 
 
 def _pinhole_parameters_from_projection_matrix(camera: CameraParams) -> CameraParameters:
@@ -107,15 +112,13 @@ def fit_distortion_coefficients(camera: CameraParams, wanted: int) -> CameraPara
         Float64 coefficients with shape `[wanted]`.
     """
     coefficients: CameraParameters = camera.distortion_coefficients
-    if coefficients.size == 0:
-        print(f"No distortion coefficients found for camera {camera.camera_params_id}. Will pad with zeros.")
-        return np.zeros(wanted)
     if coefficients.size > wanted:
         print(f"Too many distortion coefficients for camera {camera.camera_params_id}. Only writing the first {wanted}")
         return coefficients[:wanted].astype(np.float64)
     if coefficients.size < wanted:
+        # An empty vector is the `size < wanted` case, and cuSFM logs it the same way.
         print(f"Too few distortion coefficients for camera {camera.camera_params_id}. Will pad with zeros.")
-        return np.concatenate([coefficients, np.zeros(wanted - coefficients.size)])
+        return np.concatenate([coefficients.astype(np.float64), np.zeros(wanted - coefficients.size)])
     return coefficients.astype(np.float64)
 
 
@@ -133,7 +136,7 @@ def colmap_camera_parameters(camera: CameraParams) -> CameraParameters:
     """
     if camera.projection_model not in COLMAP_MODEL_BY_PROJECTION_MODEL:
         raise ValueError(f"Unsupported camera projection model type: {camera.projection_model}")
-    if camera.projection_model in ("PINHOLE", "FTHETA_WINDSHIELD"):
+    if camera.projection_model in PINHOLE_FAMILY_MODELS:
         return _pinhole_parameters_from_projection_matrix(camera)
     intrinsics: CameraParameters = _pinhole_parameters_from_camera_matrix(camera)
     wanted: int = DISTORTION_COUNT_BY_PROJECTION_MODEL[camera.projection_model]
@@ -147,7 +150,13 @@ def colmap_camera(camera: CameraParams) -> pycolmap.Camera:
         camera: The cuSFM camera parameters.
 
     Returns:
-        A camera whose `camera_id` is the cuSFM `camera_params_id`, verbatim.
+        A camera whose `camera_id` is the cuSFM `camera_params_id`, verbatim, and
+        whose `has_prior_focal_length` is True. The calibration came from the
+        metadata, and COLMAP 4.2 reads that flag to choose the calibrated
+        two-view-geometry path: leaving it False silently degrades a PINHOLE pair
+        to `UNCALIBRATED` and an `OPENCV_FISHEYE` pair to `DEGENERATE` with zero
+        inliers (pycolmap-capabilities.md §5). Setting it here is what lets the
+        database and reconstruction builders stop stamping it after the fact.
 
     Raises:
         ValueError: When the projection model is unknown or its source matrix is missing.
@@ -157,13 +166,15 @@ def colmap_camera(camera: CameraParams) -> pycolmap.Camera:
             f"Camera parameter {camera.camera_params_id} is FTHETA_WINDSHIELD, "
             "thus the output in rectified model may be inaccurate."
         )
-    return pycolmap.Camera(
+    colmap: pycolmap.Camera = pycolmap.Camera(
         camera_id=camera.camera_params_id,
         model=COLMAP_MODEL_BY_PROJECTION_MODEL[camera.projection_model],
         width=camera.image_width,
         height=camera.image_height,
         params=colmap_camera_parameters(camera),
     )
+    colmap.has_prior_focal_length = True
+    return colmap
 
 
 def colmap_cameras(frames_meta: FramesMeta) -> dict[int, pycolmap.Camera]:

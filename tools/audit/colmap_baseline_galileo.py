@@ -54,9 +54,9 @@ import tyro
 from jaxtyping import Float64
 from numpy import ndarray
 from serde import serde
-from serde.json import to_json
 
-from colsfm.benchmark import RigTrack
+from colsfm.benchmark import ReconstructionMetrics, RigTrack, reconstruction_metrics, write_json_report
+from colsfm.export import RUNTIME_CSV_NAME, RuntimeRecord, append_runtime_record
 from colsfm.frames_meta import CameraParams, KeyframeMeta
 from tools.audit.galileo_metrics import (
     GalileoReference,
@@ -78,6 +78,13 @@ EXTRACTOR_BY_CHOICE: dict[FeatureChoice, pycolmap.FeatureExtractorType] = {
     "aliked": pycolmap.FeatureExtractorType.ALIKED_N16ROT,
 }
 """COLMAP extractor for each choice; ALIKED-n16rot is the closest variant to cuSFM's engine."""
+
+BaselineStage: TypeAlias = Literal["feature_extraction", "matching", "incremental_mapping"]
+"""The three stages this baseline times; the names it writes into `runtime.csv`.
+
+`colsfm.runtime.classify_stage` maps them onto `extraction`, `matching` and
+`mapping`, so a baseline run drops into the benchmark's runtime table beside a
+blob run and a colsfm run."""
 
 MATCHER_BY_CHOICE: dict[FeatureChoice, pycolmap.FeatureMatcherType] = {
     "sift": pycolmap.FeatureMatcherType.SIFT_BRUTEFORCE,
@@ -110,30 +117,14 @@ class ColmapBaselineConfig:
 
 @serde
 @dataclass(frozen=True)
-class StageTiming:
-    """Wall clock for one pipeline stage."""
-
-    command: str
-    """Stage name, matching `runtime.csv`'s first column."""
-    runtime_seconds: float
-    """Seconds measured with `time.perf_counter`."""
-
-
-@serde
-@dataclass(frozen=True)
 class ModelSummary:
     """One reconstruction COLMAP produced."""
 
     model_index: int
     """COLMAP's index for the model inside the output directory."""
-    registered_images: int
-    """Images with a pose and at least one observation."""
-    num_points3D: int
-    """Triangulated points."""
-    num_observations: int
-    """Point-image observations."""
-    mean_reprojection_error_px: float
-    """Recomputed with `update_point_3d_errors` first, as `colsfm.benchmark` does."""
+    metrics: ReconstructionMetrics
+    """The same counters `colsfm.benchmark` reports for a cuSFM-layout run, so the
+    baseline's column and the benchmark's columns are produced by one function."""
 
 
 @serde
@@ -155,8 +146,8 @@ class ColmapBaselineResult:
     """How many disconnected reconstructions COLMAP returned (paper §6.3.1)."""
     models: tuple[ModelSummary, ...]
     """Every model, largest first."""
-    stage_timings: tuple[StageTiming, ...]
-    """Per-stage wall clock, in pipeline order."""
+    stage_timings: tuple[RuntimeRecord, ...]
+    """Per-stage wall clock, in pipeline order; `runtime.csv`'s own row type."""
     total_runtime_seconds: float
     """Sum of the stage timings."""
     largest_model_fraction_registered: float
@@ -179,11 +170,11 @@ class ColmapBaselineResult:
 class StageClock:
     """Collects `time.perf_counter` spans, in the order they were measured."""
 
-    timings: list[StageTiming] = field(default_factory=list)
+    timings: list[RuntimeRecord] = field(default_factory=list)
     """One entry per completed stage."""
 
     @contextmanager
-    def stage(self, name: str) -> Iterator[None]:
+    def stage(self, name: BaselineStage) -> Iterator[None]:
         """Time a block and record it under `name`.
 
         Args:
@@ -196,7 +187,7 @@ class StageClock:
         try:
             yield
         finally:
-            self.timings.append(StageTiming(command=name, runtime_seconds=time.perf_counter() - started))
+            self.timings.append(RuntimeRecord(command=name, runtime_seconds=time.perf_counter() - started))
 
     def total_seconds(self) -> float:
         """Sum of every recorded stage.
@@ -206,16 +197,21 @@ class StageClock:
         """
         return float(sum(item.runtime_seconds for item in self.timings))
 
-    def write_csv(self, path: Path) -> None:
-        """Write the timings in `runtime.csv`'s two-column format.
+    def write_csv(self, output_dir: Path) -> None:
+        """Append the timings to `<output_dir>/runtime.csv`.
+
+        Goes through `colsfm.export.append_runtime_record`, so the header, the
+        quoting and the dialect are the ones `read_runtime_records` expects — an
+        unquoted hand-rolled row breaks the moment a command contains a comma.
 
         Args:
-            path: Destination file; parents are created.
+            output_dir: Directory holding the log; parents are created.
         """
-        path.parent.mkdir(parents=True, exist_ok=True)
-        lines: list[str] = ["command,runtime_seconds"]
-        lines.extend(f"{item.command},{item.runtime_seconds!r}" for item in self.timings)
-        path.write_text("\n".join(lines) + "\n")
+        # One run, one log: the writer appends, so a reused directory would otherwise
+        # accumulate blocks the way the blob's own runner does.
+        (output_dir / RUNTIME_CSV_NAME).unlink(missing_ok=True)
+        for record in self.timings:
+            append_runtime_record(output_dir, record)
 
 
 def _pinhole_params(camera: CameraParams) -> str:
@@ -300,11 +296,8 @@ def _count_verified_pairs(database_path: Path) -> int:
     Returns:
         Number of two-view geometries with at least one inlier.
     """
-    database: pycolmap.Database = pycolmap.Database.open(database_path)
-    try:
+    with pycolmap.Database.open(database_path) as database:
         return int(database.num_verified_image_pairs())
-    finally:
-        database.close()
 
 
 def _summarise(reconstruction: pycolmap.Reconstruction, model_index: int) -> ModelSummary:
@@ -318,13 +311,7 @@ def _summarise(reconstruction: pycolmap.Reconstruction, model_index: int) -> Mod
         The summary.
     """
     reconstruction.update_point_3d_errors()
-    return ModelSummary(
-        model_index=model_index,
-        registered_images=sum(1 for image in reconstruction.images.values() if image.num_points3D > 0),
-        num_points3D=reconstruction.num_points3D(),
-        num_observations=reconstruction.compute_num_observations(),
-        mean_reprojection_error_px=float(reconstruction.compute_mean_reprojection_error()),
-    )
+    return ModelSummary(model_index=model_index, metrics=reconstruction_metrics(reconstruction))
 
 
 def main(config: ColmapBaselineConfig) -> None:
@@ -360,14 +347,13 @@ def main(config: ColmapBaselineConfig) -> None:
             output_path=sparse_dir,
             options=pycolmap.IncrementalPipelineOptions(),
         )
-    clock.write_csv(run_dir / "runtime.csv")
+    clock.write_csv(run_dir)
 
-    summaries: list[ModelSummary] = sorted(
-        (_summarise(model, index) for index, model in models.items()),
-        key=lambda item: item.registered_images,
-        reverse=True,
-    )
-    print(f"[audit] {len(models)} model(s); registered per model: {[item.registered_images for item in summaries]}")
+    # Materialised before sorting: `_summarise` calls `update_point_3d_errors`, and a
+    # generator that mutates its inputs while `sorted` drains it is a trap, not a saving.
+    measured: list[ModelSummary] = [_summarise(model, index) for index, model in models.items()]
+    summaries: list[ModelSummary] = sorted(measured, key=lambda item: item.metrics.registered_images, reverse=True)
+    print(f"[audit] {len(models)} model(s); registered per model: {[item.metrics.registered_images for item in summaries]}")
 
     if not summaries:
         raise RuntimeError("incremental_mapping returned no reconstruction")
@@ -387,7 +373,7 @@ def main(config: ColmapBaselineConfig) -> None:
         models=tuple(summaries),
         stage_timings=tuple(clock.timings),
         total_runtime_seconds=clock.total_seconds(),
-        largest_model_fraction_registered=summaries[0].registered_images / len(keyframes),
+        largest_model_fraction_registered=summaries[0].metrics.registered_images / len(keyframes),
         similarity_scale=alignment.scale,
         image_center_rigid_rmse_millimeters=center_score.rigid_rmse_millimeters,
         image_center_similarity_rmse_millimeters=center_score.similarity_rmse_millimeters,
@@ -396,16 +382,15 @@ def main(config: ColmapBaselineConfig) -> None:
         num_rig_frames=len(rig_track),
     )
 
-    output_json: Path = config.bench_dir / f"audit_colmap_{config.features}_{config.matcher}.json"
-    output_json.parent.mkdir(parents=True, exist_ok=True)
-    output_json.write_text(to_json(result))
+    output_json: Path = write_json_report(config.bench_dir / f"audit_colmap_{config.features}_{config.matcher}.json", result)
 
     for timing in clock.timings:
         print(f"[audit] {timing.command:<22} {timing.runtime_seconds:8.2f} s")
     print(f"[audit] {'total':<22} {clock.total_seconds():8.2f} s")
+    largest_metrics: ReconstructionMetrics = summaries[0].metrics
     print(
-        f"[audit] largest model: {summaries[0].registered_images}/{len(keyframes)} images, "
-        f"{summaries[0].num_points3D} points, {summaries[0].mean_reprojection_error_px:.3f} px"
+        f"[audit] largest model: {largest_metrics.registered_images}/{len(keyframes)} images, "
+        f"{largest_metrics.num_points3D} points, {largest_metrics.mean_reprojection_error_px:.3f} px"
     )
     print(f"[audit] SIM(3) scale onto ground truth: {alignment.scale:.5f}")
     print(f"[audit] per-image ATE: rigid {center_score.rigid_rmse_millimeters:.2f} mm, SIM(3) {center_score.similarity_rmse_millimeters:.2f} mm")

@@ -56,20 +56,14 @@ def _prepare(database_path: Path, frames_meta: FramesMeta, image_root: Path, key
 
 
 @pytest.fixture(scope="module")
-def galileo(galileo_input_meta: Path) -> FramesMeta:
-    """The 226-keyframe Galileo input metadata."""
-    return read_frames_meta(galileo_input_meta)
-
-
-@pytest.fixture(scope="module")
 def galileo_matched(
-    galileo: FramesMeta, repo_root: Path, tmp_path_factory: pytest.TempPathFactory
+    galileo_input: FramesMeta, repo_root: Path, tmp_path_factory: pytest.TempPathFactory
 ) -> tuple[Path, list[ImagePair], MatchReport]:
     """Match the first two Galileo rig frames once and reuse the result."""
-    rig_frames = galileo.rig_frames()[:2]
+    rig_frames = galileo_input.rig_frames()[:2]
     keyframe_ids: list[int] = [keyframe_id for rig_frame in rig_frames for keyframe_id in rig_frame.keyframe_ids][:6]
     database_path: Path = tmp_path_factory.mktemp("matching") / "galileo.db"
-    subset: FramesMeta = _prepare(database_path, galileo, repo_root / "data" / "r2b_galileo", keyframe_ids)
+    subset: FramesMeta = _prepare(database_path, galileo_input, repo_root / "data" / "r2b_galileo", keyframe_ids)
     pairs: list[ImagePair] = select_pairs(subset, connected_keyframe_num=1)
     report: MatchReport = match_pairs(database_path, pairs, MatchingOptions())
     return database_path, pairs, report
@@ -101,7 +95,7 @@ def test_geometries_take_the_calibrated_path(galileo_matched: tuple[Path, list[I
 
 
 def test_stereo_pairs_inside_one_rig_frame_are_matched(
-    galileo: FramesMeta, galileo_matched: tuple[Path, list[ImagePair], MatchReport]
+    galileo_input: FramesMeta, galileo_matched: tuple[Path, list[ImagePair], MatchReport]
 ) -> None:
     """`skip_image_pairs_in_same_frame` must stay off: cuSFM matches the stereo baseline.
 
@@ -110,7 +104,7 @@ def test_stereo_pairs_inside_one_rig_frame_are_matched(
     """
     _, pairs, report = galileo_matched
     assert MatchingOptions().skip_image_pairs_in_same_frame is False
-    keyframe_by_id = galileo.keyframe_by_id()
+    keyframe_by_id = galileo_input.keyframe_by_id()
     same_frame: list[ImagePair] = [
         pair
         for pair in pairs
@@ -122,7 +116,7 @@ def test_stereo_pairs_inside_one_rig_frame_are_matched(
 
 
 def test_min_num_inliers_empties_a_pair_instead_of_trimming_it(
-    galileo: FramesMeta, repo_root: Path, tmp_path: Path
+    galileo_input: FramesMeta, repo_root: Path, tmp_path: Path
 ) -> None:
     """The blob drops the whole pair below 10 inliers; COLMAP's option does the same.
 
@@ -131,16 +125,16 @@ def test_min_num_inliers_empties_a_pair_instead_of_trimming_it(
     threshold loses its `matches` row too, not just its geometry. The blob keeps
     the raw matches and empties only the result.
     """
-    rig_frame = galileo.rig_frames()[0]
-    keyframe_by_id = galileo.keyframe_by_id()
-    stereo_camera_ids: set[int] = {galileo.stereo_pairs[0].left_camera_params_id, galileo.stereo_pairs[0].right_camera_params_id}
+    rig_frame = galileo_input.rig_frames()[0]
+    keyframe_by_id = galileo_input.keyframe_by_id()
+    stereo_camera_ids: set[int] = {galileo_input.stereo_pairs[0].left_camera_params_id, galileo_input.stereo_pairs[0].right_camera_params_id}
     keyframe_ids: list[int] = [
         keyframe_id
         for keyframe_id in rig_frame.keyframe_ids
         if keyframe_by_id[keyframe_id].camera_params_id in stereo_camera_ids
     ]
     database_path: Path = tmp_path / "thin.db"
-    subset: FramesMeta = _prepare(database_path, galileo, repo_root / "data" / "r2b_galileo", keyframe_ids)
+    subset: FramesMeta = _prepare(database_path, galileo_input, repo_root / "data" / "r2b_galileo", keyframe_ids)
     pairs: list[ImagePair] = stereo_pairs(subset)
     assert len(pairs) == 1
 
@@ -212,10 +206,10 @@ def test_verification_options_carry_the_blob_thresholds() -> None:
     assert options.ransac.confidence == pytest.approx(BLOB_RANSAC_CONFIDENCE)
 
 
-def test_empty_pair_list_does_no_work(galileo: FramesMeta, tmp_path: Path) -> None:
+def test_empty_pair_list_does_no_work(galileo_input: FramesMeta, tmp_path: Path) -> None:
     """An empty pair list returns an empty report rather than invoking COLMAP."""
     database_path: Path = tmp_path / "empty.db"
-    create_database(database_path, galileo.filtered([galileo.keyframes[0].keyframe_id]))
+    create_database(database_path, galileo_input.filtered([galileo_input.keyframes[0].keyframe_id]))
     report: MatchReport = match_pairs(database_path, [])
     assert report.pair_stats == {}
     assert report.elapsed_seconds == 0.0
@@ -317,25 +311,25 @@ def test_subsample_survives_an_empty_match_list() -> None:
 
 
 def test_matching_caps_the_verified_matches_written_to_the_database(
-    galileo: FramesMeta, repo_root: Path, tmp_path: Path
+    galileo_input: FramesMeta, repo_root: Path, tmp_path: Path
 ) -> None:
     """`max_matches_per_pair` reduces what the database stores, and None leaves it alone."""
-    keyframe_ids: list[int] = [keyframe_id for rig_frame in galileo.rig_frames()[:2] for keyframe_id in rig_frame.keyframe_ids][:4]
+    keyframe_ids: list[int] = [keyframe_id for rig_frame in galileo_input.rig_frames()[:2] for keyframe_id in rig_frame.keyframe_ids][:4]
     image_root: Path = repo_root / "data" / "r2b_galileo"
 
     uncapped_db: Path = tmp_path / "uncapped.db"
-    subset: FramesMeta = _prepare(uncapped_db, galileo, image_root, keyframe_ids)
+    subset: FramesMeta = _prepare(uncapped_db, galileo_input, image_root, keyframe_ids)
     pairs: list[ImagePair] = select_pairs(subset, connected_keyframe_num=1)
     uncapped: MatchReport = match_pairs(uncapped_db, pairs, MatchingOptions(max_matches_per_pair=None))
 
     capped_db: Path = tmp_path / "capped.db"
-    _prepare(capped_db, galileo, image_root, keyframe_ids)
+    _prepare(capped_db, galileo_input, image_root, keyframe_ids)
     cap: int = 40
     capped: MatchReport = match_pairs(capped_db, pairs, MatchingOptions(max_matches_per_pair=cap))
 
     for pair in pairs:
         stored: int = len(read_two_view_geometry(capped_db, pair[0], pair[1]).inlier_matches)
-        assert stored <= max(cap, 0) or stored == 0
+        assert stored <= cap
         assert capped.pair_stats[pair].inlier_matches == stored
         assert stored <= uncapped.pair_stats[pair].inlier_matches
     assert sum(stats.inlier_matches for stats in capped.pair_stats.values()) < sum(

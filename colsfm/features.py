@@ -41,10 +41,7 @@ from typing import Final, Literal, TypeAlias
 
 import pycolmap
 
-from colsfm.config import KeyframeSelectionConfig
-from colsfm.database import create_database, keypoint_counts
-from colsfm.frames_meta import FramesMeta
-from colsfm.keyframe_selection import KeyframeSelection, apply_selection, select_keyframes
+from colsfm.database import image_ids_by_name, keypoint_counts
 
 AlikedVariant: TypeAlias = Literal["ALIKED_N16ROT", "ALIKED_N32"]
 """The two ALIKED graphs COLMAP 4.2 can download and run."""
@@ -92,9 +89,6 @@ class FeatureOptions:
 
 DEFAULT_FEATURE_OPTIONS: Final[FeatureOptions] = FeatureOptions()
 """Shared immutable default, so the signatures below hold no constructor call."""
-
-DEFAULT_KEYFRAME_SELECTION: Final[KeyframeSelectionConfig] = KeyframeSelectionConfig()
-"""`feature_extractor_main`'s own gflag defaults (0.5 m / 5 deg / 50 us)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,9 +228,7 @@ def extract_features(
     )
     elapsed_seconds: float = time.perf_counter() - started
 
-    name_to_id: dict[str, int] = {
-        image.name: image.image_id for image in pycolmap.Database.open(database_path).read_all_images()
-    }
+    name_to_id: dict[str, int] = image_ids_by_name(database_path)
     wanted_ids: list[int] = [name_to_id[name] for name in image_names if name in name_to_id]
     report: ExtractionReport = ExtractionReport(
         keypoint_counts=keypoint_counts(database_path, wanted_ids),
@@ -245,62 +237,3 @@ def extract_features(
     )
     print(f"colsfm.features: {report.summary()}")
     return report
-
-
-@dataclass(frozen=True, slots=True)
-class SelectedExtraction:
-    """The full stage-1 result: which frames survived selection and what they yielded."""
-
-    selection: KeyframeSelection
-    """Kept keyframe ids and the dense 1-based rig renumbering."""
-    frames_meta: FramesMeta
-    """The filtered collection, i.e. what `feature_extractor_main` writes out."""
-    report: ExtractionReport
-    """Per-image keypoint counts and timing."""
-
-
-def extract_selected(
-    database_path: Path,
-    image_root: Path,
-    frames_meta: FramesMeta,
-    selection_config: KeyframeSelectionConfig = DEFAULT_KEYFRAME_SELECTION,
-    options: FeatureOptions = DEFAULT_FEATURE_OPTIONS,
-    *,
-    overwrite: bool = False,
-) -> SelectedExtraction:
-    """Select keyframes, create the database and extract features from the survivors.
-
-    Keyframe selection is `colsfm.keyframe_selection`'s; this only wires it to
-    the database and the extractor so no caller has to repeat the three steps.
-
-    Args:
-        database_path: Destination database.
-        image_root: Directory the `image_name` values are relative to.
-        frames_meta: The unfiltered input collection.
-        selection_config: The `feature_extractor_main` gflags that drive selection.
-        options: Extraction settings.
-        overwrite: Replace an existing database.
-
-    Returns:
-        The selection, the filtered collection and the extraction report.
-
-    Raises:
-        FileExistsError: When the database exists and `overwrite` is False.
-        RuntimeError: When `options.device` is `cuda` and CUDA is unusable.
-    """
-    selection: KeyframeSelection = select_keyframes(
-        frames_meta,
-        min_inter_frame_distance_m=selection_config.min_inter_frame_distance_m,
-        min_inter_frame_rotation_degrees=selection_config.min_inter_frame_rotation_degrees,
-        sample_sync_threshold_microseconds=selection_config.sample_sync_threshold_microseconds,
-    )
-    selected: FramesMeta = apply_selection(frames_meta, selection)
-    print(f"colsfm.features: {len(selected.keyframes)} frames selected from {len(frames_meta.keyframes)} raw frames.")
-    create_database(database_path, selected, overwrite=overwrite)
-    report: ExtractionReport = extract_features(
-        database_path,
-        image_root,
-        [keyframe.image_name for keyframe in selected.keyframes],
-        options,
-    )
-    return SelectedExtraction(selection=selection, frames_meta=selected, report=report)

@@ -26,8 +26,9 @@ from pathlib import Path
 import numpy as np
 import pycolmap
 import pytest
+from conftest import pose_delta, project_and_mask, read_blob_keyframes
 from google.protobuf.message import Message
-from jaxtyping import Float64, Int, UInt32
+from jaxtyping import Bool, Float64, Int, UInt32
 from numpy import ndarray
 from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
@@ -35,8 +36,7 @@ from scipy.spatial.transform import Rotation
 from colsfm.cameras import colmap_cameras
 from colsfm.config import CusfmConfig, VisionMappingConfig, read_config_directory
 from colsfm.export import read_runtime_records
-from colsfm.frames_meta import FramesMeta, KeyframeMeta, parse_message, read_frames_meta
-from colsfm.geometry import axis_angle_degrees_from_rigid3d, relative_rotation_degrees
+from colsfm.frames_meta import FramesMeta, KeyframeMeta, parse_message, read_frames_meta, write_rigid_transform
 from colsfm.mapping import (
     Correspondences,
     MappingOptions,
@@ -50,12 +50,11 @@ from colsfm.mapping import (
 )
 from colsfm.reconstruction import (
     RIG_ID,
-    RigReference,
+    PosedModel,
     build_reconstruction,
     camera_sensor_id,
     gauge_camera_params_id,
     gauge_rig_frame,
-    rig_reference,
 )
 from colsfm.schema import KEYFRAMES_METADATA_COLLECTION, load_schema
 
@@ -106,23 +105,6 @@ class SyntheticRig:
     """The true vehicle pose per `synced_sample_id`, before any perturbation."""
 
 
-def _rigid_transform_message(target: Message, pose: pycolmap.Rigid3d) -> None:
-    """Fill a `RigidTransform3d` message from a `Rigid3d`.
-
-    Args:
-        target: The `protos.common.geometry.RigidTransform3d` to fill.
-        pose: The pose to encode as axis-angle degrees plus metres.
-    """
-    axis_angle = axis_angle_degrees_from_rigid3d(pose)
-    target.axis_angle.x = float(axis_angle.axis_xyz[0])
-    target.axis_angle.y = float(axis_angle.axis_xyz[1])
-    target.axis_angle.z = float(axis_angle.axis_xyz[2])
-    target.axis_angle.angle_degrees = axis_angle.angle_degrees
-    target.translation.x = float(axis_angle.translation_xyz[0])
-    target.translation.y = float(axis_angle.translation_xyz[1])
-    target.translation.z = float(axis_angle.translation_xyz[2])
-
-
 def _pinhole_projection(camera_matrix: Float64[ndarray, "3 3"]) -> list[float]:
     """A 3x4 projection matrix, row-major, from a 3x3 intrinsic matrix.
 
@@ -167,7 +149,7 @@ def _fill_camera(
     message.sensor_meta_data.sensor_id = camera_params_id
     message.sensor_meta_data.sensor_name = f"camera_{camera_params_id}"
     message.sensor_meta_data.frequency = 30.0
-    _rigid_transform_message(message.sensor_meta_data.sensor_to_vehicle_transform, vehicle_T_cam)
+    write_rigid_transform(message.sensor_meta_data.sensor_to_vehicle_transform, vehicle_T_cam)
     message.calibration_parameters.image_width = IMAGE_WIDTH
     message.calibration_parameters.image_height = IMAGE_HEIGHT
     if fisheye:
@@ -207,7 +189,7 @@ def _project(
     reconstruction: pycolmap.Reconstruction,
     frames_meta: FramesMeta,
     points_xyz: Float64[ndarray, "num_points 3"],
-) -> tuple[dict[int, Float64[ndarray, "num_points 2"]], dict[int, Int[ndarray, " num_points"]]]:
+) -> tuple[dict[int, Float64[ndarray, "num_points 2"]], dict[int, Bool[ndarray, " num_points"]]]:
     """Project a point cloud into every image of a reconstruction.
 
     Args:
@@ -216,28 +198,17 @@ def _project(
         points_xyz: World points in metres.
 
     Returns:
-        Exact pixel projections per keyframe id, and a 0/1 visibility row per
-        keyframe id: in front of the camera and inside the image.
+        Exact pixel projections per keyframe id, and a visibility mask per keyframe
+        id: in front of the camera, finite, and inside the image.
     """
     projections: dict[int, Float64[ndarray, "num_points 2"]] = {}
-    visibility: dict[int, Int[ndarray, " num_points"]] = {}
+    visibility: dict[int, Bool[ndarray, " num_points"]] = {}
     for keyframe in frames_meta.keyframes:
         image: pycolmap.Image = reconstruction.image(keyframe.keyframe_id)
         camera: pycolmap.Camera = reconstruction.camera(image.camera_id)
-        cam_from_world: pycolmap.Rigid3d = image.cam_from_world()
-        points_in_cam: Float64[ndarray, "num_points 3"] = (
-            points_xyz @ cam_from_world.rotation.matrix().T + np.asarray(cam_from_world.translation)
-        )
-        projected: Float64[ndarray, "num_points 2"] = camera.img_from_cam(points_in_cam)
-        projections[keyframe.keyframe_id] = np.nan_to_num(projected, nan=-1.0, posinf=-1.0, neginf=-1.0)
-        visibility[keyframe.keyframe_id] = (
-            np.isfinite(projected).all(axis=1)
-            & (points_in_cam[:, 2] > 0.5)
-            & (projected[:, 0] >= 0.0)
-            & (projected[:, 0] < IMAGE_WIDTH)
-            & (projected[:, 1] >= 0.0)
-            & (projected[:, 1] < IMAGE_HEIGHT)
-        ).astype(np.int64)
+        projected, visible = project_and_mask(camera, image.cam_from_world(), points_xyz)
+        projections[keyframe.keyframe_id] = projected
+        visibility[keyframe.keyframe_id] = visible
     return projections, visibility
 
 
@@ -294,13 +265,13 @@ def build_synthetic_rig(
             entry.timestamp_microseconds = 1_000_000 + frame_index * 33_333
             entry.image_name = f"camera_{camera_params_id}/{frame_index:04d}.jpeg"
             entry.synced_sample_id = frame_index
-            _rigid_transform_message(
+            write_rigid_transform(
                 entry.camera_to_world, world_T_vehicle[frame_index] * vehicle_T_cams[camera_params_id]
             )
             keyframe_id += 1
 
     frames_meta: FramesMeta = parse_message(collection)
-    reconstruction: pycolmap.Reconstruction = build_reconstruction(frames_meta)
+    reconstruction: pycolmap.Reconstruction = build_reconstruction(frames_meta).reconstruction
     candidates: Float64[ndarray, "num_candidates 3"] = np.column_stack(
         [
             rng.uniform(2.0, 8.0 + 0.6 * num_frames, MULTIVIEW_OVERSAMPLING * num_points),
@@ -322,8 +293,8 @@ def build_synthetic_rig(
     keypoints: dict[int, Float64[ndarray, "num_observations 2"]] = {}
     indices: dict[int, Int[ndarray, " num_observations"]] = {}
     for keyframe in frames_meta.keyframes:
-        visible: Int[ndarray, " num_kept"] = visibility[keyframe.keyframe_id][keep]
-        exact: Float64[ndarray, "num_observations 2"] = projections[keyframe.keyframe_id][keep][visible.astype(bool)]
+        visible: Bool[ndarray, " num_kept"] = visibility[keyframe.keyframe_id][keep]
+        exact: Float64[ndarray, "num_observations 2"] = projections[keyframe.keyframe_id][keep][visible]
         keypoints[keyframe.keyframe_id] = exact + rng.normal(0.0, noise_px, exact.shape)
         indices[keyframe.keyframe_id] = np.flatnonzero(visible).astype(np.int64)
     return SyntheticRig(
@@ -443,6 +414,22 @@ def _quiet_options(**overrides: object) -> MappingOptions:
     return dataclasses.replace(MappingOptions(verbose=False), **overrides)
 
 
+def _every_round(mapping_config: VisionMappingConfig) -> VisionMappingConfig:
+    """The same configuration with the early exit switched off.
+
+    `run_mapping` leaves the outer loop when the observation change falls below
+    `max_observation_change`, and the statistic is never negative, so a threshold of
+    0.0 runs every one of `num_ba_iterations` rounds.
+
+    Args:
+        mapping_config: The mapping configuration.
+
+    Returns:
+        A copy whose `max_observation_change` is 0.0.
+    """
+    return dataclasses.replace(mapping_config, max_observation_change=0.0)
+
+
 def _match_tracks_to_truth(
     reconstruction: pycolmap.Reconstruction, rig: SyntheticRig
 ) -> tuple[set[int], int, list[float]]:
@@ -482,20 +469,6 @@ def _match_tracks_to_truth(
     return recovered, mixed_tracks, relative_errors
 
 
-def _pose_delta(actual: pycolmap.Rigid3d, expected: pycolmap.Rigid3d) -> tuple[float, float]:
-    """Translation and rotation difference between two poses.
-
-    Args:
-        actual: Pose under test.
-        expected: Reference pose.
-
-    Returns:
-        Translation difference in metres and rotation difference in degrees.
-    """
-    translation_m: float = float(np.linalg.norm(np.asarray(actual.translation) - np.asarray(expected.translation)))
-    return translation_m, relative_rotation_degrees(actual, expected)
-
-
 def test_pixel_error_schedule_is_the_isaac_ramp(isaac_config: CusfmConfig) -> None:
     """The gate decays linearly across the outer loop: 25, 20, 15, 10, 5 (§5.6).
 
@@ -512,7 +485,7 @@ def test_load_correspondences_fills_points2d_and_the_graph(
     Nothing is re-estimated: the poses the reconstruction went in with come back
     out bit-identical.
     """
-    reconstruction: pycolmap.Reconstruction = build_reconstruction(synthetic_rig.frames_meta)
+    reconstruction: pycolmap.Reconstruction = build_reconstruction(synthetic_rig.frames_meta).reconstruction
     poses_before: dict[int, Float64[ndarray, "3 4"]] = {
         frame_id: reconstruction.frame(frame_id).rig_from_world.matrix().copy() for frame_id in sorted(reconstruction.frames)
     }
@@ -548,7 +521,7 @@ def test_load_correspondences_rejects_a_database_with_other_image_ids(
         image_id_offset=1000,
     )
 
-    reconstruction: pycolmap.Reconstruction = build_reconstruction(synthetic_rig.frames_meta)
+    reconstruction: pycolmap.Reconstruction = build_reconstruction(synthetic_rig.frames_meta).reconstruction
     with pytest.raises(ValueError, match="disagree on image ids"):
         load_correspondences(reconstruction, database_path)
 
@@ -561,11 +534,9 @@ def test_run_mapping_recovers_the_synthetic_points(
     Ground truth is the point cloud the observations were generated from, so a
     recovered point is only counted when it lands within a centimetre of one.
     """
-    reconstruction: pycolmap.Reconstruction = build_reconstruction(synthetic_rig.frames_meta)
+    model: PosedModel = build_reconstruction(synthetic_rig.frames_meta)
     mapping_config: VisionMappingConfig = isaac_config.vision_mapping
-    result: MappingResult = run_mapping(
-        reconstruction, synthetic_database, mapping_config, mapping_config.bundle_adjustment, _quiet_options()
-    )
+    result: MappingResult = run_mapping(model, synthetic_database, mapping_config, _quiet_options())
 
     recovered, mixed_tracks, relative_errors = _match_tracks_to_truth(result.reconstruction, synthetic_rig)
     fraction: float = len(recovered) / len(synthetic_rig.points_xyz)
@@ -596,15 +567,12 @@ def test_the_outer_loop_can_run_to_the_end_or_exit_early(
     On exact synthetic geometry no track merges, completes or gets filtered, so
     the statistic is 0 and the loop stops after one round. cuSFM's own log says
     `use num_ba_iterations to stop BA`, i.e. its two stopping rules are
-    exclusive, so the switch to run every round regardless exists too.
+    exclusive, and a `max_observation_change` of 0.0 is how the configuration asks
+    for every round regardless.
     """
     mapping_config: VisionMappingConfig = isaac_config.vision_mapping
     early: MappingResult = run_mapping(
-        build_reconstruction(synthetic_rig.frames_meta),
-        synthetic_database,
-        mapping_config,
-        mapping_config.bundle_adjustment,
-        _quiet_options(),
+        build_reconstruction(synthetic_rig.frames_meta), synthetic_database, mapping_config, _quiet_options()
     )
     assert len(early.rounds) == 1
     assert early.rounds[0].observation_change < mapping_config.max_observation_change
@@ -612,12 +580,35 @@ def test_the_outer_loop_can_run_to_the_end_or_exit_early(
     full: MappingResult = run_mapping(
         build_reconstruction(synthetic_rig.frames_meta),
         synthetic_database,
-        mapping_config,
-        mapping_config.bundle_adjustment,
-        _quiet_options(stop_on_observation_change=False),
+        _every_round(mapping_config),
+        _quiet_options(),
     )
     assert len(full.rounds) == mapping_config.num_ba_iterations == 5
     assert [round_stats.max_pixel_error for round_stats in full.rounds] == [25.0, 20.0, 15.0, 10.0, 5.0]
+
+
+def _random_offset(
+    rng: np.random.Generator, translation_m: float, rotation_deg: float
+) -> pycolmap.Rigid3d:
+    """One rigid offset of an exact size, in a random direction.
+
+    Both the pose-recovery and the extrinsic-recovery tests need the same thing: an
+    error whose magnitude is known to the metre and the degree, so that what is
+    measured afterwards is how much of it came back.
+
+    Args:
+        rng: The generator; the rotation is drawn before the translation.
+        translation_m: Length of the translation, metres.
+        rotation_deg: Angle of the rotation, degrees.
+
+    Returns:
+        The offset transform.
+    """
+    rotation_vector: Float64[ndarray, "3"] = rng.normal(0.0, 1.0, 3)
+    rotation_vector = rotation_vector / np.linalg.norm(rotation_vector) * np.deg2rad(rotation_deg)
+    translation: Float64[ndarray, "3"] = rng.normal(0.0, 1.0, 3)
+    translation = translation / np.linalg.norm(translation) * translation_m
+    return pycolmap.Rigid3d(pycolmap.Rotation3d(Rotation.from_rotvec(rotation_vector).as_quat()), translation)
 
 
 def _perturbed_metadata(rig: SyntheticRig, seed: int = 11) -> FramesMeta:
@@ -639,14 +630,11 @@ def _perturbed_metadata(rig: SyntheticRig, seed: int = 11) -> FramesMeta:
     gauge_sample_id: int = gauge_rig_frame(rig.frames_meta).synced_sample_id
     perturbed_poses: dict[int, pycolmap.Rigid3d] = {}
     for rig_frame in rig.frames_meta.rig_frames():
-        if rig_frame.synced_sample_id == gauge_sample_id:
-            offset: pycolmap.Rigid3d = pycolmap.Rigid3d()
-        else:
-            rotation_vector: Float64[ndarray, "3"] = rng.normal(0.0, 1.0, 3)
-            rotation_vector = rotation_vector / np.linalg.norm(rotation_vector) * np.deg2rad(PERTURBATION_DEG)
-            translation: Float64[ndarray, "3"] = rng.normal(0.0, 1.0, 3)
-            translation = translation / np.linalg.norm(translation) * PERTURBATION_M
-            offset = pycolmap.Rigid3d(pycolmap.Rotation3d(Rotation.from_rotvec(rotation_vector).as_quat()), translation)
+        offset: pycolmap.Rigid3d = (
+            pycolmap.Rigid3d()
+            if rig_frame.synced_sample_id == gauge_sample_id
+            else _random_offset(rng, PERTURBATION_M, PERTURBATION_DEG)
+        )
         world_T_vehicle: pycolmap.Rigid3d = rig_frame.world_T_vehicle * offset
         for keyframe_id in rig_frame.keyframe_ids:
             camera_params_id: int = keyframe_by_id[keyframe_id].camera_params_id
@@ -677,31 +665,28 @@ def test_bundle_adjustment_pulls_perturbed_rig_poses_back(
     _write_database(database_path, rig.frames_meta, rig.keypoints_px, _synthetic_matches(rig))
     perturbed_meta: FramesMeta = _perturbed_metadata(rig)
 
-    reconstruction: pycolmap.Reconstruction = build_reconstruction(perturbed_meta)
+    model: PosedModel = build_reconstruction(perturbed_meta)
+    reconstruction: pycolmap.Reconstruction = model.reconstruction
     extrinsics_before: dict[int, Float64[ndarray, "3 4"]] = {
         camera_params_id: reconstruction.rig(RIG_ID).sensor_from_rig(camera_sensor_id(camera_params_id)).matrix().copy()
         for camera_params_id in sorted(perturbed_meta.cameras)
     }
     start_translation_m: float = max(
-        _pose_delta(reconstruction.frame(rig_frame.synced_sample_id).rig_from_world.inverse(), rig_frame.world_T_vehicle)[0]
+        pose_delta(reconstruction.frame(rig_frame.synced_sample_id).rig_from_world.inverse(), rig_frame.world_T_vehicle)[0]
         for rig_frame in rig.frames_meta.rig_frames()
     )
     assert start_translation_m == pytest.approx(PERTURBATION_M, abs=1e-6)
 
     mapping_config: VisionMappingConfig = isaac_config.vision_mapping
     result: MappingResult = run_mapping(
-        reconstruction,
-        database_path,
-        mapping_config,
-        mapping_config.bundle_adjustment,
-        _quiet_options(stop_on_observation_change=False),
+        model, database_path, _every_round(mapping_config), _quiet_options()
     )
 
     worst_translation_m: float = 0.0
     worst_rotation_deg: float = 0.0
     for rig_frame in rig.frames_meta.rig_frames():
         frame: pycolmap.Frame = result.reconstruction.frame(rig_frame.synced_sample_id)
-        translation_m, rotation_deg = _pose_delta(frame.rig_from_world.inverse(), rig_frame.world_T_vehicle)
+        translation_m, rotation_deg = pose_delta(frame.rig_from_world.inverse(), rig_frame.world_T_vehicle)
         worst_translation_m = max(worst_translation_m, translation_m)
         worst_rotation_deg = max(worst_rotation_deg, rotation_deg)
     print(
@@ -731,7 +716,6 @@ def test_run_mapping_is_deterministic_on_one_thread(
             build_reconstruction(synthetic_rig.frames_meta),
             synthetic_database,
             mapping_config,
-            mapping_config.bundle_adjustment,
             _quiet_options(num_threads=1),
         )
         for _ in range(2)
@@ -753,14 +737,13 @@ def test_fisheye_rig_triangulates(tmp_path: Path, isaac_config: CusfmConfig) -> 
     database_path: Path = tmp_path / "fisheye.db"
     _write_database(database_path, rig.frames_meta, rig.keypoints_px, _synthetic_matches(rig))
 
-    reconstruction: pycolmap.Reconstruction = build_reconstruction(rig.frames_meta)
+    model: PosedModel = build_reconstruction(rig.frames_meta)
+    reconstruction: pycolmap.Reconstruction = model.reconstruction
     assert {camera.model.name for camera in reconstruction.cameras.values()} == {"OPENCV_FISHEYE"}
     assert all(camera.has_prior_focal_length for camera in reconstruction.cameras.values())
 
     mapping_config: VisionMappingConfig = isaac_config.vision_mapping
-    result: MappingResult = run_mapping(
-        reconstruction, database_path, mapping_config, mapping_config.bundle_adjustment, _quiet_options()
-    )
+    result: MappingResult = run_mapping(model, database_path, mapping_config, _quiet_options())
     print(f"[colsfm] fisheye: {result.num_points3D} points, reprojection {result.mean_reprojection_error_px:.4f} px")
     assert result.num_points3D > 100
     assert result.mean_reprojection_error_px < 1.0
@@ -792,12 +775,10 @@ DROPPED_PAIRS_PATTERN: str = r"Filter image pairs: by min matches=\d+: (\d+)"
 
 
 def _blob_keypoints(keyframe_dir: Path, frames_meta: FramesMeta) -> dict[int, Float64[ndarray, "num_keypoints 2"]]:
-    """Read the extractor's keypoint pixel coordinates out of the blob's keyframes.
+    """Take the extractor's keypoint pixel columns out of the blob's own keyframes.
 
-    A keyframe file is `<keyframe_dir>/<camera_name>/<timestamp_ns>.pb`, the same
-    path as the image name with a different suffix (feature_matcher_main.md
-    §4.1). Only `keypoint_vector.x` and `.y` are read; the descriptors are what
-    the matcher needed and the mapper never sees them.
+    Only `keypoint_vector.x` and `.y` are read; the descriptors are what the matcher
+    needed and the mapper never sees them.
 
     Args:
         keyframe_dir: The run's `keyframes` directory.
@@ -807,19 +788,16 @@ def _blob_keypoints(keyframe_dir: Path, frames_meta: FramesMeta) -> dict[int, Fl
         Keypoints per keyframe id, in the file's own order — which is what the
         match files index into.
     """
-    keyframe_class = load_schema().message_class("protos.visual.general.Keyframe")
-    keypoints: dict[int, Float64[ndarray, "num_keypoints 2"]] = {}
-    for keyframe in frames_meta.keyframes:
-        message: Message = keyframe_class()
-        message.ParseFromString((keyframe_dir / Path(keyframe.image_name).with_suffix(".pb")).read_bytes())
-        keypoints[keyframe.keyframe_id] = np.stack(
+    return {
+        keyframe_id: np.stack(
             [
                 np.asarray(message.keypoint_vector.x, dtype=np.float64),
                 np.asarray(message.keypoint_vector.y, dtype=np.float64),
             ],
             axis=1,
         )
-    return keypoints
+        for keyframe_id, message in read_blob_keyframes(keyframe_dir, frames_meta).items()
+    }
 
 
 def _blob_matches(matches_dir: Path) -> dict[tuple[int, int], UInt32[ndarray, "num_matches 2"]]:
@@ -946,11 +924,7 @@ def parity(galileo_blob: BlobRun, isaac_config: CusfmConfig) -> ParityRun:
     mapping_config: VisionMappingConfig = isaac_config.vision_mapping
     started: float = time.perf_counter()
     result: MappingResult = run_mapping(
-        build_reconstruction(galileo_blob.input_meta),
-        galileo_blob.database_path,
-        mapping_config,
-        mapping_config.bundle_adjustment,
-        _quiet_options(),
+        build_reconstruction(galileo_blob.input_meta), galileo_blob.database_path, mapping_config, _quiet_options()
     )
     return ParityRun(result=result, elapsed_seconds=time.perf_counter() - started)
 
@@ -968,7 +942,7 @@ def test_the_blob_database_keeps_the_pairs_the_blob_kept(galileo_blob: BlobRun, 
     32-keyframe run. Those images stay registered and simply observe nothing,
     which is also why the blob exports 28 images out of 32.
     """
-    reconstruction: pycolmap.Reconstruction = build_reconstruction(galileo_blob.input_meta)
+    reconstruction: pycolmap.Reconstruction = build_reconstruction(galileo_blob.input_meta).reconstruction
     correspondences = load_correspondences(
         reconstruction, galileo_blob.database_path, isaac_config.vision_mapping.min_num_matches_per_pair
     )
@@ -1046,12 +1020,12 @@ def test_galileo_rig_poses_match_the_blob(galileo_blob: BlobRun, parity: ParityR
         rig_frame.synced_sample_id: rig_frame.world_T_vehicle for rig_frame in galileo_blob.input_meta.rig_frames()
     }
     for rig_frame in galileo_blob.output_meta.rig_frames():
-        correction_m, correction_deg = _pose_delta(
+        correction_m, correction_deg = pose_delta(
             input_by_sample[rig_frame.synced_sample_id], rig_frame.world_T_vehicle
         )
         blob_correction_m = max(blob_correction_m, correction_m)
         blob_correction_deg = max(blob_correction_deg, correction_deg)
-        translation_m, rotation_deg = _pose_delta(
+        translation_m, rotation_deg = pose_delta(
             parity.result.reconstruction.frame(rig_frame.synced_sample_id).rig_from_world.inverse(),
             rig_frame.world_T_vehicle,
         )
@@ -1070,7 +1044,7 @@ def test_galileo_rig_poses_match_the_blob(galileo_blob: BlobRun, parity: ParityR
 
     # Both sides hold the same rig frame constant, so it cannot have moved.
     gauge_sample_id: int = gauge_rig_frame(galileo_blob.input_meta).synced_sample_id
-    gauge_translation_m, gauge_rotation_deg = _pose_delta(
+    gauge_translation_m, gauge_rotation_deg = pose_delta(
         parity.result.reconstruction.frame(gauge_sample_id).rig_from_world.inverse(),
         next(
             rig_frame
@@ -1097,18 +1071,20 @@ def test_the_cauchy_scale_is_the_sigma_whitening_equivalent(galileo_blob: BlobRu
     mapping_config: VisionMappingConfig = isaac_config.vision_mapping
     deltas_mm: dict[float, float] = {}
     for sigma in (1.0, 4.0, 8.0):
-        ba_config = dataclasses.replace(
-            mapping_config.bundle_adjustment, reprojection_error_standard_deviation=sigma
+        scaled_config: VisionMappingConfig = dataclasses.replace(
+            mapping_config,
+            bundle_adjustment=dataclasses.replace(
+                mapping_config.bundle_adjustment, reprojection_error_standard_deviation=sigma
+            ),
         )
         result: MappingResult = run_mapping(
             build_reconstruction(galileo_blob.input_meta),
             galileo_blob.database_path,
-            mapping_config,
-            ba_config,
+            scaled_config,
             _quiet_options(),
         )
         deltas_mm[sigma] = 1e3 * max(
-            _pose_delta(
+            pose_delta(
                 result.reconstruction.frame(rig_frame.synced_sample_id).rig_from_world.inverse(),
                 rig_frame.world_T_vehicle,
             )[0]
@@ -1143,7 +1119,7 @@ def _triangulated(rig: SyntheticRig, database_path: Path, config: CusfmConfig) -
     Returns:
         The triangulated reconstruction and the correspondences that own its manager.
     """
-    reconstruction: pycolmap.Reconstruction = build_reconstruction(rig.frames_meta)
+    reconstruction: pycolmap.Reconstruction = build_reconstruction(rig.frames_meta).reconstruction
     correspondences: Correspondences = load_correspondences(
         reconstruction, database_path, config.vision_mapping.min_num_matches_per_pair
     )
@@ -1230,7 +1206,7 @@ def test_projection_failure_guard_drops_a_point_pushed_into_a_camera(
     survivor: int = point3D_ids[1]
     survivor_track_length: int = reconstruction.point3D(survivor).track.length()
     observer: pycolmap.Image = reconstruction.image(reconstruction.point3D(doomed).track.elements[0].image_id)
-    reconstruction.point3D(doomed).xyz = observer.cam_from_world().inverse() * np.array([0.5, 0.5, 1e-6])
+    _corrupt_point(reconstruction, doomed, observer.cam_from_world().inverse() * np.array([0.5, 0.5, 1e-6]))
     reconstruction.update_point_3d_errors()
     assert reconstruction.point3D(doomed).error > bound_px
 
@@ -1325,15 +1301,7 @@ def _perturbed_extrinsic(pose: pycolmap.Rigid3d, seed: int = 5) -> pycolmap.Rigi
     Returns:
         The perturbed transform.
     """
-    rng: np.random.Generator = np.random.default_rng(seed)
-    rotation_vector: Float64[ndarray, "3"] = rng.normal(0.0, 1.0, 3)
-    rotation_vector = rotation_vector / np.linalg.norm(rotation_vector) * np.deg2rad(PERTURBATION_DEG)
-    translation: Float64[ndarray, "3"] = rng.normal(0.0, 1.0, 3)
-    translation = translation / np.linalg.norm(translation) * EXTRINSIC_PERTURBATION_M
-    offset: pycolmap.Rigid3d = pycolmap.Rigid3d(
-        pycolmap.Rotation3d(Rotation.from_rotvec(rotation_vector).as_quat()), translation
-    )
-    return pose * offset
+    return pose * _random_offset(np.random.default_rng(seed), EXTRINSIC_PERTURBATION_M, PERTURBATION_DEG)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1378,14 +1346,11 @@ def extrinsic_runs(
     )
 
     def _map(frames_meta: FramesMeta, optimize_extrinsics: bool) -> MappingResult:
-        reference: RigReference = rig_reference(frames_meta, reference_camera_params_id)
         return run_mapping(
             build_reconstruction(frames_meta, reference_camera_params_id=reference_camera_params_id),
             galileo_colsfm_database,
             mapping_config,
-            mapping_config.bundle_adjustment,
             _quiet_options(optimize_extrinsics=optimize_extrinsics, num_threads=1),
-            rig_reference=reference,
         )
 
     return ExtrinsicRuns(
@@ -1415,21 +1380,20 @@ def test_refinement_removes_a_20_mm_extrinsic_perturbation(
     """
     truth: pycolmap.Rigid3d = galileo_pose_graph_meta.cameras[extrinsic_runs.perturbed_camera_params_id].vehicle_T_cam
     started: pycolmap.Rigid3d = extrinsic_runs.perturbed_meta.cameras[extrinsic_runs.perturbed_camera_params_id].vehicle_T_cam
-    assert _pose_delta(started, truth)[0] == pytest.approx(EXTRINSIC_PERTURBATION_M, abs=1e-9)
+    assert pose_delta(started, truth)[0] == pytest.approx(EXTRINSIC_PERTURBATION_M, abs=1e-9)
 
     assert extrinsic_runs.fixed.refined_extrinsics is None, "nothing is refined when the flag is off"
-    reference: RigReference = rig_reference(extrinsic_runs.perturbed_meta, extrinsic_runs.reference_camera_params_id)
-    kept: dict[int, pycolmap.Rigid3d] = reference.vehicle_T_cam_by_camera_params_id(
+    kept: dict[int, pycolmap.Rigid3d] = extrinsic_runs.fixed.reference.vehicle_T_cam_by_camera_params_id(
         extrinsic_runs.fixed.reconstruction
     )
-    assert _pose_delta(kept[extrinsic_runs.perturbed_camera_params_id], truth)[0] == pytest.approx(EXTRINSIC_PERTURBATION_M, abs=1e-9)
+    assert pose_delta(kept[extrinsic_runs.perturbed_camera_params_id], truth)[0] == pytest.approx(EXTRINSIC_PERTURBATION_M, abs=1e-9)
 
     assert extrinsic_runs.refined.refined_extrinsics is not None
     assert extrinsic_runs.refined_from_clean.refined_extrinsics is not None
     recovered: pycolmap.Rigid3d = extrinsic_runs.refined.refined_extrinsics[extrinsic_runs.perturbed_camera_params_id]
     clean: pycolmap.Rigid3d = extrinsic_runs.refined_from_clean.refined_extrinsics[extrinsic_runs.perturbed_camera_params_id]
-    translation_m, rotation_deg = _pose_delta(recovered, clean)
-    residual_m, residual_deg = _pose_delta(recovered, truth)
+    translation_m, rotation_deg = pose_delta(recovered, clean)
+    residual_m, residual_deg = pose_delta(recovered, truth)
     print(
         f"[colsfm] extrinsic refinement: camera {extrinsic_runs.perturbed_camera_params_id} started "
         f"{EXTRINSIC_PERTURBATION_M * 1e3:.1f} mm / {PERTURBATION_DEG} deg off, landed "
@@ -1455,7 +1419,7 @@ def test_the_fixed_camera_extrinsic_is_untouched(
     """
     assert extrinsic_runs.refined.refined_extrinsics is not None
     camera_params_id: int = extrinsic_runs.reference_camera_params_id
-    translation_m, rotation_deg = _pose_delta(
+    translation_m, rotation_deg = pose_delta(
         extrinsic_runs.refined.refined_extrinsics[camera_params_id],
         galileo_pose_graph_meta.cameras[camera_params_id].vehicle_T_cam,
     )
@@ -1480,7 +1444,7 @@ def test_the_unregularised_refinement_drifts_on_weakly_covisible_cameras(
     assert refined is not None
     assert sorted(refined) == sorted(extrinsic_runs.refined_from_clean.reconstruction.cameras)
     moved_m: dict[int, float] = {
-        camera_params_id: _pose_delta(pose, galileo_pose_graph_meta.cameras[camera_params_id].vehicle_T_cam)[0]
+        camera_params_id: pose_delta(pose, galileo_pose_graph_meta.cameras[camera_params_id].vehicle_T_cam)[0]
         for camera_params_id, pose in refined.items()
     }
     print(
@@ -1512,22 +1476,5 @@ def test_refining_extrinsics_on_a_vehicle_referenced_rig_is_refused(
             build_reconstruction(synthetic_rig.frames_meta),
             synthetic_database,
             mapping_config,
-            mapping_config.bundle_adjustment,
-            _quiet_options(optimize_extrinsics=True),
-        )
-
-
-def test_refining_extrinsics_without_a_rig_reference_is_refused(
-    synthetic_rig: SyntheticRig, synthetic_database: Path, isaac_config: CusfmConfig
-) -> None:
-    """Even a camera-referenced rig needs the input `vehicle_T_cam_ref` to invert with."""
-    mapping_config: VisionMappingConfig = isaac_config.vision_mapping
-    reference_camera_params_id: int = gauge_camera_params_id(synthetic_rig.frames_meta)
-    with pytest.raises(ValueError, match="rig_reference"):
-        run_mapping(
-            build_reconstruction(synthetic_rig.frames_meta, reference_camera_params_id=reference_camera_params_id),
-            synthetic_database,
-            mapping_config,
-            mapping_config.bundle_adjustment,
             _quiet_options(optimize_extrinsics=True),
         )

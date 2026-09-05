@@ -24,18 +24,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal, TypeAlias
 
 import numpy as np
-import pycolmap
 import tyro
 from jaxtyping import Int64
 from numpy import ndarray
 from serde import serde
-from serde.json import to_json
 
-from colsfm.benchmark import GROUND_TRUTH_TOLERANCE_MICROSECONDS, RigTrack, match_timestamps, rig_track_from_frames_meta
-from colsfm.frames_meta import FramesMeta, read_frames_meta
-from tools.audit.galileo_metrics import GalileoReference, TrajectoryScore, read_galileo_reference, score_positions
+from colsfm.benchmark import RigTrack, read_run, rig_track_from_frames_meta, write_json_report
+from tools.audit.galileo_metrics import (
+    GalileoReference,
+    TrajectoryScore,
+    read_galileo_reference,
+    score_track_against_ground_truth,
+)
 
 
 @dataclass(frozen=True)
@@ -52,6 +55,11 @@ class TrajectoryAuditConfig:
     """Where the machine-readable result is written."""
 
 
+SampleSet: TypeAlias = Literal["own", "common"]
+"""Which rig frames a trajectory is scored on: its own registered ones, or the
+intersection of all three trajectories' so that no run is scored on a different set."""
+
+
 @serde
 @dataclass(frozen=True)
 class ScoredTrajectory:
@@ -59,18 +67,11 @@ class ScoredTrajectory:
 
     name: str
     """`input`, `blob` or `colsfm`."""
-    sample_set: str
-    """`own` (the run's own registered samples) or `common` (the intersection)."""
-    num_matched: int
-    """Rig frames that joined ground truth."""
-    rigid_rmse_millimeters: float
-    """RMSE after a rigid fit with the scale held at 1.0."""
-    rigid_max_millimeters: float
-    """Largest residual of that fit."""
-    would_be_scale: float
-    """Scale a similarity fit would have chosen."""
-    similarity_rmse_millimeters: float
-    """RMSE after a scale-free SIM(3) fit, for reference only."""
+    sample_set: SampleSet
+    """Which rig frames it was scored on."""
+    score: TrajectoryScore
+    """Every number the scorer produced, embedded whole rather than transcribed —
+    the previous shape restated five of its seven fields and dropped two."""
 
 
 @serde
@@ -84,21 +85,6 @@ class TrajectoryAuditResult:
     """Every trajectory, on every sample set."""
     verdict: str
     """One sentence stating whether refinement improved the input trajectory."""
-
-
-def _track_of_run(run_dir: Path) -> RigTrack:
-    """Rig trajectory of a cuSFM-layout run, restricted to its registered images.
-
-    Args:
-        run_dir: A `.../cusfm` directory.
-
-    Returns:
-        The optimised rig trajectory.
-    """
-    reconstruction: pycolmap.Reconstruction = pycolmap.Reconstruction(str(run_dir / "sparse"))
-    registered_names: set[str] = {image.name for image in reconstruction.images.values() if image.num_points3D > 0}
-    frames_meta: FramesMeta = read_frames_meta(run_dir / "kpmap" / "keyframes" / "frames_meta.json")
-    return rig_track_from_frames_meta(frames_meta, keep_image_names=registered_names)
 
 
 def _score_on_timestamps(track: RigTrack, reference: GalileoReference, keep_microseconds: set[int] | None) -> TrajectoryScore:
@@ -115,13 +101,12 @@ def _score_on_timestamps(track: RigTrack, reference: GalileoReference, keep_micr
     selected: Int64[ndarray, "m"] = (
         np.arange(len(track), dtype=np.int64)
         if keep_microseconds is None
-        else np.asarray([index for index, stamp in enumerate(track.timestamps_microseconds) if int(stamp) in keep_microseconds], dtype=np.int64)
+        else np.asarray(
+            [index for index, stamp in enumerate(track.timestamps_microseconds) if int(stamp) in keep_microseconds],
+            dtype=np.int64,
+        )
     )
-    subset: RigTrack = track.take(selected)
-    track_indices, reference_indices = match_timestamps(
-        subset.timestamps_microseconds, reference.ground_truth.timestamps_microseconds, GROUND_TRUTH_TOLERANCE_MICROSECONDS
-    )
-    return score_positions(subset.world_t_rig[track_indices], reference.ground_truth.world_t_rig[reference_indices])
+    return score_track_against_ground_truth(track.take(selected), reference.ground_truth)
 
 
 def main(config: TrajectoryAuditConfig) -> None:
@@ -131,33 +116,27 @@ def main(config: TrajectoryAuditConfig) -> None:
         config: Paths for the three trajectories and the output report.
     """
     reference: GalileoReference = read_galileo_reference(config.input_dir)
+    # `read_run` is the benchmark's own reader, so these tracks are built from the same
+    # sparse model, the same optimised metadata and the same registered-image rule the
+    # report's numbers come from.
     tracks: dict[str, RigTrack] = {
         "input": rig_track_from_frames_meta(reference.frames_meta),
-        "blob": _track_of_run(config.blob_run),
-        "colsfm": _track_of_run(config.colsfm_run),
+        "blob": read_run(config.blob_run, "blob").track,
+        "colsfm": read_run(config.colsfm_run, "colsfm").track,
     }
 
     common: set[int] = set.intersection(*({int(stamp) for stamp in track.timestamps_microseconds} for track in tracks.values()))
-    scored: list[ScoredTrajectory] = []
-    for sample_set, keep in (("own", None), ("common", common)):
-        for name, track in tracks.items():
-            score: TrajectoryScore = _score_on_timestamps(track, reference, keep)
-            scored.append(
-                ScoredTrajectory(
-                    name=name,
-                    sample_set=sample_set,
-                    num_matched=score.num_matched,
-                    rigid_rmse_millimeters=score.rigid_rmse_millimeters,
-                    rigid_max_millimeters=score.rigid_max_millimeters,
-                    would_be_scale=score.would_be_scale,
-                    similarity_rmse_millimeters=score.similarity_rmse_millimeters,
-                )
-            )
+    sample_sets: tuple[tuple[SampleSet, set[int] | None], ...] = (("own", None), ("common", common))
+    scored: list[ScoredTrajectory] = [
+        ScoredTrajectory(name=name, sample_set=sample_set, score=_score_on_timestamps(track, reference, keep))
+        for sample_set, keep in sample_sets
+        for name, track in tracks.items()
+    ]
 
-    by_key: dict[tuple[str, str], ScoredTrajectory] = {(item.name, item.sample_set): item for item in scored}
-    input_rmse: float = by_key[("input", "common")].rigid_rmse_millimeters
-    blob_rmse: float = by_key[("blob", "common")].rigid_rmse_millimeters
-    colsfm_rmse: float = by_key[("colsfm", "common")].rigid_rmse_millimeters
+    by_key: dict[tuple[str, SampleSet], ScoredTrajectory] = {(item.name, item.sample_set): item for item in scored}
+    input_rmse: float = by_key[("input", "common")].score.rigid_rmse_millimeters
+    blob_rmse: float = by_key[("blob", "common")].score.rigid_rmse_millimeters
+    colsfm_rmse: float = by_key[("colsfm", "common")].score.rigid_rmse_millimeters
     verdict: str = (
         f"on the {len(common)} common rig frames: input {input_rmse:.2f} mm, blob {blob_rmse:.2f} mm "
         f"({blob_rmse - input_rmse:+.2f} mm), colsfm {colsfm_rmse:.2f} mm ({colsfm_rmse - input_rmse:+.2f} mm)"
@@ -166,15 +145,14 @@ def main(config: TrajectoryAuditConfig) -> None:
     print(f"{'trajectory':<10} {'set':<8} {'matched':>8} {'RMSE mm':>9} {'max mm':>9} {'scale':>9} {'SIM3 mm':>9}")
     for item in scored:
         print(
-            f"{item.name:<10} {item.sample_set:<8} {item.num_matched:>8d} {item.rigid_rmse_millimeters:>9.3f} "
-            f"{item.rigid_max_millimeters:>9.3f} {item.would_be_scale:>9.5f} {item.similarity_rmse_millimeters:>9.3f}"
+            f"{item.name:<10} {item.sample_set:<8} {item.score.num_matched:>8d} "
+            f"{item.score.rigid_rmse_millimeters:>9.3f} {item.score.rigid_max_millimeters:>9.3f} "
+            f"{item.score.would_be_scale:>9.5f} {item.score.similarity_rmse_millimeters:>9.3f}"
         )
     print(f"\n{verdict}")
 
     result: TrajectoryAuditResult = TrajectoryAuditResult(input_dir=str(config.input_dir), scored=tuple(scored), verdict=verdict)
-    config.output_json.parent.mkdir(parents=True, exist_ok=True)
-    config.output_json.write_text(to_json(result))
-    print(f"wrote {config.output_json}")
+    print(f"wrote {write_json_report(config.output_json, result)}")
 
 
 if __name__ == "__main__":

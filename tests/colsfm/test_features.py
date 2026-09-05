@@ -10,19 +10,17 @@ import pytest
 from jaxtyping import Float32
 from numpy import ndarray
 
-from colsfm.config import KeyframeSelectionConfig
 from colsfm.database import create_database, read_keypoints
 from colsfm.features import (
     BLOB_MAX_KEYPOINTS,
     ExtractionReport,
     FeatureOptions,
-    SelectedExtraction,
     cudnn_is_available,
     extract_features,
-    extract_selected,
     resolve_device,
 )
-from colsfm.frames_meta import FramesMeta, read_frames_meta
+from colsfm.frames_meta import FramesMeta
+from colsfm.keyframe_selection import KeyframeSelection, apply_selection, select_keyframes
 
 FAST_IMAGE_SIZE: int = 640
 """Longest side used where the test cares about wiring rather than keypoint counts.
@@ -33,36 +31,27 @@ provider this is the difference between 2.8 s and 0.4 s per 1920x1200 image.
 """
 
 
-@pytest.fixture(scope="module")
-def galileo(galileo_input_meta: Path) -> FramesMeta:
-    """The 226-keyframe Galileo input metadata."""
-    return read_frames_meta(galileo_input_meta)
 
-
-@pytest.fixture(scope="module")
-def galileo_images(repo_root: Path) -> Path:
-    """The raw Galileo image root the `image_name` values are relative to."""
-    return repo_root / "data" / "r2b_galileo"
 
 
 @pytest.fixture(scope="module")
 def two_image_extraction(
-    galileo: FramesMeta, galileo_images: Path, tmp_path_factory: pytest.TempPathFactory
+    galileo_input: FramesMeta, galileo_input_dir: Path, tmp_path_factory: pytest.TempPathFactory
 ) -> tuple[Path, FramesMeta, ExtractionReport]:
     """Extract two full-resolution Galileo images once, at the blob's own settings."""
-    subset: FramesMeta = galileo.filtered([keyframe.keyframe_id for keyframe in galileo.keyframes[:2]])
+    subset: FramesMeta = galileo_input.filtered([keyframe.keyframe_id for keyframe in galileo_input.keyframes[:2]])
     database_path: Path = tmp_path_factory.mktemp("features") / "two.db"
     create_database(database_path, subset)
     report: ExtractionReport = extract_features(
         database_path,
-        galileo_images,
+        galileo_input_dir,
         [keyframe.image_name for keyframe in subset.keyframes],
         FeatureOptions(),
     )
     return database_path, subset, report
 
 
-def test_resolve_device_never_returns_an_unusable_cuda(galileo: FramesMeta) -> None:
+def test_resolve_device_never_returns_an_unusable_cuda(galileo_input: FramesMeta) -> None:
     """`auto` degrades to the CPU provider; explicit `cuda` raises instead of aborting.
 
     ONNX Runtime's CUDA provider dlopens `libcudnn.so` lazily and throws inside a
@@ -156,50 +145,55 @@ def test_descriptors_are_float32_aliked_blocks(
     assert np.allclose(norms, 1.0, atol=1e-3), "ALIKED descriptors should be L2-normalised"
 
 
-def test_extract_selected_runs_keyframe_selection_first(
-    galileo: FramesMeta, galileo_images: Path, tmp_path: Path
+def test_only_selected_keyframes_reach_the_extractor(
+    galileo_input: FramesMeta, galileo_input_dir: Path, tmp_path: Path
 ) -> None:
-    """Only the frames keyframe selection keeps reach the extractor.
+    """The pipeline's stages 1 and 2 in sequence: select, create the database, extract.
 
     With gates far above anything the trajectory does, cuSFM keeps the first
-    sample alone — six Galileo frames (feature_extractor_main.md §5).
+    sample alone — six Galileo frames (feature_extractor_main.md §5) — and only
+    those six may reach the database or the extraction report.
     """
+    selection: KeyframeSelection = select_keyframes(
+        galileo_input,
+        min_inter_frame_distance_m=99.0,
+        min_inter_frame_rotation_degrees=999.0,
+        sample_sync_threshold_microseconds=100,
+    )
+    selected: FramesMeta = apply_selection(galileo_input, selection)
+    assert len(selection.kept_keyframe_ids) == 6
+    assert len(selected.keyframes) == 6
+    # The filtered collection carries the dense 1-based rig numbering.
+    assert {keyframe.synced_sample_id for keyframe in selected.keyframes} == {1}
+    assert selection.kept_synced_sample_ids == (1,)
+
     database_path: Path = tmp_path / "selected.db"
-    result: SelectedExtraction = extract_selected(
+    create_database(database_path, selected)
+    report: ExtractionReport = extract_features(
         database_path,
-        galileo_images,
-        galileo,
-        KeyframeSelectionConfig(
-            min_inter_frame_distance_m=99.0,
-            min_inter_frame_rotation_degrees=999.0,
-            sample_sync_threshold_microseconds=100,
-        ),
+        galileo_input_dir,
+        [keyframe.image_name for keyframe in selected.keyframes],
         FeatureOptions(max_image_size=FAST_IMAGE_SIZE, max_num_features=256),
     )
-    assert len(result.selection.kept_keyframe_ids) == 6
-    assert len(result.frames_meta.keyframes) == 6
-    assert set(result.report.keypoint_counts) == set(result.selection.kept_keyframe_ids)
-    # The filtered collection carries the dense 1-based rig numbering.
-    assert {keyframe.synced_sample_id for keyframe in result.frames_meta.keyframes} == {1}
+    assert set(report.keypoint_counts) == set(selection.kept_keyframe_ids)
 
-    database: pycolmap.Database = pycolmap.Database.open(database_path)
-    assert database.num_images() == 6
-    assert database.num_frames() == 1
-    database.close()
+    with pycolmap.Database.open(database_path) as database:
+        assert database.num_images() == 6
+        assert database.num_frames() == 1
 
 
-def test_extract_features_reports_a_missing_database(galileo_images: Path, tmp_path: Path) -> None:
+def test_extract_features_reports_a_missing_database(galileo_input_dir: Path, tmp_path: Path) -> None:
     """A missing database is an error here, not a silently created empty one."""
     with pytest.raises(FileNotFoundError):
-        extract_features(tmp_path / "absent.db", galileo_images, ["a.jpeg"])
+        extract_features(tmp_path / "absent.db", galileo_input_dir, ["a.jpeg"])
 
 
-def test_extract_features_reports_a_missing_image_root(galileo: FramesMeta, tmp_path: Path) -> None:
+def test_extract_features_reports_a_missing_image_root(galileo_input: FramesMeta, tmp_path: Path) -> None:
     """A missing image root is caught before COLMAP is handed the job."""
     database_path: Path = tmp_path / "empty.db"
-    create_database(database_path, galileo.filtered([galileo.keyframes[0].keyframe_id]))
+    create_database(database_path, galileo_input.filtered([galileo_input.keyframes[0].keyframe_id]))
     with pytest.raises(FileNotFoundError):
-        extract_features(database_path, tmp_path / "absent", [galileo.keyframes[0].image_name])
+        extract_features(database_path, tmp_path / "absent", [galileo_input.keyframes[0].image_name])
 
 
 def test_report_summary_handles_an_empty_run() -> None:

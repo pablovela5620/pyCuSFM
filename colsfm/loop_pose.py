@@ -24,6 +24,20 @@ Nothing in step 2 reads the prior relation between `A` and `B`, so the edge can 
 the odometry about distance — which is exactly what a loop closure is for, and exactly what
 scaling a two-view direction by the prior baseline cannot do.
 
+`RigPoseEstimator` owns all of it
+---------------------------------
+
+The rig frames, the rig geometry, the keypoints, the matcher and the settings are fixed for
+a whole run and are read by every step, so they are the estimator's state rather than five
+arguments threaded through four functions. The object also owns the two memos that make the
+stage affordable: unprojected bearings per image (one camera-model call per keypoint, which
+a rig frame with twenty loop candidates would otherwise repeat twenty times) and one local
+map per source rig frame, reused across all of that frame's candidates by `measure_group`.
+
+`measure_group` is also the unit of parallelism: two source rig frames share nothing but the
+read-only bearings memo, and `pycolmap.estimate_and_refine_generalized_absolute_pose`
+releases the GIL, so `colsfm.loop_closure` runs one group per worker thread.
+
 Why not the generalized essential matrix
 ----------------------------------------
 
@@ -43,7 +57,8 @@ of metres deep, and half a pixel of noise halves it. Triangulating first spends 
 baseline on depth, where a redundant, refined least-squares problem averages the noise away
 instead of amplifying it. The generalized essential matrix is still used, but only for its
 rotation: `RigPoseConfig.max_direction_disagreement_deg` cross-checks the PnP translation
-direction against it and drops a pair the two disagree about.
+direction against it and drops a pair the two disagree about. It costs no extra matching —
+it is solved from the same-camera correspondences the observation pass already read.
 
 Depth, and why the neighbours matter
 ------------------------------------
@@ -72,6 +87,15 @@ rotations agree with the odometry to 1.5 deg and with
 `pycolmap.estimate_generalized_relative_pose` — an estimator that shares only the
 correspondences — to **0.35 deg**. See `colsfm.loop_closure` for what that costs against a
 reference whose own rotations sit 6.5 deg away.
+
+Cross-stereo observations are unconditional
+-------------------------------------------
+
+The source rig's anchor image is matched against *both* cameras of the target's declared
+stereo pair. The two cameras see the same scene 86 mm apart, so the cross pair is a real
+extra observation rather than a duplicate view, and every measured configuration used it;
+the switch that used to guard it was never set to False by any caller or test, so it is
+gone rather than untested.
 
 Reading a `match_fn` the caller has not matched yet
 ---------------------------------------------------
@@ -110,11 +134,8 @@ Keypoints: TypeAlias = Float64[ndarray, "n_keypoints 2"]
 Bearings: TypeAlias = Float64[ndarray, "n_keypoints 3"]
 """Unit-norm bearing vectors, one per keypoint, in the camera's optical frame."""
 
-RigLandmarks: TypeAlias = dict[int, dict[int, Float64[ndarray, "3"]]]
-"""Local map: 3-D points in the rig frame, keyed by anchor image id then keypoint index."""
-
-RigPoseRejection: TypeAlias = Literal["no_observations", "no_pose", "too_few_inliers", "direction_disagreement"]
-"""Which gate turned a rig pair down; `RigPoseOutcome.rejection` carries one of these.
+RigPoseRejectionReason: TypeAlias = Literal["no_observations", "no_pose", "too_few_inliers", "direction_disagreement"]
+"""Which gate turned a rig pair down.
 
 The loop-closure stage reports these verbatim in its diagnostics, because a stage that
 returns no edge is only explainable if it says which gate emptied it."""
@@ -161,31 +182,28 @@ class RigPoseConfig:
     """Trials RANSAC runs before its confidence test may stop it; COLMAP's own
     `TwoViewGeometryOptions` value."""
     min_inliers: int = 30
-    """Fewest inliers a solved pose may rest on.
+    """Fewest correspondences a solved pose may rest on, and the loop stage's own
+    acceptance floor.
 
-    This is a solvability floor, not the loop-closure stage's acceptance rule: whether an
-    edge is *good* is `colsfm.loop_closure.is_good_match`, which owns the blob's
-    `min_matches_num` and `min_matches_ratio` (`docs/spec/generate_association_main.md`
-    §6.6) and applies them to the counts this estimator reports."""
-    min_cameras: int = 1
-    """Cameras of the target rig frame that must contribute at least one inlier-eligible
-    observation. 1 accepts a revisit seen by one camera only, which is the common case when
-    a rig passes an old place facing a different way."""
-    max_direction_disagreement_deg: float = 45.0
+    This is the blob's `min_matches_num` (`docs/spec/generate_association_main.md` §6.6)
+    and it is declared here, once: `colsfm.loop_closure.LoopClosureConfig.min_inliers`
+    reads it back, so the estimator's solvability floor and the stage's acceptance rule
+    cannot drift apart. The ratio half of the blob's rule has no copy here at all — it
+    lives in `colsfm.loop_closure.is_good_match`, applied to the counts this estimator
+    reports."""
+    max_direction_disagreement_deg: float | None = 45.0
     """How far the refined translation direction may sit from the generalized essential
-    matrix's before the pair is dropped.
+    matrix's before the pair is dropped, or None to skip the cross-check.
 
     The two estimates share their correspondences but nothing else — one triangulates and
     resections, the other solves an epipolar constraint — so agreement is real evidence and
     disagreement means one of them latched onto a wrong RANSAC support set. 45 deg is loose
     on purpose: on a 0.2 m revisit baseline the direction is the weakest quantity either
     estimator produces (`colsfm.loop_closure` measured the prior and the blob's own result
-    44 deg apart on the same pairs), so a tight gate would reject true loops. Set it above
-    180.0 to switch the cross-check off."""
-    cross_stereo_observations: bool = True
-    """Also match the left camera of the source against the right camera of the target, and
-    vice versa. The two cameras of a declared stereo pair see the same scene 86 mm apart, so
-    the cross pairs are real extra observations rather than duplicates of the same view."""
+    44 deg apart on the same pairs), so a tight gate would reject true loops.
+
+    Measured on RoboCap it costs 66 of 921 pairs and buys 10 mm of trajectory RMSE
+    (418.4 mm without it, 408.1 mm with it), so it is on by default."""
 
 
 DEFAULT_RIG_POSE_CONFIG: RigPoseConfig = RigPoseConfig()
@@ -281,6 +299,34 @@ class RigFrameIndex:
 
 
 @dataclass(frozen=True, slots=True)
+class AnchorLandmarks:
+    """One anchor image's share of a local map, packed for the join in `_observations`.
+
+    The two arrays are parallel and `keypoint_indices` is ascending, so a match list joins
+    against them with one `searchsorted` instead of a dict lookup per match. They are packed
+    once at triangulation, because a source rig frame with twenty loop candidates would
+    otherwise re-sort and re-stack the same points twenty times.
+    """
+
+    keypoint_indices: Int[ndarray, "n_landmarks"]
+    """Ascending anchor keypoint index per landmark."""
+    points_in_rig: Float64[ndarray, "n_landmarks 3"]
+    """The landmark positions in the source rig frame, in metres, in the same order."""
+
+    def __len__(self) -> int:
+        """How many landmarks this anchor contributed.
+
+        Returns:
+            The landmark count.
+        """
+        return len(self.keypoint_indices)
+
+
+RigLandmarks: TypeAlias = dict[int, AnchorLandmarks]
+"""Local map: 3-D points in the rig frame, keyed by the anchor image that owns them."""
+
+
+@dataclass(frozen=True, slots=True)
 class RigPoseEstimate:
     """One measured rig-to-rig relative pose and the evidence behind it."""
 
@@ -296,27 +342,31 @@ class RigPoseEstimate:
     """Cameras of the target rig frame that contributed an observation."""
     direction_disagreement_deg: float
     """Angle between this translation direction and the generalized essential matrix's, or
-    `nan` when that estimate was unavailable (too few correspondences, or a degenerate
-    configuration pycolmap answered with a panoramic model instead)."""
+    `nan` when that estimate was unavailable (too few correspondences, a degenerate
+    configuration pycolmap answered with a panoramic model, or the cross-check switched
+    off)."""
 
 
 @dataclass(frozen=True, slots=True)
-class RigPoseOutcome:
-    """What one rig pair produced: an estimate, or the name of the gate that refused it.
+class RigPoseRejection:
+    """The gate that refused a rig pair.
 
-    Exactly one of the two fields is set. The rejection is returned rather than folded into
-    a bare None because the loop-closure stage's diagnostics have to say *why* a pair was
-    dropped — "no edges" and "no edges because every pair was too far from its epipolar
-    direction" are different bugs.
+    Returned instead of a bare None because the loop-closure stage's diagnostics have to say
+    *why* a pair was dropped — "no edges" and "no edges because every pair was too far from
+    its epipolar direction" are different bugs.
     """
 
-    estimate: RigPoseEstimate | None = None
-    """The measurement, or None when a gate rejected the pair."""
-    rejection: RigPoseRejection | None = None
-    """The gate that rejected the pair, or None when there is an estimate."""
+    reason: RigPoseRejectionReason
+    """Which gate turned the pair down."""
 
 
-def build_rig_geometry(cameras: Mapping[int, pycolmap.Camera], vehicle_T_cam: Mapping[int, pycolmap.Rigid3d], stereo_partner: Mapping[int, int]) -> RigGeometry:
+RigPoseOutcome: TypeAlias = RigPoseEstimate | RigPoseRejection
+"""What one rig pair produced: a measurement, or the gate that refused it."""
+
+
+def build_rig_geometry(
+    cameras: Mapping[int, pycolmap.Camera], vehicle_T_cam: Mapping[int, pycolmap.Rigid3d], stereo_partner: Mapping[int, int]
+) -> RigGeometry:
     """Assemble the fixed arguments of the generalized estimators.
 
     Args:
@@ -371,193 +421,22 @@ def bearings_of(camera: pycolmap.Camera, keypoints: Keypoints) -> Bearings:
     return homogeneous / np.linalg.norm(homogeneous, axis=1, keepdims=True)
 
 
-@dataclass(slots=True)
-class RigImageCache:
-    """Per-image lookups the estimator would otherwise redo for every candidate pair.
-
-    Bearings are the expensive part — one camera-model unprojection per keypoint per image —
-    and a rig frame with twenty loop candidates would otherwise unproject its neighbourhood
-    twenty times. Build one of these per run and hand it to every call.
-    """
-
-    geometry: RigGeometry
-    """The rig, for the camera model of each image."""
-    keypoints: Mapping[int, Keypoints]
-    """Keypoint pixels per image id."""
-    camera_of_image: Mapping[int, int]
-    """`camera_params_id` per image id."""
-    rig_of_image: Mapping[int, int]
-    """`synced_sample_id` per image id."""
-    bearings: dict[int, Bearings] = field(default_factory=dict, init=False)
-    """Memoised unit bearings per image id."""
-
-    def of(self, image_id: int) -> Bearings:
-        """Unit bearings of every keypoint of one image.
-
-        Args:
-            image_id: The image to unproject.
-
-        Returns:
-            Float64 unit bearings with shape `[n_keypoints, 3]`.
-        """
-        cached: Bearings | None = self.bearings.get(image_id)
-        if cached is None:
-            camera: pycolmap.Camera = self.geometry.cameras[self.geometry.position_of(self.camera_of_image[image_id])]
-            cached = bearings_of(camera, self.keypoints[image_id])
-            self.bearings[image_id] = cached
-        return cached
-
-
-def build_image_cache(index: RigFrameIndex, geometry: RigGeometry, keypoints: Mapping[int, Keypoints]) -> RigImageCache:
-    """Invert the rig-frame index into the per-image lookups the estimator needs.
+def direction_angle_deg(first: pycolmap.Rigid3d, second: pycolmap.Rigid3d) -> float:
+    """Angle between the translation directions of two poses.
 
     Args:
-        index: The rig frames.
-        geometry: The rig.
-        keypoints: Keypoint pixels per image id.
+        first: The first pose.
+        second: The second pose.
 
     Returns:
-        An empty cache that knows the camera and the rig frame of every indexed image.
+        The angle in degrees, or `nan` when either translation is degenerate.
     """
-    return RigImageCache(
-        geometry=geometry,
-        keypoints=keypoints,
-        camera_of_image={image_id: camera_id for (_, camera_id), image_id in index.keyframe_by_rig_camera.items()},
-        rig_of_image={image_id: rig_id for (rig_id, _), image_id in index.keyframe_by_rig_camera.items()},
-    )
-
-
-def _local_map_partners(rig_id: int, camera_id: int, index: RigFrameIndex, geometry: RigGeometry, config: RigPoseConfig) -> list[int]:
-    """Images whose rays join one anchor image's in the local map.
-
-    Args:
-        rig_id: The source rig frame.
-        camera_id: The anchor image's camera.
-        index: The rig frames.
-        geometry: The rig.
-        config: The estimator settings.
-
-    Returns:
-        Image ids of the stereo partner inside the rig frame and of the same camera in every
-        temporal neighbour, in a stable order.
-    """
-    partners: list[int] = []
-    partner_camera: int | None = geometry.stereo_partner.get(camera_id)
-    if partner_camera is not None:
-        stereo_image: int | None = index.keyframe(rig_id, partner_camera)
-        if stereo_image is not None:
-            partners.append(stereo_image)
-    for neighbour in index.neighbours(rig_id, config.neighbour_span):
-        neighbour_image: int | None = index.keyframe(neighbour, camera_id)
-        if neighbour_image is not None:
-            partners.append(neighbour_image)
-    return partners
-
-
-def triangulate_rig_landmarks(
-    rig_id: int,
-    index: RigFrameIndex,
-    geometry: RigGeometry,
-    keypoints: Mapping[int, Keypoints],
-    match_fn: MatchFunction,
-    config: RigPoseConfig = DEFAULT_RIG_POSE_CONFIG,
-    cache: RigImageCache | None = None,
-) -> RigLandmarks:
-    """Triangulate a metric point cloud in one rig frame's own vehicle frame.
-
-    Every camera of the rig frame anchors its own landmarks: a keypoint of the anchor image
-    becomes a 3-D point once at least one partner image — the declared stereo partner, or
-    the same camera in a temporal neighbour — matches it. Poses come from the rig extrinsics
-    and from the *local* odometry between neighbouring rig frames, never from any relation
-    to a far-away rig frame.
-
-    Args:
-        rig_id: The rig frame to build the map around.
-        index: Rig frames, their prior poses and their images.
-        geometry: The rig's cameras and extrinsics.
-        keypoints: Keypoint pixels per image id.
-        match_fn: The injected matcher.
-        config: Gates and thresholds.
-        cache: Shared per-image cache; a private one is built when None.
-
-    Returns:
-        3-D points in the rig frame, keyed by anchor image id then anchor keypoint index.
-        Every camera of the rig frame gets an entry, possibly empty.
-    """
-    images: RigImageCache = cache if cache is not None else build_image_cache(index, geometry, keypoints)
-    world_T_rig: pycolmap.Rigid3d = index.world_T_rig[rig_id]
-    landmarks: RigLandmarks = {}
-    for camera_id in geometry.camera_ids:
-        anchor: int | None = index.keyframe(rig_id, camera_id)
-        if anchor is None or anchor not in keypoints:
-            continue
-        anchor_from_rig: pycolmap.Rigid3d = geometry.cams_from_rig[geometry.position_of(camera_id)]
-        anchor_projection: Float64[ndarray, "3 4"] = np.asarray(anchor_from_rig.matrix(), dtype=np.float64)
-        anchor_bearings: Bearings = images.of(anchor)
-        anchor_focal: float = focal_length_of(images, anchor)
-
-        tracks: dict[int, list[tuple[int, int]]] = {}
-        projections: dict[int, Float64[ndarray, "3 4"]] = {}
-        for partner in _local_map_partners(rig_id, camera_id, index, geometry, config):
-            partner_matches: Matches = np.asarray(match_fn(anchor, partner), dtype=np.int64).reshape(-1, 2)
-            if partner not in keypoints or len(partner_matches) == 0:
-                continue
-            partner_camera: int = images.camera_of_image[partner]
-            partner_rig: int = images.rig_of_image[partner]
-            rig_T_partner_rig: pycolmap.Rigid3d = world_T_rig.inverse() * index.world_T_rig[partner_rig]
-            projections[partner] = np.asarray(
-                (geometry.cams_from_rig[geometry.position_of(partner_camera)] * rig_T_partner_rig.inverse()).matrix(), dtype=np.float64
-            )
-            for anchor_index, partner_index in partner_matches:
-                tracks.setdefault(int(anchor_index), []).append((partner, int(partner_index)))
-
-        # Group the tracks by which images they were seen in: every track in a group shares
-        # one stack of projection matrices, so the whole group triangulates in one batched
-        # least-squares call instead of one pybind call per landmark. A four-camera rig with
-        # two neighbours has at most a handful of distinct view sets, so the grouping is
-        # cheap and the batches are large.
-        grouped: dict[tuple[int, ...], list[int]] = {}
-        for anchor_index, observations in tracks.items():
-            grouped.setdefault(tuple(image_id for image_id, _ in observations), []).append(anchor_index)
-
-        points: dict[int, Float64[ndarray, "3"]] = {}
-        for view_set, anchor_indices in grouped.items():
-            stacked_projections: Float64[ndarray, "n_views 3 4"] = np.stack([anchor_projection, *(projections[image_id] for image_id in view_set)])
-            view_focals: Float64[ndarray, "n_views"] = np.array(
-                [anchor_focal, *(focal_length_of(images, image_id) for image_id in view_set)], dtype=np.float64
-            )
-            observed_indices: dict[int, dict[int, int]] = {}
-            for anchor_index in anchor_indices:
-                for image_id, index_in_partner in tracks[anchor_index]:
-                    observed_indices.setdefault(image_id, {})[anchor_index] = index_in_partner
-            batch_bearings: Float64[ndarray, "n_points n_views 3"] = np.stack(
-                [
-                    anchor_bearings[anchor_indices],
-                    *(images.of(image_id)[[observed_indices[image_id][anchor_index] for anchor_index in anchor_indices]] for image_id in view_set),
-                ],
-                axis=1,
-            )
-            triangulated, keep = _triangulate_batch(stacked_projections, batch_bearings, view_focals, config)
-            for position, anchor_index in enumerate(anchor_indices):
-                if keep[position]:
-                    points[anchor_index] = triangulated[position]
-        landmarks[anchor] = points
-    return landmarks
-
-
-def focal_length_of(images: RigImageCache, image_id: int) -> float:
-    """Mean focal length in pixels of the camera that took one image.
-
-    Args:
-        images: The per-image cache, which knows each image's camera.
-        image_id: The image to look up.
-
-    Returns:
-        The camera's mean focal length in pixels; RoboCap's fisheyes sit near 630, Galileo's
-        pinholes near 845.
-    """
-    camera: pycolmap.Camera = images.geometry.cameras[images.geometry.position_of(images.camera_of_image[image_id])]
-    return float(camera.mean_focal_length())
+    a: Float64[ndarray, "3"] = np.asarray(first.translation, dtype=np.float64)
+    b: Float64[ndarray, "3"] = np.asarray(second.translation, dtype=np.float64)
+    norms: float = float(np.linalg.norm(a) * np.linalg.norm(b))
+    if norms <= 1e-12:
+        return float("nan")
+    return float(np.rad2deg(np.arccos(np.clip(float(a @ b) / norms, -1.0, 1.0))))
 
 
 def _triangulate_batch(
@@ -630,18 +509,20 @@ def _triangulate_batch(
     return points, keep
 
 
-def _landmark_arrays(points: Mapping[int, Float64[ndarray, "3"]]) -> tuple[Int[ndarray, "n_landmarks"], Float64[ndarray, "n_landmarks 3"]]:
-    """Turn one anchor image's landmarks into a sorted index array and a point array.
+@dataclass(frozen=True, slots=True)
+class _EpipolarCorrespondences:
+    """Same-camera matches of one rig pair, kept for the generalized essential matrix.
 
-    Args:
-        points: 3-D points in the rig frame, keyed by anchor keypoint index.
-
-    Returns:
-        The ascending keypoint indices and the matching points, so a match list can be
-        joined against them with one `searchsorted` instead of a dict lookup per match.
+    The observation pass already asks the matcher for every one of these pairs, so the
+    direction cross-check reads them off here instead of re-matching and re-joining.
     """
-    indices: Int[ndarray, "n_landmarks"] = np.fromiter(sorted(points), dtype=np.int64, count=len(points))
-    return indices, np.ascontiguousarray([points[int(index)] for index in indices], dtype=np.float64).reshape(-1, 3)
+
+    source_pixels: list[Keypoints]
+    """One block of source-image pixels per camera that matched."""
+    target_pixels: list[Keypoints]
+    """The matching target-image pixels, block for block."""
+    camera_indices: list[int]
+    """`camera_idx` per correspondence, flat across the blocks."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -656,218 +537,154 @@ class _Observations:
     """`camera_idx` of the target camera each observation was seen in."""
     cameras: set[int]
     """Which cameras of the target rig frame contributed."""
+    epipolar: _EpipolarCorrespondences
+    """The same-camera matches, for the translation-direction cross-check."""
 
 
-def _observations(
-    source_rig_id: int,
-    target_rig_id: int,
-    landmarks: RigLandmarks,
-    index: RigFrameIndex,
-    geometry: RigGeometry,
-    keypoints: Mapping[int, Keypoints],
-    match_fn: MatchFunction,
-    config: RigPoseConfig,
-) -> _Observations:
-    """Match the source rig's anchor images against the target's and pair 2-D with 3-D.
+@dataclass(slots=True)
+class RigPoseEstimator:
+    """Measures rig-to-rig relative poses over one fixed rig, sequence and matcher.
 
-    Every pair is asked of `match_fn` unconditionally, so a caller probing for the pair list
-    with a matcher that returns nothing still sees all of them (module docstring). The join
-    between a pair's matches and the anchor's landmarks is a `searchsorted`, not a lookup per
-    match: a RoboCap rig pair offers a few thousand matches over six image pairs, and doing
-    that in Python is most of the stage's runtime.
-
-    Args:
-        source_rig_id: Rig frame the landmarks belong to.
-        target_rig_id: Rig frame being localised.
-        landmarks: The source rig's local map.
-        index: The rig frames.
-        geometry: The rig.
-        keypoints: Keypoint pixels per image id.
-        match_fn: The injected matcher.
-        config: Gates and thresholds.
-
-    Returns:
-        The correspondences, empty when nothing matched.
+    Build one per run and call `measure_group` once per source rig frame. The estimator is
+    safe to share between threads: the only mutated state is the bearing memo, whose entries
+    are idempotent (two threads racing on the same image recompute the same array).
     """
-    pixel_blocks: list[Keypoints] = []
-    point_blocks: list[Float64[ndarray, "n_hits 3"]] = []
-    camera_indices: list[int] = []
-    contributing: set[int] = set()
-    for camera_id in geometry.camera_ids:
-        anchor: int | None = index.keyframe(source_rig_id, camera_id)
-        if anchor is None:
-            continue
-        target_cameras: list[int] = [camera_id]
-        partner_camera: int | None = geometry.stereo_partner.get(camera_id) if config.cross_stereo_observations else None
-        if partner_camera is not None:
-            target_cameras.append(partner_camera)
-        anchor_points: dict[int, Float64[ndarray, "3"]] = landmarks.get(anchor, {})
-        landmark_indices: Int[ndarray, "n_landmarks"] | None = None
-        landmark_points: Float64[ndarray, "n_landmarks 3"] | None = None
-        for target_camera in target_cameras:
-            observed: int | None = index.keyframe(target_rig_id, target_camera)
-            if observed is None or observed not in keypoints:
+
+    index: RigFrameIndex
+    """Rig frames, their prior poses and their images."""
+    geometry: RigGeometry
+    """The rig's cameras and extrinsics."""
+    keypoints: Mapping[int, Keypoints]
+    """Keypoint pixels per image id."""
+    match_fn: MatchFunction
+    """The injected matcher."""
+    config: RigPoseConfig = DEFAULT_RIG_POSE_CONFIG
+    """Gates and thresholds."""
+    _camera_of_image: dict[int, int] = field(init=False, repr=False)
+    """`camera_params_id` per image id, inverted from the rig-frame index."""
+    _rig_of_image: dict[int, int] = field(init=False, repr=False)
+    """`synced_sample_id` per image id, inverted from the rig-frame index."""
+    _bearings: dict[int, Bearings] = field(init=False, repr=False, default_factory=dict)
+    """Memoised unit bearings per image id; one camera-model unprojection per keypoint."""
+
+    def __post_init__(self) -> None:
+        """Invert the rig-frame index into the per-image lookups every step needs."""
+        self._camera_of_image = {image_id: camera_id for (_, camera_id), image_id in self.index.keyframe_by_rig_camera.items()}
+        self._rig_of_image = {image_id: rig_id for (rig_id, _), image_id in self.index.keyframe_by_rig_camera.items()}
+
+    def camera_of(self, image_id: int) -> pycolmap.Camera:
+        """The calibrated camera that took one image.
+
+        Args:
+            image_id: The image to look up.
+
+        Returns:
+            Its `pycolmap.Camera`.
+
+        Raises:
+            KeyError: When the image is not part of the indexed rig frames.
+        """
+        return self.geometry.cameras[self.geometry.position_of(self._camera_of_image[image_id])]
+
+    def bearings(self, image_id: int) -> Bearings:
+        """Unit bearings of every keypoint of one image.
+
+        Args:
+            image_id: The image to unproject.
+
+        Returns:
+            Float64 unit bearings with shape `[n_keypoints, 3]`.
+        """
+        cached: Bearings | None = self._bearings.get(image_id)
+        if cached is None:
+            cached = bearings_of(self.camera_of(image_id), self.keypoints[image_id])
+            self._bearings[image_id] = cached
+        return cached
+
+    def focal_length_px(self, image_id: int) -> float:
+        """Mean focal length in pixels of the camera that took one image.
+
+        Args:
+            image_id: The image to look up.
+
+        Returns:
+            The camera's mean focal length in pixels; RoboCap's fisheyes sit near 630,
+            Galileo's pinholes near 845.
+        """
+        return float(self.camera_of(image_id).mean_focal_length())
+
+    def local_map(self, rig_id: int) -> RigLandmarks:
+        """Triangulate a metric point cloud in one rig frame's own vehicle frame.
+
+        Every camera of the rig frame anchors its own landmarks: a keypoint of the anchor
+        image becomes a 3-D point once at least one partner image — the declared stereo
+        partner, or the same camera in a temporal neighbour — matches it. Poses come from the
+        rig extrinsics and from the *local* odometry between neighbouring rig frames, never
+        from any relation to a far-away rig frame.
+
+        Args:
+            rig_id: The rig frame to build the map around.
+
+        Returns:
+            The landmarks per anchor image id. Every camera of the rig frame that has
+            keypoints gets an entry, possibly empty.
+        """
+        landmarks: RigLandmarks = {}
+        for camera_id in self.geometry.camera_ids:
+            anchor: int | None = self.index.keyframe(rig_id, camera_id)
+            if anchor is None or anchor not in self.keypoints:
                 continue
-            pair_matches: Matches = np.asarray(match_fn(anchor, observed), dtype=np.int64).reshape(-1, 2)
-            if len(pair_matches) == 0 or not anchor_points:
-                continue
-            if landmark_indices is None or landmark_points is None:
-                landmark_indices, landmark_points = _landmark_arrays(anchor_points)
-            insertion: Int[ndarray, "n_matches"] = np.searchsorted(landmark_indices, pair_matches[:, 0])
-            clipped: Int[ndarray, "n_matches"] = np.clip(insertion, 0, len(landmark_indices) - 1)
-            matched: Bool[ndarray, "n_matches"] = landmark_indices[clipped] == pair_matches[:, 0]
-            hits: int = int(matched.sum())
-            if hits == 0:
-                continue
-            pixel_blocks.append(keypoints[observed][pair_matches[matched, 1]])
-            point_blocks.append(landmark_points[clipped[matched]])
-            camera_indices.extend([geometry.position_of(target_camera)] * hits)
-            contributing.add(target_camera)
-    if not point_blocks:
-        return _Observations(np.zeros((0, 2), dtype=np.float64), np.zeros((0, 3), dtype=np.float64), [], set())
-    return _Observations(
-        points2d=np.ascontiguousarray(np.concatenate(pixel_blocks), dtype=np.float64),
-        points3d=np.ascontiguousarray(np.concatenate(point_blocks), dtype=np.float64),
-        camera_indices=camera_indices,
-        cameras=contributing,
-    )
+            landmarks[anchor] = self._anchor_landmarks(rig_id, camera_id, anchor)
+        return landmarks
 
+    def measure(self, source_rig_id: int, target_rig_id: int, landmarks: RigLandmarks | None = None) -> RigPoseOutcome:
+        """Measure where one rig frame sits relative to another, in metres.
 
-def estimate_generalized_rig_pose(
-    source_rig_id: int,
-    target_rig_id: int,
-    index: RigFrameIndex,
-    geometry: RigGeometry,
-    keypoints: Mapping[int, Keypoints],
-    match_fn: MatchFunction,
-    config: RigPoseConfig = DEFAULT_RIG_POSE_CONFIG,
-) -> pycolmap.Rigid3d | None:
-    """Solve the generalized essential matrix over every same-camera match of two rig frames.
+        Builds the source rig frame's local metric map (or reuses the one given), matches
+        every anchor image against the target rig frame's cameras, and resections the target
+        rig as a whole with `pycolmap.estimate_and_refine_generalized_absolute_pose`. No
+        relation between the two rig frames is read from the priors, so the result can
+        contradict them.
 
-    Its rotation and translation *direction* are trustworthy; its magnitude is not, which is
-    why the caller only cross-checks a direction against it (module docstring).
+        Args:
+            source_rig_id: Rig frame the edge starts at.
+            target_rig_id: Rig frame the edge ends at.
+            landmarks: A local map for `source_rig_id` built earlier, or None to build one
+                here. `measure_group` is the usual way to share one across candidates.
 
-    Args:
-        source_rig_id: The first rig frame.
-        target_rig_id: The second rig frame.
-        index: The rig frames.
-        geometry: The rig.
-        keypoints: Keypoint pixels per image id.
-        match_fn: The injected matcher.
-        config: Gates and thresholds.
+        Returns:
+            The metric relative pose and its evidence, or the gate that rejected the pair.
+        """
+        local_map: RigLandmarks = self.local_map(source_rig_id) if landmarks is None else landmarks
+        observations: _Observations = self._observations(source_rig_id, target_rig_id, local_map)
+        num_landmarks: int = sum(len(anchor) for anchor in local_map.values())
+        num_observations: int = len(observations.points3d)
+        if num_observations < self.config.min_inliers:
+            return RigPoseRejection(reason="no_observations")
 
-    Returns:
-        `source_T_target` with an unreliable magnitude, or None when there are too few
-        correspondences or pycolmap answers with a panoramic (pure-rotation) model.
-    """
-    source_pixels: list[Keypoints] = []
-    target_pixels: list[Keypoints] = []
-    source_indices: list[int] = []
-    target_indices: list[int] = []
-    for camera_id in geometry.camera_ids:
-        source_image: int | None = index.keyframe(source_rig_id, camera_id)
-        target_image: int | None = index.keyframe(target_rig_id, camera_id)
-        if source_image is None or target_image is None or source_image not in keypoints or target_image not in keypoints:
-            continue
-        pair_matches: Matches = np.asarray(match_fn(source_image, target_image), dtype=np.int64).reshape(-1, 2)
-        if len(pair_matches) == 0:
-            continue
-        position: int = geometry.position_of(camera_id)
-        source_pixels.append(keypoints[source_image][pair_matches[:, 0]])
-        target_pixels.append(keypoints[target_image][pair_matches[:, 1]])
-        source_indices.extend([position] * len(pair_matches))
-        target_indices.extend([position] * len(pair_matches))
-    if len(source_indices) < config.min_inliers:
-        return None
+        answer: dict | None = pycolmap.estimate_and_refine_generalized_absolute_pose(
+            observations.points2d,
+            observations.points3d,
+            observations.camera_indices,
+            list(self.geometry.cams_from_rig),
+            list(self.geometry.cameras),
+            _ransac_options(self.config),
+            pycolmap.AbsolutePoseRefinementOptions(),
+        )
+        if answer is None:
+            return RigPoseRejection(reason="no_pose")
+        num_inliers: int = int(answer["num_inliers"])
+        if num_inliers < self.config.min_inliers:
+            return RigPoseRejection(reason="too_few_inliers")
+        source_T_target: pycolmap.Rigid3d = answer["rig_from_world"].inverse()
 
-    answer: dict | None = pycolmap.estimate_generalized_relative_pose(
-        np.ascontiguousarray(np.vstack(source_pixels), dtype=np.float64),
-        np.ascontiguousarray(np.vstack(target_pixels), dtype=np.float64),
-        source_indices,
-        target_indices,
-        list(geometry.cams_from_rig),
-        list(geometry.cameras),
-        _ransac_options(config),
-    )
-    # pycolmap answers a configuration whose rig baseline cannot fix the scale with a
-    # `pano2_from_pano1` key instead, i.e. a pure-rotation model; there is no direction in it.
-    if answer is None or "rig2_from_rig1" not in answer:
-        return None
-    return answer["rig2_from_rig1"].inverse()
+        limit_deg: float | None = self.config.max_direction_disagreement_deg
+        epipolar: pycolmap.Rigid3d | None = None if limit_deg is None else self._epipolar_pose(observations.epipolar)
+        disagreement_deg: float = float("nan") if epipolar is None else direction_angle_deg(source_T_target, epipolar)
+        if limit_deg is not None and not np.isnan(disagreement_deg) and disagreement_deg > limit_deg:
+            return RigPoseRejection(reason="direction_disagreement")
 
-
-def estimate_rig_relative_pose(
-    source_rig_id: int,
-    target_rig_id: int,
-    index: RigFrameIndex,
-    geometry: RigGeometry,
-    keypoints: Mapping[int, Keypoints],
-    match_fn: MatchFunction,
-    config: RigPoseConfig = DEFAULT_RIG_POSE_CONFIG,
-    landmarks: RigLandmarks | None = None,
-    cache: RigImageCache | None = None,
-) -> RigPoseOutcome:
-    """Measure where one rig frame sits relative to another, in metres.
-
-    Builds the source rig frame's local metric map (or reuses the one given), matches every
-    anchor image against the target rig frame's cameras, and resections the target rig as a
-    whole with `pycolmap.estimate_and_refine_generalized_absolute_pose`. No relation between
-    the two rig frames is read from the priors, so the result can contradict them.
-
-    Args:
-        source_rig_id: Rig frame the edge starts at.
-        target_rig_id: Rig frame the edge ends at.
-        index: Rig frames, their prior poses and their images.
-        geometry: The rig's cameras and extrinsics.
-        keypoints: Keypoint pixels per image id.
-        match_fn: The injected matcher.
-        config: Gates and thresholds.
-        landmarks: A local map for `source_rig_id` built earlier, or None to build it here.
-            Passing one is what stops a source rig frame with twenty candidates
-            triangulating its neighbourhood twenty times.
-        cache: Shared per-image cache; a private one is built when None.
-
-    Returns:
-        The metric relative pose and its evidence, or the name of the gate that rejected the
-        pair.
-    """
-    images: RigImageCache = cache if cache is not None else build_image_cache(index, geometry, keypoints)
-    local_map: RigLandmarks = (
-        triangulate_rig_landmarks(source_rig_id, index, geometry, keypoints, match_fn, config, images) if landmarks is None else landmarks
-    )
-    observations: _Observations = _observations(source_rig_id, target_rig_id, local_map, index, geometry, keypoints, match_fn, config)
-    num_landmarks: int = sum(len(points) for points in local_map.values())
-    num_observations: int = len(observations.points3d)
-    if num_observations < config.min_inliers or len(observations.cameras) < config.min_cameras:
-        return RigPoseOutcome(rejection="no_observations")
-
-    answer: dict | None = pycolmap.estimate_and_refine_generalized_absolute_pose(
-        observations.points2d,
-        observations.points3d,
-        observations.camera_indices,
-        list(geometry.cams_from_rig),
-        list(geometry.cameras),
-        _ransac_options(config),
-        pycolmap.AbsolutePoseRefinementOptions(),
-    )
-    if answer is None:
-        return RigPoseOutcome(rejection="no_pose")
-    num_inliers: int = int(answer["num_inliers"])
-    if num_inliers < config.min_inliers:
-        return RigPoseOutcome(rejection="too_few_inliers")
-    source_T_target: pycolmap.Rigid3d = answer["rig_from_world"].inverse()
-
-    epipolar: pycolmap.Rigid3d | None = (
-        estimate_generalized_rig_pose(source_rig_id, target_rig_id, index, geometry, keypoints, match_fn, config)
-        if config.max_direction_disagreement_deg <= 180.0
-        else None
-    )
-    disagreement_deg: float = float("nan") if epipolar is None else direction_angle_deg(source_T_target, epipolar)
-    if not np.isnan(disagreement_deg) and disagreement_deg > config.max_direction_disagreement_deg:
-        return RigPoseOutcome(rejection="direction_disagreement")
-
-    return RigPoseOutcome(
-        estimate=RigPoseEstimate(
+        return RigPoseEstimate(
             source_T_target=source_T_target,
             num_inliers=num_inliers,
             num_observations=num_observations,
@@ -875,22 +692,240 @@ def estimate_rig_relative_pose(
             num_cameras=len(observations.cameras),
             direction_disagreement_deg=disagreement_deg,
         )
-    )
 
+    def measure_group(self, source_rig_id: int, target_rig_ids: tuple[int, ...]) -> list[RigPoseOutcome]:
+        """Measure every candidate of one source rig frame against one local map.
 
-def direction_angle_deg(first: pycolmap.Rigid3d, second: pycolmap.Rigid3d) -> float:
-    """Angle between the translation directions of two poses.
+        Triangulating the local map is the expensive half of a measurement, and it depends
+        only on the source rig frame, so a source with twenty candidates builds it once.
+        This is also the unit `colsfm.loop_closure` hands to a worker thread.
 
-    Args:
-        first: The first pose.
-        second: The second pose.
+        Args:
+            source_rig_id: Rig frame the edges start at.
+            target_rig_ids: Rig frames to measure against it, in the caller's own order.
 
-    Returns:
-        The angle in degrees, or `nan` when either translation is degenerate.
-    """
-    a: Float64[ndarray, "3"] = np.asarray(first.translation, dtype=np.float64)
-    b: Float64[ndarray, "3"] = np.asarray(second.translation, dtype=np.float64)
-    norms: float = float(np.linalg.norm(a) * np.linalg.norm(b))
-    if norms <= 1e-12:
-        return float("nan")
-    return float(np.rad2deg(np.arccos(np.clip(float(a @ b) / norms, -1.0, 1.0))))
+        Returns:
+            One outcome per entry of `target_rig_ids`, in that order.
+        """
+        local_map: RigLandmarks = self.local_map(source_rig_id)
+        return [self.measure(source_rig_id, target_rig_id, local_map) for target_rig_id in target_rig_ids]
+
+    # ----------------------------------------------------------------------------------
+    # the local map
+    # ----------------------------------------------------------------------------------
+
+    def _local_map_partners(self, rig_id: int, camera_id: int) -> list[int]:
+        """Images whose rays join one anchor image's in the local map.
+
+        Args:
+            rig_id: The source rig frame.
+            camera_id: The anchor image's camera.
+
+        Returns:
+            Image ids of the stereo partner inside the rig frame and of the same camera in
+            every temporal neighbour, in a stable order.
+        """
+        partners: list[int] = []
+        partner_camera: int | None = self.geometry.stereo_partner.get(camera_id)
+        if partner_camera is not None:
+            stereo_image: int | None = self.index.keyframe(rig_id, partner_camera)
+            if stereo_image is not None:
+                partners.append(stereo_image)
+        for neighbour in self.index.neighbours(rig_id, self.config.neighbour_span):
+            neighbour_image: int | None = self.index.keyframe(neighbour, camera_id)
+            if neighbour_image is not None:
+                partners.append(neighbour_image)
+        return partners
+
+    def _anchor_tracks(self, rig_id: int, camera_id: int, anchor: int) -> tuple[dict[int, list[tuple[int, int]]], dict[int, Float64[ndarray, "3 4"]]]:
+        """Match one anchor image against its partners and collect its feature tracks.
+
+        Args:
+            rig_id: The source rig frame.
+            camera_id: The anchor image's camera.
+            anchor: The anchor image id.
+
+        Returns:
+            The observations of each anchor keypoint as `(partner image id, keypoint index)`
+            pairs, and the `cam_T_rig` 3x4 projection of every partner that matched.
+        """
+        world_T_rig: pycolmap.Rigid3d = self.index.world_T_rig[rig_id]
+        tracks: dict[int, list[tuple[int, int]]] = {}
+        projections: dict[int, Float64[ndarray, "3 4"]] = {}
+        for partner in self._local_map_partners(rig_id, camera_id):
+            partner_matches: Matches = np.asarray(self.match_fn(anchor, partner), dtype=np.int64).reshape(-1, 2)
+            if partner not in self.keypoints or len(partner_matches) == 0:
+                continue
+            partner_camera: int = self._camera_of_image[partner]
+            rig_T_partner_rig: pycolmap.Rigid3d = world_T_rig.inverse() * self.index.world_T_rig[self._rig_of_image[partner]]
+            projections[partner] = np.asarray(
+                (self.geometry.cams_from_rig[self.geometry.position_of(partner_camera)] * rig_T_partner_rig.inverse()).matrix(), dtype=np.float64
+            )
+            # `.tolist()` first: iterating a `[n, 2]` int64 array row by row builds two numpy
+            # scalars per match, which is 1.1 ms per 1500 matches and ~20 s over a RoboCap run.
+            for anchor_index, partner_index in partner_matches.tolist():
+                tracks.setdefault(anchor_index, []).append((partner, partner_index))
+        return tracks, projections
+
+    def _anchor_landmarks(self, rig_id: int, camera_id: int, anchor: int) -> AnchorLandmarks:
+        """Triangulate the landmarks one anchor image contributes to the local map.
+
+        Args:
+            rig_id: The source rig frame.
+            camera_id: The anchor image's camera.
+            anchor: The anchor image id.
+
+        Returns:
+            The surviving landmarks, packed and sorted by anchor keypoint index.
+        """
+        tracks, projections = self._anchor_tracks(rig_id, camera_id, anchor)
+        anchor_from_rig: pycolmap.Rigid3d = self.geometry.cams_from_rig[self.geometry.position_of(camera_id)]
+        anchor_projection: Float64[ndarray, "3 4"] = np.asarray(anchor_from_rig.matrix(), dtype=np.float64)
+        anchor_bearings: Bearings = self.bearings(anchor)
+        anchor_focal: float = self.focal_length_px(anchor)
+
+        # Group the tracks by which images they were seen in: every track in a group shares
+        # one stack of projection matrices, so the whole group triangulates in one batched
+        # least-squares call instead of one pybind call per landmark. A four-camera rig with
+        # two neighbours has at most a handful of distinct view sets, so the grouping is
+        # cheap and the batches are large.
+        grouped: dict[tuple[int, ...], list[int]] = {}
+        for anchor_index, observations in tracks.items():
+            grouped.setdefault(tuple(image_id for image_id, _ in observations), []).append(anchor_index)
+
+        kept_indices: list[int] = []
+        kept_points: list[Float64[ndarray, "3"]] = []
+        for view_set, anchor_indices in grouped.items():
+            stacked_projections: Float64[ndarray, "n_views 3 4"] = np.stack([anchor_projection, *(projections[image_id] for image_id in view_set)])
+            view_focals: Float64[ndarray, "n_views"] = np.array(
+                [anchor_focal, *(self.focal_length_px(image_id) for image_id in view_set)], dtype=np.float64
+            )
+            observed_indices: dict[int, dict[int, int]] = {}
+            for anchor_index in anchor_indices:
+                for image_id, index_in_partner in tracks[anchor_index]:
+                    observed_indices.setdefault(image_id, {})[anchor_index] = index_in_partner
+            batch_bearings: Float64[ndarray, "n_points n_views 3"] = np.stack(
+                [
+                    anchor_bearings[anchor_indices],
+                    *(
+                        self.bearings(image_id)[[observed_indices[image_id][anchor_index] for anchor_index in anchor_indices]]
+                        for image_id in view_set
+                    ),
+                ],
+                axis=1,
+            )
+            triangulated, keep = _triangulate_batch(stacked_projections, batch_bearings, view_focals, self.config)
+            for position, anchor_index in enumerate(anchor_indices):
+                if keep[position]:
+                    kept_indices.append(anchor_index)
+                    kept_points.append(triangulated[position])
+
+        order: Int[ndarray, "n_landmarks"] = np.argsort(np.asarray(kept_indices, dtype=np.int64), kind="stable")
+        return AnchorLandmarks(
+            keypoint_indices=np.asarray(kept_indices, dtype=np.int64)[order],
+            points_in_rig=np.ascontiguousarray(np.asarray(kept_points, dtype=np.float64).reshape(-1, 3)[order]),
+        )
+
+    # ----------------------------------------------------------------------------------
+    # the measurement
+    # ----------------------------------------------------------------------------------
+
+    def _observations(self, source_rig_id: int, target_rig_id: int, landmarks: RigLandmarks) -> _Observations:
+        """Match the source rig's anchor images against the target's and pair 2-D with 3-D.
+
+        Every pair is asked of `match_fn` unconditionally, so a caller probing for the pair
+        list with a matcher that returns nothing still sees all of them (module docstring).
+        The join between a pair's matches and the anchor's landmarks is a `searchsorted`, not
+        a lookup per match: a RoboCap rig pair offers a few thousand matches over six image
+        pairs, and doing that in Python is most of the stage's runtime.
+
+        Args:
+            source_rig_id: Rig frame the landmarks belong to.
+            target_rig_id: Rig frame being localised.
+            landmarks: The source rig's local map.
+
+        Returns:
+            The correspondences, empty when nothing matched.
+        """
+        pixel_blocks: list[Keypoints] = []
+        point_blocks: list[Float64[ndarray, "n_hits 3"]] = []
+        camera_indices: list[int] = []
+        contributing: set[int] = set()
+        epipolar_source: list[Keypoints] = []
+        epipolar_target: list[Keypoints] = []
+        epipolar_positions: list[int] = []
+        for camera_id in self.geometry.camera_ids:
+            anchor: int | None = self.index.keyframe(source_rig_id, camera_id)
+            if anchor is None:
+                continue
+            target_cameras: list[int] = [camera_id]
+            partner_camera: int | None = self.geometry.stereo_partner.get(camera_id)
+            if partner_camera is not None:
+                target_cameras.append(partner_camera)
+            anchor_landmarks: AnchorLandmarks | None = landmarks.get(anchor)
+            for target_camera in target_cameras:
+                observed: int | None = self.index.keyframe(target_rig_id, target_camera)
+                if observed is None or observed not in self.keypoints:
+                    continue
+                pair_matches: Matches = np.asarray(self.match_fn(anchor, observed), dtype=np.int64).reshape(-1, 2)
+                if len(pair_matches) == 0:
+                    continue
+                position: int = self.geometry.position_of(target_camera)
+                if target_camera == camera_id and anchor in self.keypoints:
+                    epipolar_source.append(self.keypoints[anchor][pair_matches[:, 0]])
+                    epipolar_target.append(self.keypoints[observed][pair_matches[:, 1]])
+                    epipolar_positions.extend([position] * len(pair_matches))
+                if anchor_landmarks is None or len(anchor_landmarks) == 0:
+                    continue
+                insertion: Int[ndarray, "n_matches"] = np.searchsorted(anchor_landmarks.keypoint_indices, pair_matches[:, 0])
+                clipped: Int[ndarray, "n_matches"] = np.clip(insertion, 0, len(anchor_landmarks) - 1)
+                matched: Bool[ndarray, "n_matches"] = anchor_landmarks.keypoint_indices[clipped] == pair_matches[:, 0]
+                hits: int = int(matched.sum())
+                if hits == 0:
+                    continue
+                pixel_blocks.append(self.keypoints[observed][pair_matches[matched, 1]])
+                point_blocks.append(anchor_landmarks.points_in_rig[clipped[matched]])
+                camera_indices.extend([position] * hits)
+                contributing.add(target_camera)
+        epipolar: _EpipolarCorrespondences = _EpipolarCorrespondences(
+            source_pixels=epipolar_source, target_pixels=epipolar_target, camera_indices=epipolar_positions
+        )
+        if not point_blocks:
+            return _Observations(np.zeros((0, 2), dtype=np.float64), np.zeros((0, 3), dtype=np.float64), [], set(), epipolar)
+        return _Observations(
+            points2d=np.ascontiguousarray(np.concatenate(pixel_blocks), dtype=np.float64),
+            points3d=np.ascontiguousarray(np.concatenate(point_blocks), dtype=np.float64),
+            camera_indices=camera_indices,
+            cameras=contributing,
+            epipolar=epipolar,
+        )
+
+    def _epipolar_pose(self, correspondences: _EpipolarCorrespondences) -> pycolmap.Rigid3d | None:
+        """Solve the generalized essential matrix over the same-camera matches of a rig pair.
+
+        Its rotation and translation *direction* are trustworthy; its magnitude is not, which
+        is why the caller only cross-checks a direction against it (module docstring).
+
+        Args:
+            correspondences: The same-camera matches `_observations` collected.
+
+        Returns:
+            `source_T_target` with an unreliable magnitude, or None when there are too few
+            correspondences or pycolmap answers with a panoramic (pure-rotation) model.
+        """
+        if len(correspondences.camera_indices) < self.config.min_inliers:
+            return None
+        answer: dict | None = pycolmap.estimate_generalized_relative_pose(
+            np.ascontiguousarray(np.vstack(correspondences.source_pixels), dtype=np.float64),
+            np.ascontiguousarray(np.vstack(correspondences.target_pixels), dtype=np.float64),
+            correspondences.camera_indices,
+            correspondences.camera_indices,
+            list(self.geometry.cams_from_rig),
+            list(self.geometry.cameras),
+            _ransac_options(self.config),
+        )
+        # pycolmap answers a configuration whose rig baseline cannot fix the scale with a
+        # `pano2_from_pano1` key instead, i.e. a pure-rotation model; there is no direction in it.
+        if answer is None or "rig2_from_rig1" not in answer:
+            return None
+        return answer["rig2_from_rig1"].inverse()

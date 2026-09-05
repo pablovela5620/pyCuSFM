@@ -64,7 +64,7 @@ off by default; NOTES.md deviation 9 carries the table.
 | `ceres.loss_function_type` | TRIVIAL | `loss_type` (CAUCHY) | config §3.2 |
 | `ceres.loss_function_scale` | 1.0 | `sigma * loss_function_scale` (4.0) | see below |
 | `ceres.auto_select_solver_type` | True | False | otherwise the explicit solver choice is ignored |
-| `solver_options.linear_solver_type` | SPARSE_NORMAL_CHOLESKY | `MappingOptions.linear_solver` | cuSFM: SPARSE_SCHUR on CPU, SPARSE_NORMAL_CHOLESKY on the cuDSS path (§6.5) |
+| `solver_options.linear_solver_type` | SPARSE_NORMAL_CHOLESKY | `MAPPING_LINEAR_SOLVER` (SPARSE_SCHUR) | cuSFM: SPARSE_SCHUR on CPU, SPARSE_NORMAL_CHOLESKY on the cuDSS path (§6.5) |
 | `solver_options.max_num_iterations` | 100 | 200 | config §3.2 |
 | `solver_options.max_linear_solver_iterations` | 200 | 100 | config §3.2 |
 | `solver_options.num_threads` | -1 | `num_threads` (8) | config §3.2 |
@@ -121,19 +121,27 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, Literal, TypeAlias
+from typing import Final
 
 import numpy as np
 import pycolmap
-import pycolmap.pyceres as colmap_ceres
 from jaxtyping import Bool, Float64
 from numpy import ndarray
 
+from colsfm.ceres_pose import COLMAP_LINEAR_SOLVER, LinearSolver
 from colsfm.config import BundleAdjustmentConfig, LossFunctionType, VisionMappingConfig
-from colsfm.reconstruction import RIG_ID, RigReference, camera_sensor_id
+from colsfm.reconstruction import (
+    RIG_ID,
+    PosedModel,
+    RigReference,
+    camera_sensor_id,
+)
+from colsfm.reconstruction import num_registered_images as num_observing_images
 
-LinearSolver: TypeAlias = Literal["SPARSE_SCHUR", "SPARSE_NORMAL_CHOLESKY"]
-"""The two linear solvers cuSFM uses: SPARSE_SCHUR on the CPU, the other on the cuDSS path."""
+MAPPING_LINEAR_SOLVER: Final[LinearSolver] = "SPARSE_SCHUR"
+"""cuSFM's CPU linear solver, and the only one this stage ever wants: a bundle adjustment
+is exactly the problem the Schur complement exists for. The cuDSS path uses
+SPARSE_NORMAL_CHOLESKY instead (§6.5), which colsfm does not build."""
 
 CERES_FUNCTION_TOLERANCE: Final[float] = 1e-6
 """Ceres' own default, which cuSFM keeps and pycolmap overrides to 0.0."""
@@ -175,17 +183,8 @@ class MappingOptions:
     (`min_num_images_gpu_solver`, pycolmap-capabilities.md §11). Off by default because the
     measured gain does not exist: 1.68 s against 1.60 s on Galileo's 226 images, and 19.2 s
     against 20.9 s on 800 RoboCap images — 5 % the wrong way, then 8 % the right way. The
-    blob's own mapper is Ceres on the CPU, so that is where the default stays."""
-    gpu_index: str = "-1"
-    """GPU to solve on when `use_gpu`; `-1` lets Ceres choose."""
-    linear_solver: LinearSolver = "SPARSE_SCHUR"
-    """Linear solver; cuSFM's CPU default. The cuDSS path uses SPARSE_NORMAL_CHOLESKY."""
-    stop_on_observation_change: bool = True
-    """Leave the outer loop when `(merged + completed + filtered) / observations` falls
-    below `max_observation_change`. cuSFM logs `use num_ba_iterations to stop BA`, so
-    its two stopping rules are exclusive; set this False to always run every round."""
-    print_ba_summary: bool = False
-    """Print COLMAP's own solver summary per round."""
+    blob's own mapper is Ceres on the CPU, so that is where the default stays. Which GPU
+    is left to Ceres, i.e. pycolmap's `gpu_index` default of `-1`."""
     verbose: bool = True
     """Print one line per triangulation pass and per outer round, as cuSFM does."""
 
@@ -250,22 +249,18 @@ class RoundStats:
 
 @dataclass(frozen=True, slots=True)
 class MappingResult:
-    """What `run_mapping` produced, and how long each phase took."""
+    """What `run_mapping` produced, and how long each phase took.
+
+    Every count is a **property** computed from `reconstruction` on demand, not a
+    number copied out of it at return time. `colsfm.extrinsic_refinement` keeps
+    adjusting the very same model after `run_mapping` has returned, and a stored
+    count would then be quietly describing a model that no longer exists.
+    """
 
     reconstruction: pycolmap.Reconstruction
     """The adjusted reconstruction; the same object that was passed in."""
-    num_registered_images: int
-    """Images belonging to a registered frame, whether or not they see a point."""
-    num_images_with_observations: int
-    """Images that observe at least one point; what a COLMAP export writes out."""
-    num_points3D: int
-    """Triangulated points that survived every filter."""
-    num_observations: int
-    """Point-to-image observations in the final map."""
-    mean_reprojection_error_px: float
-    """Mean reprojection error over all observations, in pixels."""
-    mean_track_length: float
-    """Mean observations per point; cuSFM's `Mean length`."""
+    reference: RigReference
+    """Where the rig origin sits, carried through from the `PosedModel` that was mapped."""
     rounds: tuple[RoundStats, ...]
     """Per-round statistics, in order."""
     correspondence_seconds: float
@@ -276,10 +271,81 @@ class MappingResult:
     """Time spent inside `BundleAdjuster.solve`, summed over the rounds."""
     total_seconds: float
     """Wall-clock seconds for the whole call."""
-    refined_extrinsics: dict[int, pycolmap.Rigid3d] | None = None
-    """`vehicle_T_cam` per `camera_params_id` after the solve, or None when
-    `optimize_extrinsics` was off. The reference camera's entry is the input one
-    exactly: it is the rig origin, so bundle adjustment holds no block for it."""
+    extrinsics_refined: bool = False
+    """Whether this pass refined `sensor_from_rig`; what makes `refined_extrinsics`
+    something other than the input calibration read back out of the rig."""
+
+    @property
+    def num_registered_images(self) -> int:
+        """Images belonging to a registered frame, whether or not they see a point.
+
+        Returns:
+            The count `registered_image_ids` reports, which is every image of a
+            `build_reconstruction` model.
+        """
+        return len(registered_image_ids(self.reconstruction))
+
+    @property
+    def num_images_with_observations(self) -> int:
+        """Images that observe at least one point; what a COLMAP export writes out.
+
+        Returns:
+            `colsfm.reconstruction.num_registered_images` of this model — the other,
+            narrower sense of "registered"; see that function.
+        """
+        return num_observing_images(self.reconstruction)
+
+    @property
+    def num_points3D(self) -> int:
+        """Triangulated points that survived every filter.
+
+        Returns:
+            The point count.
+        """
+        return self.reconstruction.num_points3D()
+
+    @property
+    def num_observations(self) -> int:
+        """Point-to-image observations in the final map.
+
+        Returns:
+            The observation count.
+        """
+        return self.reconstruction.compute_num_observations()
+
+    @property
+    def mean_reprojection_error_px(self) -> float:
+        """Mean reprojection error over all observations, in pixels.
+
+        Returns:
+            The mean error; valid only after `update_point_3d_errors`, which
+            `run_mapping` calls at the end of every round.
+        """
+        return self.reconstruction.compute_mean_reprojection_error()
+
+    @property
+    def mean_track_length(self) -> float:
+        """Mean observations per point; cuSFM's `Mean length`.
+
+        Returns:
+            The mean track length.
+        """
+        return self.reconstruction.compute_mean_track_length()
+
+    @property
+    def refined_extrinsics(self) -> dict[int, pycolmap.Rigid3d] | None:
+        """`vehicle_T_cam` per `camera_params_id` after the solve.
+
+        Returns:
+            The extrinsics read back out of the adjusted rig, or None when nothing
+            refined them — either because `optimize_extrinsics` was off or because
+            the rig is vehicle-referenced, which COLMAP would freeze anyway. The
+            reference camera's entry is the input one exactly: it is the rig origin,
+            so bundle adjustment holds no block for it.
+        """
+        if not self.extrinsics_refined or self.reference.camera_params_id is None:
+            return None
+        return self.reference.vehicle_T_cam_by_camera_params_id(self.reconstruction)
 
 
 @dataclass(frozen=True, slots=True)
@@ -366,16 +432,16 @@ def bundle_adjustment_options(
     ba_options.refine_rig_from_world = True
     ba_options.refine_sensor_from_rig = options.optimize_extrinsics
     ba_options.refine_points3D = True
-    ba_options.print_summary = options.print_ba_summary
+    # pycolmap defaults this to True, which prints a full Ceres report per round.
+    ba_options.print_summary = False
 
     num_threads: int = ba_config.num_threads if options.num_threads is None else options.num_threads
     ba_options.ceres.loss_function_type = LOSS_FUNCTION_BY_NAME[ba_config.loss_type]
     ba_options.ceres.loss_function_scale = ba_config.reprojection_error_standard_deviation * ba_config.loss_function_scale
     ba_options.ceres.use_gpu = options.use_gpu
-    ba_options.ceres.gpu_index = options.gpu_index
     ba_options.ceres.auto_select_solver_type = False
     solver_options = ba_options.ceres.solver_options
-    solver_options.linear_solver_type = getattr(colmap_ceres.LinearSolverType, options.linear_solver)
+    solver_options.linear_solver_type = COLMAP_LINEAR_SOLVER[MAPPING_LINEAR_SOLVER]
     solver_options.num_threads = num_threads
     solver_options.max_num_iterations = ba_config.max_num_iterations
     solver_options.max_num_consecutive_invalid_steps = ba_config.max_invalid_steps
@@ -710,25 +776,7 @@ def _parse_brief_report(summary: pycolmap.BundleAdjustmentSummary) -> tuple[int,
     return int(match.group(1)), float(match.group(2)), float(match.group(3))
 
 
-def _images_with_observations(reconstruction: pycolmap.Reconstruction) -> int:
-    """Count images that observe at least one point.
-
-    Args:
-        reconstruction: The model.
-
-    Returns:
-        The number of images a COLMAP export would write with a non-empty track list.
-
-    Note:
-        `Image.num_points2D` is a method while `Image.num_points3D` is a
-        property — one of pycolmap 4.2's several method/property splits.
-    """
-    return sum(1 for image in reconstruction.images.values() if image.num_points3D > 0)
-
-
-def _check_extrinsics_are_refinable(
-    reconstruction: pycolmap.Reconstruction, rig_reference: RigReference | None
-) -> None:
+def _check_extrinsics_are_refinable(model: PosedModel) -> None:
     """Refuse an extrinsic refinement COLMAP would silently turn into a no-op.
 
     COLMAP's `ParameterizeRigsAndFrames` fixes every non-reference
@@ -737,40 +785,35 @@ def _check_extrinsics_are_refinable(
     not well constrained". A vehicle-body reference owns no images, so it never
     is, and `refine_sensor_from_rig = True` then moves nothing at all.
 
+    A `PosedModel` carries the reference it was built with, so this is the only
+    condition left to test: the second half of the old guard — a caller who had a
+    reconstruction but no `rig_reference` to invert the bookkeeping with — cannot
+    be expressed any more.
+
     Args:
-        reconstruction: The model about to be adjusted.
-        rig_reference: How its rig was built, or None.
+        model: The model about to be adjusted.
 
     Raises:
-        ValueError: When the rig's reference sensor is not a camera, or when the
-            caller gave no `rig_reference` to invert the bookkeeping with.
+        ValueError: When the rig's reference sensor is not a camera.
     """
-    reference_sensor: pycolmap.sensor_t = reconstruction.rig(RIG_ID).ref_sensor_id
-    if reference_sensor.type != pycolmap.SensorType.CAMERA:
+    if model.reference.camera_params_id is None:
         raise ValueError(
             "Cannot refine rig extrinsics: this rig's reference sensor is "
-            f"{reference_sensor}, which owns no images. COLMAP holds every "
-            "`sensor_from_rig` constant when the reference sensor is not part of the "
-            "problem, so the refinement would be a silent no-op. Build the "
-            "reconstruction with `build_reconstruction(..., reference_camera_params_id=...)` "
-            "to put the rig origin on a camera."
-        )
-    if rig_reference is None:
-        raise ValueError(
-            "Cannot refine rig extrinsics without a `rig_reference`: the input "
-            "`vehicle_T_cam_ref` is what turns the adjusted `sensor_from_rig` "
-            "transforms back into `sensor_to_vehicle_transform`."
+            f"{model.reconstruction.rig(RIG_ID).ref_sensor_id}, which owns no images. "
+            "COLMAP holds every `sensor_from_rig` constant when the reference sensor is "
+            "not part of the problem, so the refinement would be a silent no-op. Build "
+            "the reconstruction with "
+            "`build_reconstruction(..., reference_camera_params_id=...)` to put the rig "
+            "origin on a camera."
         )
 
 
 def run_mapping(
-    reconstruction: pycolmap.Reconstruction,
+    model: PosedModel,
     database_path: Path,
     mapping_config: VisionMappingConfig,
-    ba_config: BundleAdjustmentConfig,
     options: MappingOptions | None = None,
     gauge_frame_id: int | None = None,
-    rig_reference: RigReference | None = None,
 ) -> MappingResult:
     """Triangulate and bundle-adjust, cuSFM's `keypoints_mapper_main` §5.3-§5.6.
 
@@ -787,20 +830,20 @@ def run_mapping(
     remove what a converged solve can still leave behind — a point outside the
     world, or one inside a camera. Both docstrings carry the measurements.
 
+    The early exit is the configuration's own: set
+    `mapping_config.max_observation_change` to 0.0 to run every round, since the
+    statistic is never negative. cuSFM logs `use num_ba_iterations to stop BA`, so
+    its two stopping rules are exclusive.
+
     Args:
-        reconstruction: A reconstruction with registered, pose-carrying frames,
-            adjusted in place.
+        model: A reconstruction with registered, pose-carrying frames and the rig
+            reference it was built with. The reconstruction is adjusted in place.
         database_path: COLMAP database with keypoints and verified two-view geometries.
-        mapping_config: `vision_mapping_config.pb.txt`.
-        ba_config: The `BundleAdjustmentConfig` inside it.
+        mapping_config: `vision_mapping_config.pb.txt`; its `bundle_adjustment` block
+            is what the Ceres solve is configured from.
         options: Command-line style knobs; the defaults when None.
         gauge_frame_id: Frame held constant for gauge; the frame owning the
             lowest image id when None, which is cuSFM's own choice (§6.3).
-        rig_reference: How the reconstruction's rig was built, from
-            `colsfm.reconstruction.rig_reference`. Required when
-            `options.optimize_extrinsics` is set, because the input
-            `vehicle_T_cam_ref` it carries is the only way back from the adjusted
-            `sensor_from_rig` transforms to `sensor_to_vehicle_transform`.
 
     Returns:
         The adjusted reconstruction with per-round statistics and timings, plus
@@ -813,6 +856,8 @@ def run_mapping(
             asked for on a rig COLMAP would silently freeze.
     """
     resolved_options: MappingOptions = MappingOptions() if options is None else options
+    reconstruction: pycolmap.Reconstruction = model.reconstruction
+    ba_config: BundleAdjustmentConfig = mapping_config.bundle_adjustment
     started: float = time.perf_counter()
     image_ids: list[int] = registered_image_ids(reconstruction)
     if not image_ids:
@@ -822,7 +867,7 @@ def run_mapping(
     )
     fixed_camera_params_id: int | None = None
     if resolved_options.optimize_extrinsics:
-        _check_extrinsics_are_refinable(reconstruction, rig_reference)
+        _check_extrinsics_are_refinable(model)
         # cuSFM's constant keyframe is the lowest id in the map (§6.3), and
         # `--fixed_camera_name` pins that keyframe's camera when extrinsics move.
         fixed_camera_params_id = (
@@ -910,27 +955,18 @@ def run_mapping(
                 f"change {observation_change:.6f}, points {latest.num_points3D}, "
                 f"reprojection {latest.mean_reprojection_error_px:.4f} px"
             )
-        if resolved_options.stop_on_observation_change and observation_change < mapping_config.max_observation_change:
+        if observation_change < mapping_config.max_observation_change:
             if resolved_options.verbose:
                 print(f"[colsfm] observation change {observation_change:.6f} below {mapping_config.max_observation_change}")
             break
 
     return MappingResult(
         reconstruction=reconstruction,
-        num_registered_images=len(image_ids),
-        num_images_with_observations=_images_with_observations(reconstruction),
-        num_points3D=reconstruction.num_points3D(),
-        num_observations=reconstruction.compute_num_observations(),
-        mean_reprojection_error_px=reconstruction.compute_mean_reprojection_error(),
-        mean_track_length=reconstruction.compute_mean_track_length(),
+        reference=model.reference,
         rounds=tuple(rounds),
         correspondence_seconds=correspondence_seconds,
         triangulation_seconds=triangulation_seconds,
         bundle_adjustment_seconds=bundle_adjustment_seconds,
         total_seconds=time.perf_counter() - started,
-        refined_extrinsics=(
-            rig_reference.vehicle_T_cam_by_camera_params_id(reconstruction)
-            if resolved_options.optimize_extrinsics and rig_reference is not None
-            else None
-        ),
+        extrinsics_refined=resolved_options.optimize_extrinsics,
     )
