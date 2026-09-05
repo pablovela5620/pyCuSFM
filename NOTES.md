@@ -785,6 +785,87 @@ mismatch there raises nothing and just quietly costs matches, so
 differ by, and two unit tests assert the inverse holds and that the blob's normalisation is
 *not* it.
 
+**Preprocessing now runs on the GPU** (`docs/gpu-preprocessing.md`). A four-layer TensorRT
+engine — cast, transpose, BGR-to-RGB gather, divide by 255 — built with the graph API rather
+than prepended to either ONNX file, so neither detector engine is rebuilt and no `onnx`
+dependency enters the `colsfm` environment. The host now stages decoded uint8 frames in one
+page-locked batch buffer and uploads a quarter of the bytes; the `np.concatenate` and the
+identity `cv2.resize` are gone. It is bit-exact against the old host arithmetic, and the
+Galileo run is unchanged at 224/226, 1.500 px, 5.17 mm ATE, 4/4 bounds, with the extraction
+stage at 4.77 s.
+
+### CASPAR backend
+
+`--ba-backend caspar` sends every bundle adjustment to **CASPAR**, COLMAP's experimental
+GPU solver, instead of Ceres. It is compiled in only with `-DCASPAR_ENABLED=ON`, which no
+distributed binary sets, so it lives in the `colsfm-caspar` environment and its from-source
+pycolmap (`docs/caspar-build.md`, `packages/pycolmap-caspar`). The flag is safe to pass
+anywhere: the `BundleAdjustmentBackend.CASPAR` enum is bound unconditionally and proves
+nothing, the missing capability surfaces only when the adjuster is *built*, and
+`colsfm.mapping.solve_bundle_adjustment` catches that `ValueError` once and finishes the run
+on Ceres. Two pre-flight fallbacks join it: a camera model outside PINHOLE / SIMPLE_RADIAL,
+whose observations CASPAR *silently drops*, and `--optimize-extrinsics`, which CASPAR cannot
+honour because it holds `sensor_from_rig` fixed. `summary.json` records the backend that
+actually ran (`mapping.ba_backend`), not the one that was asked for.
+
+**Galileo 226 — nothing to win.** Both runs in `colsfm-caspar`, so the solver is the only
+difference (`data/bench/galileo_caspar_compare.md`):
+
+| Metric | ceres | caspar |
+|---|---:|---:|
+| mapping stage (s) | 1.76 | 1.82 |
+| total (s) | 17.64 | 18.02 |
+| registered images | 225 / 226 | 225 / 226 |
+| 3D points | 6187 | 6294 |
+| mean reprojection (px) | 1.333 | 1.423 |
+| ATE vs ground truth (mm) | 4.37 | 4.44 |
+| rig poses, caspar against ceres | — | 0.28 mm RMSE / 0.25 deg |
+
+6194 points is far too small a problem to pay for a GPU: each solve is ~0.1 s either way and
+the stage is triangulation-bound. All four acceptance bounds still pass.
+
+**KITTI 06 — 4.7x on the stage, and 0.4 m of trajectory.** `--loop-closure --match-cap-mode
+fixed --min-inter-frame-distance 0.5` from the cuVSLAM SLAM initialisation: the `cap 500 +
+loops` row of `docs/kitti-06-results.md` §8 with the backend as the only change. The third
+column is the ablation that explains it — Ceres with `loss_type: TRIVIAL`, i.e. the same
+robust loss CASPAR drops, dropped on purpose. ATE is Sim(3)- and SE(3)-aligned against
+`data/kitti/06/poses_gt_06.txt`, all three rows from one `tools/kitti/evaluate_kitti.py` run:
+
+| Metric | ceres (CAUCHY) | caspar | ceres, loss TRIVIAL |
+|---|---:|---:|---:|
+| mapping stage (s) | 148.5 | **31.5** | (not comparable) |
+| total (s) | 338.0 | 208.6 | (not comparable) |
+| registered images | 2156 | 2156 | 2156 |
+| 3D points | 96 691 | 97 224 | 96 528 |
+| observations | 713 124 | 709 950 | 713 222 |
+| mean reprojection (px) | 0.674 | 0.715 | 0.708 |
+| Sim(3) ATE RMSE (m) | **0.895** | 1.299 | 0.899 |
+| SE(3) ATE RMSE (m) | 1.118 | 1.601 | 1.097 |
+
+The TRIVIAL run shared the machine with the test suite, so its two runtimes are not
+comparable; every other number in its column is.
+
+**The speedup is real: 148.5 s to 31.5 s**, 4.7x, on 2156 images and ~710 000 observations
+across five triangulate / filter / bundle-adjust rounds — and that is the *whole stage*, so
+the solves themselves are faster than 4.7x. Total runtime falls from 338.0 s to 208.6 s.
+
+**The accuracy cost is real too, and it is not the robust loss.** Sim(3) ATE goes from
+0.895 m to 1.299 m and SE(3) from 1.118 m to 1.601 m on a 1231 m sequence. The obvious
+suspect was decision 6's CAUCHY-at-sigma-4 term, which CASPAR ignores — it solves plain
+least squares whatever `ceres.loss_function_type` says. The ablation says no: **Ceres
+without the robust loss scores 0.899 m**, four millimetres from the robust run, because
+the outer loop's own pixel gate (25, 20, 15, 10, 5 px) and the two degeneracy filters have
+already removed what the loss would have down-weighted. What is left to blame is CASPAR
+itself — `CASPAR_USE_DOUBLE` is off, so it is a float32 solver with PCG stopping rules of
+its own, and `docs/caspar-build.md` predicted exactly this: "it is a real difference and it
+will grow on longer chains". Galileo's 1.96 m of trajectory hides it (0.07 mm); KITTI's
+1231 m does not. The reprojection error does *not* show it — 0.715 px against the TRIVIAL
+run's 0.708 px — so the pixels are fine and the pose chain is what drifts.
+
+**Recommendation: CASPAR for iteration, Ceres for the answer.** On KITTI 06 it buys 117 s
+of a 338 s run for 0.4 m of ATE. That is the wrong trade for a benchmark and the right one
+for a debug loop, which is why the flag exists and why it is off by default.
+
 ### Where colsfm deviates from the blob
 
 1. **The point cloud is a superset, from LO-RANSAC.** cuSFM grows one disjoint track per

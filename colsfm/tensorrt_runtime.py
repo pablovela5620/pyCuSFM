@@ -32,13 +32,16 @@ the tests skip on `ImportError`.
 
 from __future__ import annotations
 
+import ctypes
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Self, TypeAlias
 
 import numpy as np
 import tensorrt as trt
 from cuda.bindings import runtime as cudart
+from jaxtyping import UInt8
 from numpy import ndarray
 
 from colsfm import REPO_ROOT
@@ -54,6 +57,79 @@ DEFAULT_WORKSPACE_GIB: Final[int] = 8
 
 DEFAULT_OPTIMIZATION_LEVEL: Final[int] = 3
 """TensorRT builder search level; 3 is the default and what the shipped engines used."""
+
+PREPROCESS_IMAGE_U8_BINDING: Final[str] = "image_u8"
+"""The preprocessing engine's input: `[batch, height, width, 3]` uint8 BGR, as `cv2.imread` gives it."""
+
+PREPROCESS_IMAGE_BINDING: Final[str] = "image"
+"""The preprocessing engine's output, named to match what both ALIKED graphs call their input."""
+
+PREPROCESS_ENGINE_DIR: Final[Path] = REPO_ROOT / "data" / "cusfm_models"
+"""Where the generated preprocessing engines are cached; gitignored, like the RaCo graphs."""
+
+BGR_TO_RGB_INDICES: Final[tuple[int, int, int]] = (2, 1, 0)
+"""The channel permutation the host used to do with `resized_bgr_hwc[..., ::-1]`."""
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceTensor:
+    """One tensor that already lives in device memory, ready to bind as an input.
+
+    The point is to chain two engines on one stream without a round trip through
+    the host: `GpuPreprocessor.run` returns the device address of its float32
+    output and `TensorRTSession.run` binds that address directly.
+    """
+
+    pointer: int
+    """Device address, as `cudaMalloc` and `set_tensor_address` both spell it."""
+    shape: tuple[int, ...]
+    """The shape to declare for the binding this tensor is passed as."""
+
+
+class PinnedHostBuffer:
+    """One page-locked host allocation, viewed as an array.
+
+    Page-locked staging is what makes `cudaMemcpyAsync` a DMA rather than a
+    driver-side copy through an internal bounce buffer: measured on this host, a
+    batch of eight 1920x1200x3 uint8 frames takes 1.4 ms pinned against 5.6 ms
+    pageable (docs/raco-speed-investigation.md §4). Use it as a context manager;
+    `close` returns the pages to the OS.
+    """
+
+    def __init__(self, shape: tuple[int, ...], dtype: np.dtype[Any]) -> None:
+        """Allocate `shape` elements of `dtype` in page-locked memory.
+
+        Args:
+            shape: The array shape to expose.
+            dtype: The element type.
+
+        Raises:
+            RuntimeError: When `cudaHostAlloc` fails.
+        """
+        self.shape: tuple[int, ...] = shape
+        self.nbytes: int = int(np.prod(shape)) * np.dtype(dtype).itemsize
+        self.pointer: int = int(
+            check_cuda(cudart.cudaHostAlloc(self.nbytes, cudart.cudaHostAllocDefault), "cudaHostAlloc")[0]
+        )
+        buffer: Any = ctypes.cast(self.pointer, ctypes.POINTER(ctypes.c_ubyte * self.nbytes)).contents
+        self.array: ndarray = np.frombuffer(buffer, dtype=dtype).reshape(shape)
+        self.closed: bool = False
+
+    def close(self) -> None:
+        """Free the page-locked allocation; safe to call twice."""
+        if self.closed:
+            return
+        self.closed = True
+        del self.array
+        check_cuda(cudart.cudaFreeHost(self.pointer), "cudaFreeHost")
+
+    def __enter__(self) -> Self:
+        """Return the buffer itself, so `with PinnedHostBuffer(...) as staging` works."""
+        return self
+
+    def __exit__(self, *_arguments: object) -> None:
+        """Free the page-locked allocation."""
+        self.close()
 
 
 def check_cuda(result: tuple[Any, ...] | Any, operation: str) -> tuple[Any, ...]:
@@ -222,12 +298,17 @@ class TensorRTSession:
     Use it as a context manager; `close` frees the device memory and the stream.
     """
 
-    def __init__(self, engine_path: Path) -> None:
+    def __init__(self, engine_path: Path, *, reuse_output_buffers: bool = False) -> None:
         """Deserialise one engine.
 
         Args:
             engine_path: A serialised TensorRT engine built for this GPU and
                 this TensorRT version.
+            reuse_output_buffers: Keep one host array per output binding and hand
+                back views into it instead of allocating per call. Off by default
+                because it invalidates the previous call's arrays; the feature
+                backends turn it on because they copy what they keep out of the
+                arrays before the next call.
 
         Raises:
             FileNotFoundError: When the engine file is missing.
@@ -260,6 +341,8 @@ class TensorRTSession:
         }
         self.device_pointers: dict[str, int] = {}
         self.capacities: dict[str, int] = {}
+        self.reuse_output_buffers: bool = reuse_output_buffers
+        self.host_outputs: dict[str, ndarray] = {}
         self.stream: int = int(check_cuda(cudart.cudaStreamCreate(), "cudaStreamCreate")[0])
         self.closed: bool = False
 
@@ -283,15 +366,40 @@ class TensorRTSession:
         self.capacities[name] = wanted
         return pointer
 
-    def run(self, inputs: Mapping[str, ndarray]) -> dict[str, ndarray]:
+    def _host_output(self, name: str, shape: tuple[int, ...]) -> ndarray:
+        """A host array of `shape` for one output binding, reused when allowed.
+
+        Args:
+            name: The output binding.
+            shape: The shape TensorRT resolved for this call.
+
+        Returns:
+            A writable array. With `reuse_output_buffers` it is the same memory
+            every call, so the previous call's view is invalidated; without it a
+            fresh `np.empty`, whose first-touch page faults cost about 1 ms per
+            megabyte of descriptors (docs/raco-speed-investigation.md §4).
+        """
+        if not self.reuse_output_buffers:
+            return np.empty(shape, dtype=self.dtypes[name])
+        cached: ndarray | None = self.host_outputs.get(name)
+        if cached is None or cached.size < int(np.prod(shape)):
+            cached = np.zeros(int(np.prod(shape)), dtype=self.dtypes[name])
+            self.host_outputs[name] = cached
+        return cached[: int(np.prod(shape))].reshape(shape)
+
+    def run(self, inputs: Mapping[str, ndarray | DeviceTensor]) -> dict[str, ndarray]:
         """Execute the engine once and return every output as a host array.
 
         Args:
-            inputs: One contiguous host array per input binding, already in the
-                binding's dtype.
+            inputs: Per input binding, either one contiguous host array already
+                in the binding's dtype — which is copied to the device here — or
+                a `DeviceTensor` that some earlier work on **this session's
+                stream** already produced, which is bound in place with no copy.
 
         Returns:
             One host array per output binding, at the shape TensorRT resolved.
+            With `reuse_output_buffers` these are views into session-owned memory
+            and are only valid until the next `run`.
 
         Raises:
             RuntimeError: When the session is closed, when a profile rejects a
@@ -303,20 +411,31 @@ class TensorRTSession:
         for name in self.input_names:
             if name not in inputs:
                 raise ValueError(f"TensorRT engine input {name} was not supplied")
-            array: ndarray = inputs[name]
-            if array.dtype != self.dtypes[name]:
-                raise ValueError(f"Input {name} must be {self.dtypes[name]}, got {array.dtype}")
-            if not array.flags.c_contiguous:
-                raise ValueError(f"Input {name} must be C-contiguous")
-            if not self.context.set_input_shape(name, tuple(array.shape)):
-                raise RuntimeError(f"TensorRT profile rejected shape {tuple(array.shape)} for {name}")
+            supplied: ndarray | DeviceTensor = inputs[name]
+            if isinstance(supplied, DeviceTensor):
+                input_shape: tuple[int, ...] = supplied.shape
+            else:
+                if supplied.dtype != self.dtypes[name]:
+                    raise ValueError(f"Input {name} must be {self.dtypes[name]}, got {supplied.dtype}")
+                if not supplied.flags.c_contiguous:
+                    raise ValueError(f"Input {name} must be C-contiguous")
+                input_shape = tuple(supplied.shape)
+            if not self.context.set_input_shape(name, input_shape):
+                raise RuntimeError(f"TensorRT profile rejected shape {input_shape} for {name}")
         for name in self.input_names:
-            array = inputs[name]
-            pointer: int = self._ensure_capacity(name, array.nbytes)
+            supplied = inputs[name]
+            if isinstance(supplied, DeviceTensor):
+                self.context.set_tensor_address(name, supplied.pointer)
+                continue
+            pointer: int = self._ensure_capacity(name, supplied.nbytes)
             self.context.set_tensor_address(name, pointer)
             check_cuda(
                 cudart.cudaMemcpyAsync(
-                    pointer, array.ctypes.data, array.nbytes, cudart.cudaMemcpyKind.cudaMemcpyHostToDevice, self.stream
+                    pointer,
+                    supplied.ctypes.data,
+                    supplied.nbytes,
+                    cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
+                    self.stream,
                 ),
                 f"cudaMemcpyAsync(H2D {name})",
             )
@@ -325,7 +444,7 @@ class TensorRTSession:
             shape: tuple[int, ...] = tuple(self.context.get_tensor_shape(name))
             if any(dimension < 0 for dimension in shape):
                 raise RuntimeError(f"TensorRT left output {name} with an unresolved shape {shape}")
-            host: ndarray = np.empty(shape, dtype=self.dtypes[name])
+            host: ndarray = self._host_output(name, shape)
             outputs[name] = host
             self.context.set_tensor_address(name, self._ensure_capacity(name, max(host.nbytes, 1)))
         if not self.context.execute_async_v3(self.stream):
@@ -363,4 +482,225 @@ class TensorRTSession:
 
     def __exit__(self, *_arguments: object) -> None:
         """Free the device buffers and the stream."""
+        self.close()
+
+
+def preprocess_engine_path(height: int, width: int, max_batch: int, *, device_index: int = 0) -> Path:
+    """Where the generated uint8 preprocessing engine for one input size lives.
+
+    Args:
+        height: The consumer engine's input height.
+        width: The consumer engine's input width.
+        max_batch: The largest batch the profile admits.
+        device_index: CUDA device the engine is built for.
+
+    Returns:
+        A path under `PREPROCESS_ENGINE_DIR`, keyed by size, batch ceiling,
+        TensorRT version and compute capability — the same four things that make
+        a serialised engine non-portable.
+    """
+    tag: str = f"{height}x{width}_b{max_batch}_{tensorrt_version_tag()}_sm_{compute_capability(device_index)}"
+    return PREPROCESS_ENGINE_DIR / f"preprocess_bgr_u8_{tag}.engine"
+
+
+def build_preprocess_engine(
+    engine_path: Path,
+    *,
+    height: int,
+    width: int,
+    max_batch: int,
+    optimal_batch: int,
+    workspace_gib: int = 1,
+) -> Path:
+    """Build the engine that does the host's old `preprocess_image` arithmetic.
+
+    The network is authored with TensorRT's own graph API rather than parsed from
+    ONNX, because the `colsfm` environment has no `onnx` package and because
+    prepending nodes to `aliked.onnx` would force a fresh ~200 s build of the
+    blob's shipped engine. Four layers, in the order the host used to do them:
+    `Cast(uint8 -> float32)`, `Transpose(0, 3, 1, 2)`,
+    `Gather(axis=1, [2, 1, 0])` for BGR to RGB, and `Div(255)`.
+
+    FP16 is deliberately **not** enabled. Every step is exact in float32 —
+    widening a uint8 loses nothing and `x / 255.0f` is one correctly-rounded IEEE
+    division — so the tensor this engine hands the detector is bit-for-bit the
+    one `numpy` used to build (`tests/colsfm/test_features_trt_gpu_preprocess.py`).
+
+    Args:
+        engine_path: Destination; a `.tmp` sibling is renamed onto it.
+        height: Input height, matching the consumer engine.
+        width: Input width, matching the consumer engine.
+        max_batch: The profile's `max` batch.
+        optimal_batch: The profile's `opt` batch.
+        workspace_gib: Tactic workspace ceiling in GiB; four memory-bound layers
+            need none of it.
+
+    Returns:
+        `engine_path`.
+
+    Raises:
+        RuntimeError: When TensorRT refuses to build the network.
+        ValueError: When the batch bounds are not `1 <= optimal <= max`.
+    """
+    if not 1 <= optimal_batch <= max_batch:
+        raise ValueError(f"Need 1 <= optimal_batch <= max_batch, got {optimal_batch} and {max_batch}")
+
+    logger: trt.Logger = trt.Logger(trt.Logger.WARNING)
+    builder: trt.Builder = trt.Builder(logger)
+    network: trt.INetworkDefinition = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+    images_u8: trt.ITensor = network.add_input(PREPROCESS_IMAGE_U8_BINDING, trt.uint8, (-1, height, width, 3))
+    widened: trt.ITensor = network.add_cast(images_u8, trt.float32).get_output(0)
+    planar: trt.IShuffleLayer = network.add_shuffle(widened)
+    planar.first_transpose = trt.Permutation([0, 3, 1, 2])
+    channel_order: trt.ITensor = network.add_constant(
+        (3,), np.asarray(BGR_TO_RGB_INDICES, dtype=np.int32)
+    ).get_output(0)
+    rgb: trt.ITensor = network.add_gather(planar.get_output(0), channel_order, 1).get_output(0)
+    denominator: trt.ITensor = network.add_constant((1, 1, 1, 1), np.asarray([[[[255.0]]]], dtype=np.float32)).get_output(0)
+    scaled: trt.ITensor = network.add_elementwise(rgb, denominator, trt.ElementWiseOperation.DIV).get_output(0)
+    scaled.name = PREPROCESS_IMAGE_BINDING
+    network.mark_output(scaled)
+
+    builder_config: trt.IBuilderConfig = builder.create_builder_config()
+    builder_config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_gib << 30)
+    profile: trt.IOptimizationProfile = builder.create_optimization_profile()
+    profile.set_shape(
+        PREPROCESS_IMAGE_U8_BINDING,
+        (1, height, width, 3),
+        (optimal_batch, height, width, 3),
+        (max_batch, height, width, 3),
+    )
+    builder_config.add_optimization_profile(profile)
+
+    serialized: trt.IHostMemory | None = builder.build_serialized_network(network, builder_config)
+    if serialized is None:
+        raise RuntimeError(f"TensorRT could not build the uint8 preprocessing engine for {height}x{width}")
+    engine_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path = engine_path.with_suffix(engine_path.suffix + ".tmp")
+    temporary_path.write_bytes(bytes(serialized))
+    temporary_path.replace(engine_path)
+    return engine_path
+
+
+class GpuPreprocessor:
+    """The decode-to-tensor conversion, moved off the host and onto the stream.
+
+    What the host used to do per image — widen 6.9 M uint8 samples to float32,
+    transpose HWC to CHW, reverse the channels, divide by 255, then push 27.6 MB
+    over PCIe — cost 16.5 ms of CPU and 2.15 ms of transfer per image
+    (docs/raco-speed-investigation.md §4). This class pushes the 6.9 MB uint8
+    frame instead and lets a four-layer TensorRT engine do the rest, on the same
+    stream as the detector so the two never need a host synchronisation between
+    them.
+
+    Fill `staging_bhwc[:count]` with `cv2.imread`-order BGR frames, call `run`,
+    and bind the `DeviceTensor` it returns as the detector's `image` input. The
+    staging buffer may be refilled once the detector's own `run` has returned,
+    because that call synchronises the shared stream.
+    """
+
+    def __init__(
+        self,
+        *,
+        height: int,
+        width: int,
+        max_batch: int,
+        optimal_batch: int,
+        stream: int,
+        device_index: int = 0,
+    ) -> None:
+        """Load or build the preprocessing engine and allocate its buffers.
+
+        Args:
+            height: Input height, matching the consumer engine.
+            width: Input width, matching the consumer engine.
+            max_batch: The largest batch that will be passed to `run`.
+            optimal_batch: The batch to tune the profile for.
+            stream: The CUDA stream the consumer engine also executes on.
+            device_index: CUDA device the engine is built for.
+
+        Raises:
+            RuntimeError: When the engine cannot be built or deserialised.
+        """
+        engine_path: Path = preprocess_engine_path(height, width, max_batch, device_index=device_index)
+        if not engine_path.is_file():
+            build_preprocess_engine(
+                engine_path, height=height, width=width, max_batch=max_batch, optimal_batch=optimal_batch
+            )
+        logger: trt.Logger = trt.Logger(trt.Logger.ERROR)
+        self.runtime: trt.Runtime = trt.Runtime(logger)
+        engine: trt.ICudaEngine | None = self.runtime.deserialize_cuda_engine(engine_path.read_bytes())
+        if engine is None:
+            raise RuntimeError(f"Could not deserialize {engine_path}; it was built for another GPU or TensorRT")
+        self.engine: trt.ICudaEngine = engine
+        self.context: trt.IExecutionContext = self.engine.create_execution_context()
+        self.height: int = height
+        self.width: int = width
+        self.max_batch: int = max_batch
+        self.stream: int = stream
+        self.staging: PinnedHostBuffer = PinnedHostBuffer((max_batch, height, width, 3), np.dtype(np.uint8))
+        self.staging_bhwc: UInt8[ndarray, "max_batch height width 3"] = self.staging.array
+        self.input_pointer: int = int(
+            check_cuda(cudart.cudaMalloc(self.staging.nbytes), "cudaMalloc(image_u8)")[0]
+        )
+        self.output_nbytes: int = max_batch * 3 * height * width * np.dtype(np.float32).itemsize
+        self.output_pointer: int = int(
+            check_cuda(cudart.cudaMalloc(self.output_nbytes), "cudaMalloc(image)")[0]
+        )
+        self.closed: bool = False
+
+    def run(self, count: int) -> DeviceTensor:
+        """Convert the first `count` staged frames and leave the result on the device.
+
+        Args:
+            count: How many slots of `staging_bhwc` hold a frame, 1 to `max_batch`.
+
+        Returns:
+            The float32 planar RGB batch, `[count, 3, height, width]`, in device
+            memory. Nothing is synchronised: the work is queued on the shared
+            stream, ahead of whatever the caller enqueues next.
+
+        Raises:
+            RuntimeError: When the session is closed or execution fails.
+            ValueError: When `count` is outside the profile.
+        """
+        if self.closed:
+            raise RuntimeError("This GpuPreprocessor is closed")
+        if not 1 <= count <= self.max_batch:
+            raise ValueError(f"count must be in [1, {self.max_batch}], got {count}")
+        input_shape: tuple[int, int, int, int] = (count, self.height, self.width, 3)
+        if not self.context.set_input_shape(PREPROCESS_IMAGE_U8_BINDING, input_shape):
+            raise RuntimeError(f"The preprocessing profile rejected shape {input_shape}")
+        check_cuda(
+            cudart.cudaMemcpyAsync(
+                self.input_pointer,
+                self.staging.pointer,
+                count * self.height * self.width * 3,
+                cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
+                self.stream,
+            ),
+            "cudaMemcpyAsync(H2D image_u8)",
+        )
+        self.context.set_tensor_address(PREPROCESS_IMAGE_U8_BINDING, self.input_pointer)
+        self.context.set_tensor_address(PREPROCESS_IMAGE_BINDING, self.output_pointer)
+        if not self.context.execute_async_v3(self.stream):
+            raise RuntimeError("The uint8 preprocessing engine failed to execute")
+        return DeviceTensor(pointer=self.output_pointer, shape=(count, 3, self.height, self.width))
+
+    def close(self) -> None:
+        """Free the device buffers and the page-locked staging; safe to call twice."""
+        if self.closed:
+            return
+        self.closed = True
+        del self.staging_bhwc
+        self.staging.close()
+        check_cuda(cudart.cudaFree(self.input_pointer), "cudaFree(image_u8)")
+        check_cuda(cudart.cudaFree(self.output_pointer), "cudaFree(image)")
+
+    def __enter__(self) -> Self:
+        """Return the preprocessor itself, so `with GpuPreprocessor(...)` works."""
+        return self
+
+    def __exit__(self, *_arguments: object) -> None:
+        """Free the device buffers and the page-locked staging."""
         self.close()

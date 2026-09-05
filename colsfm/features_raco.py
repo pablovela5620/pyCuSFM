@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Iterator, Sequence
+from contextlib import ExitStack
 from itertools import islice
 from pathlib import Path
 from typing import Final, TypeAlias
@@ -54,6 +55,7 @@ from colsfm.database import Descriptors, KeypointsXY, keypoint_counts
 from colsfm.features import TensorRTExtraction
 from colsfm.features_trt import (
     ALIKED_IMAGE_BINDING,
+    DEFAULT_GPU_PREPROCESSING,
     DEFAULT_PREPROCESSING_WORKERS,
     DESCRIPTOR_TYPE,
     NETWORK_HEIGHT,
@@ -64,7 +66,7 @@ from colsfm.features_trt import (
     _prepared_stream,
     normalized_to_pixels,
 )
-from colsfm.tensorrt_runtime import ShapeProfile, TensorRTSession, resolve_engine
+from colsfm.tensorrt_runtime import DeviceTensor, GpuPreprocessor, ShapeProfile, TensorRTSession, resolve_engine
 
 NetworkBatch: TypeAlias = Float32[ndarray, "batch 3 network_height network_width"]
 """One batch of preprocessed images as the engine takes it: planar RGB in [0, 1]."""
@@ -129,6 +131,7 @@ def extract_raco(
     onnx_path: Path = RACO_ONNX_PATH,
     batch_size: int = DEFAULT_BATCH_SIZE,
     preprocessing_workers: int = DEFAULT_PREPROCESSING_WORKERS,
+    gpu_preprocessing: bool = DEFAULT_GPU_PREPROCESSING,
 ) -> TensorRTExtraction:
     """Run the batched RaCo-ALIKED engine over the named images and store the features.
 
@@ -144,6 +147,10 @@ def extract_raco(
         onnx_path: The batch-dynamic RaCo-ALIKED graph whose engine to use.
         batch_size: Images executed together, 1 to `MAXIMUM_BATCH_SIZE`.
         preprocessing_workers: Decode-and-resize threads.
+        gpu_preprocessing: Stage the decoded uint8 frames in one page-locked
+            batch buffer and let a TensorRT preprocessing engine transpose, widen
+            and scale them. `False` restores the host conversion plus the
+            `np.concatenate` that used to build every batch.
 
     Returns:
         Keypoints stored per `image_id`, and the wall time of the whole pass
@@ -164,16 +171,39 @@ def extract_raco(
     started: float = time.perf_counter()
     tasks: list[ImageTask] = _image_tasks(database_path, image_root, image_names)
     engine_path: Path = resolve_engine(onnx_path, raco_profile())
-    with TensorRTSession(engine_path) as session, pycolmap.Database.open(database_path) as database:
+    with ExitStack() as stack:
+        session: TensorRTSession = stack.enter_context(TensorRTSession(engine_path, reuse_output_buffers=True))
+        database: pycolmap.Database = stack.enter_context(pycolmap.Database.open(database_path))
         declared_shape: tuple[int, ...] = tuple(session.engine.get_tensor_shape(ALIKED_IMAGE_BINDING))
         network_height: int = int(declared_shape[2])
         network_width: int = int(declared_shape[3])
-        prepared: Iterator[PreparedImage] = _prepared_stream(tasks, preprocessing_workers, network_height, network_width)
-        for batch in _batched(prepared, batch_size):
-            images_bchw: NetworkBatch = np.ascontiguousarray(
-                np.concatenate([item.network_bchw for item in batch], axis=0), dtype=np.float32
+        preprocessor: GpuPreprocessor | None = (
+            stack.enter_context(
+                GpuPreprocessor(
+                    height=network_height,
+                    width=network_width,
+                    max_batch=batch_size,
+                    optimal_batch=batch_size,
+                    stream=session.stream,
+                )
             )
-            outputs: dict[str, ndarray] = session.run({ALIKED_IMAGE_BINDING: images_bchw})
+            if gpu_preprocessing
+            else None
+        )
+        prepared: Iterator[PreparedImage] = _prepared_stream(
+            tasks, preprocessing_workers, network_height, network_width, not gpu_preprocessing
+        )
+        for batch in _batched(prepared, batch_size):
+            network_input: NetworkBatch | DeviceTensor
+            if preprocessor is None:
+                network_input = np.ascontiguousarray(
+                    np.concatenate([item.network_image() for item in batch], axis=0), dtype=np.float32
+                )
+            else:
+                for slot, item in enumerate(batch):
+                    preprocessor.staging_bhwc[slot] = item.resized_bgr_hwc
+                network_input = preprocessor.run(len(batch))
+            outputs: dict[str, ndarray] = session.run({ALIKED_IMAGE_BINDING: network_input})
             keypoints_bn2: Float32[ndarray, "batch num_keypoints 2"] = np.asarray(outputs["keypoints"], dtype=np.float32)
             descriptors_bnd: Float32[ndarray, "batch num_keypoints 128"] = np.asarray(outputs["descriptors"], dtype=np.float32)
             scores_bn: Float32[ndarray, "batch num_keypoints"] = np.asarray(outputs["scores"], dtype=np.float32)
