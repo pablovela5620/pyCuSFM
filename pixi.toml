@@ -93,6 +93,13 @@ raco-benchmark = { cmd = "python -m tools.benchmark_cusfm_extractors", descripti
 # layers a GPU ONNX Runtime (CUDA 13 wheels) and Polygraphy on top of `raco`,
 # which already carries OpenCV, typer, and fabio-sim's `lightglue_dynamo`.
 # `raco` itself stays CPU-only on purpose, so the GPU runtime lives here.
+# onnxruntime-gpu's CUDA provider dlopens libcurand.so.10, which the pip
+# `[cuda,cudnn]` extras do not ship; without it (and the LD_LIBRARY_PATH
+# activation below) both the TensorRT and CUDA providers silently fall back to
+# CPU. Found by docs/raco-speed-investigation.md §3.
+[feature.bench.dependencies]
+libcurand = "*"
+
 [feature.bench.pypi-dependencies]
 onnxruntime-gpu = { version = "==1.29.0", extras = ["cuda", "cudnn"] }
 polygraphy = "*"
@@ -309,6 +316,13 @@ libnvjpeg = "*"
 
 [feature.decode-bench.tasks]
 decode-bench = { cmd = "python -m tools.audit.decode_bench", description = "Benchmark GPU (nvJPEG) against CPU JPEG decode for the feature-extraction stage" }
+
+# ONNX Runtime's TensorRT execution provider dlopens libnvinfer from the
+# tensorrt-cu13 wheel's `tensorrt_libs`; without this the provider is advertised
+# but session creation silently falls back to CPU (found by the RaCo speed
+# investigation, docs/raco-speed-investigation.md §3).
+[feature.bench.activation.env]
+LD_LIBRARY_PATH = "${CONDA_PREFIX}/lib/python3.12/site-packages/tensorrt_libs:${CONDA_PREFIX}/lib/python3.12/site-packages/nvidia/cudnn/lib:${CONDA_PREFIX}/lib/python3.12/site-packages/nvidia/cu13/lib:${CONDA_PREFIX}/lib"
 
 [environments]
 raco = { features = ["raco"], no-default-feature = true, solve-group = "raco" }
