@@ -570,3 +570,62 @@ right backend when the 0.736 matters: on KITTI the blob's own ALIKED descriptors
 produce the better trajectory, and the honest summary is that RaCo buys the pycolmap
 backend's accuracy at TensorRT's speed, plus 20 s of extraction over the pycolmap backend
 that a dynamic-shape export would remove.
+
+
+## 10. RaCo at native resolution, Ceres against CASPAR mapping
+
+Section 9's RaCo run stretched every 1226x370 frame to 1920x1200. NOTES.md "RaCo
+backend" records the dynamic-shape export that removed the stretch (extraction 42.3 s
+to 10.1 s, total 295.0 s to 203.2 s, Sim(3) 0.902 m to 0.878 m). This section stacks
+the GPU bundle adjuster from `docs/caspar-build.md` on top of that run, in the
+`colsfm-caspar-fisheye` environment (KITTI is PINHOLE, so the stock adapter serves;
+the fisheye build is simply the CASPAR build that was installed):
+
+```bash
+pixi run -e colsfm-caspar-fisheye python -m colsfm run \
+    --input-dir data/kitti/06_colsfm_input_slam --config-dir data/kitti/config \
+    --output-dir /tmp/colsfm_runs/kitti_raco_caspar/cusfm \
+    --min-inter-frame-distance 0.5 --loop-closure --match-cap-mode fixed \
+    --features-backend raco --matching-backend raco --ba-backend caspar
+```
+
+Stage times from each run's `runtime.csv`, counts from `summary.json`, ATE from one
+`evaluate_kitti` invocation over all six rows (`data/bench/kitti_06_raco_caspar_ate.json`),
+the blob head-to-head in `data/bench/kitti_06_raco_caspar_compare.md`. The CASPAR row
+includes the default Ceres polish (9.7 s, 20 iterations, reprojection 0.599 to 0.582 px).
+
+| Run | extraction (s) | matching (s) | loop stage (s) | mapping (s) | total (s) | points | reprojection (px) | Sim(3) RMSE (m) | SE(3) RMSE (m) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| blob cuSFM, SLAM init | 96.85 | 32.61 | 1306.76 | 143.14 | 1596.08 | 120 097 | 0.454 | 1.328 | 1.605 |
+| colsfm TensorRT + loops | 62.2 | 25.2 | 62.3 | 209.9 | 363.5 | 174 319 | 0.534 | 0.736 | 1.111 |
+| colsfm pycolmap + loops, CASPAR + polish | 16.4 | 74.7 | 77.6 | 41.3 | 212.9 | 96 691 | 0.674 | 0.904 | 1.128 |
+| colsfm RaCo native + loops, Ceres | 10.1 | 21.8 | 50.8 | 117.6 | 203.2 | 133 784 | 0.580 | 0.878 | 1.423 |
+| **colsfm RaCo native + loops, CASPAR + polish** | **9.7** | **20.2** | **47.0** | **63.0** | **142.8** | 134 884 | 0.582 | 0.937 | 1.461 |
+
+**Fastest run of the whole study.** 142.8 s is 8.9 % of the blob's 1596.08 s and 0.70x
+the previous best (203.2 s). Mapping fell from 117.6 s to 63.0 s; the other stages are
+unchanged to within run-to-run noise (extraction 10.1 vs 9.7 s, matching 21.8 vs 20.2 s).
+The mapping stage is now the same size as the loop stage, and the sum of the three
+GPU-bound stages (extraction, matching, loop association) at 77 s is larger than mapping.
+
+**The CASPAR mapping is 1.87x faster here, not the 3.6x of section 8's pycolmap run.**
+The pycolmap run's 148.5 s to 41.3 s had 96 691 points; RaCo's map has 134 884 points
+and 1 085 213 observations (1.5x), and the 9.7 s polish is a fixed Ceres cost on top.
+CASPAR's own share of the 63.0 s is therefore about 53 s, or 2.2x over Ceres on the same
+map.
+
+**Accuracy cost: 0.878 to 0.937 m Sim(3), 1.423 to 1.461 m SE(3).** That is the same
+direction as section 8's CASPAR + polish result on the pycolmap backend (0.895 to 0.904 m),
+but a larger step (+0.059 m against +0.009 m). The reconstruction statistics do not show
+it: 2156/2156 registered, reprojection 0.582 against 0.580 px, track length 8.05 against
+8.18, and the Sim(3) scale is identical to five digits (0.99180). The difference is in
+the trajectory shape after loop closure, where fp32 CASPAR plus one Ceres round lands in a
+slightly different basin than five rounds of Ceres. Against the blob the run still passes
+three of four acceptance bounds and fails the same one every `colsfm` KITTI run fails,
+reprojection error (0.582 against the 0.500 ceiling that 1.1x the blob's 0.454 sets).
+
+**Where this leaves the backends on KITTI 06.** For wall clock, RaCo native + CASPAR at
+142.8 s and 0.937 m. For accuracy, TensorRT (the blob's own ALIKED descriptors) + Ceres
+at 363.5 s and 0.736 m. RaCo native + Ceres (203.2 s, 0.878 m) is the middle point. The
+RaCo descriptor gap to the blob's ALIKED (0.878/0.937 against 0.736) remains the open
+accuracy question; CASPAR does not change it.
