@@ -34,6 +34,7 @@ Tables 2-6 is out of reach; that is stated per claim rather than glossed over.
 | `trajectory_audit.py` | C12 | `data/bench/audit_galileo_trajectory.json` |
 | `extrinsics_audit.py` | C8 | `data/bench/audit_galileo_extrinsics.json` |
 | `colmap_baseline_galileo.py` | C10, C11 | `data/bench/audit_colmap_<features>_<matcher>.json`, `data/cusfm_runs/audit_colmap_*/` |
+| `colmap_rig_baseline_galileo.py` | C10, C11 addendum | `data/bench/audit_colmap_rig_<features>_<matcher>.json`, `data/cusfm_runs/audit_colmap_rig_*/` |
 | `configs/radius/` | C3 | a config copy with `search_method: RADIUS_SEARCH`, driven through `demo_rerun.py`; reports in `data/bench/audit_galileo_radius_compare.md` and `audit_galileo_radius_full_compare.md`, runs in `data/cusfm_runs/galileo_audit_radius{,_full}/` |
 
 ---
@@ -821,7 +822,8 @@ magnitude is right and the direction is not in doubt.
 **Fragmentation (§6.3.1) reproduces exactly.** COLMAP never produced a single
 model on Galileo in any of the configurations run: 4, 2 and 3 disconnected
 components. Both cuSfM systems produce one model covering 224 or 225 of 226
-images.
+images. **This holds only for rig-free COLMAP** — see the addendum below, where
+the same mapper given the rig returns a single model covering 221 of 226.
 
 **Three caveats that the paper's framing also carries.**
 
@@ -833,7 +835,9 @@ images.
    true of the wall clock and misleading about the algorithms.
 2. **cuSfM is handed the rig; COLMAP is not.** Eight cameras rigidly coupled is
    a much smaller parameter space than eight free cameras, and COLMAP 4.2's rig
-   support was not used here because the paper's baseline is monocular.
+   support was not used here because the paper's baseline is monocular. The
+   **C10/C11 addendum** below removes this caveat: it runs stock COLMAP *with*
+   the rig, and the fragmentation disappears.
 3. **Sequential matching is a bad fit for this data** and produces the worst
    coverage (56/226). The exhaustive rows are the fair comparison and are the
    ones quoted above.
@@ -904,6 +908,117 @@ what §6.3.1 implies: COLMAP loses on scale and coverage, not on bundle adjustme
 accuracy.
 **Verdict — colsfm:** **holds** on Galileo, marginally ahead of the blob
 (4.33 mm against 5.00 mm).
+
+---
+
+## C10/C11 addendum — COLMAP with rig support
+
+The C10 caveat "cuSfM is handed the rig; COLMAP is not" was worth removing.
+COLMAP has carried rig support since 3.12
+(https://colmap.github.io/rigs.html): `pycolmap.apply_rig_config` writes a rig
+and one frame per capture into the database, after which the **stock** sequential
+matcher and the **stock** incremental mapper are rig-aware. No cuSfM code is
+involved and no option is tuned —
+`pixi run -e colsfm python -m tools.audit.colmap_rig_baseline_galileo`
+runs COLMAP's own pipeline with COLMAP's own defaults, including
+`IncrementalPipelineOptions.ba_refine_sensor_from_rig` at its default of **on**,
+so the mapper is free to move the extrinsics it was given.
+
+Two things had to be set up correctly, and both are recorded in the script:
+
+* **Frame grouping is by file name.** COLMAP groups images into a frame by the
+  part of the path after `image_prefix`, and Galileo's per-camera timestamps
+  differ by a few microseconds inside one capture (`...246532.jpeg` against
+  `...247532.jpeg`). On the raw tree the rig would produce 226 one-image frames
+  and change nothing. The run therefore stages a symlink tree
+  `images/<camera_folder>/<synced_sample_id>.jpeg`, which gives the eight
+  cameras an identical suffix per capture; the database then holds **29 frames**.
+  Image names are mapped back to the dataset's own `image_name`s before scoring,
+  so every number below comes from the same `tools.audit.galileo_metrics` code as
+  the rig-free rows.
+* **`cam_from_rig` is `cam_i_T_cam_ref`.** `sensor_to_vehicle_transform` is
+  `vehicle_T_cam`, so the config carries
+  `cam_i_T_vehicle * vehicle_T_cam_ref` — what
+  `colsfm.reconstruction.build_rig` writes. The reference sensor must also be
+  **first** in the config's camera list, or `Rig::AddSensor` aborts
+  (`rig.cc:42`).
+
+**Measured** (blob and colsfm from `data/bench/galileo_compare.md`; rig-free
+COLMAP rows repeated from C10/C11 above; rig rows from
+`data/bench/audit_colmap_rig_*.json` and `data/cusfm_runs/audit_colmap_rig_*/`):
+
+| Pipeline | extract (s) | match (s) | map (s) | **total (s)** | models | largest registered | points | reproj (px) | ATE rigid (mm) | ATE SIM(3) (mm) | would-be scale |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| **blob** (cuSfM, all 8 stages) | 8.64 | 2.25 | 6.69 | **40.07** | **1** | 224 / 226 | 5065 | 1.550 | **5.00** | 2.52 | 0.97844 |
+| **colsfm** | 8.01 | 8.15 | 2.70 | **19.35** | **1** | 225 / 226 | 6195 | 1.334 | **4.33** | 2.62 | 0.98270 |
+| COLMAP SIFT + sequential, no rig | 3.86 | 9.52 | 49.51 | **62.90** | 4 | 56 / 226 | 7148 | 0.691 | 0.87 \* | 0.78 \* | **0.05305** |
+| COLMAP SIFT + exhaustive, no rig | 5.37 | 34.75 | 195.84 | **235.96** | 2 | 195 / 226 | 29814 | 0.931 | 26.06 \* | 25.49 \* | **0.09306** |
+| COLMAP ALIKED + sequential, no rig | 10.24 | 24.88 | 366.57 | **401.68** | 3 | 117 / 226 | 11918 | 1.390 | 109.35 \* | 97.45 \* | **0.07216** |
+| **COLMAP SIFT + sequential, with rig** | 7.50 | 19.07 | 65.62 | **92.19** | **1** | **221 / 226** | 23683 | 0.809 | **10.23** | 8.22 | **1.02352** |
+| **COLMAP ALIKED + sequential, with rig** | 8.56 | 98.34 | 89.51 | **196.41** | **1** | **200 / 226** | 20567 | 1.186 | **11.84** | 9.73 | **1.01570** |
+| COLMAP ALIKED + exhaustive, with rig | 8.6 | **> 180, killed** | — | **> 190** | — | — | — | — | — | — | — |
+
+\* Meaningless without the scale the SIM(3) fit borrowed from ground truth: those
+reconstructions came out 11 to 19 times too small. The rig rows need no such
+apology.
+
+The exhaustive + rig row is a **time-box failure, reported as one**: exhaustive
+pairing ran 9 of its 25 blocks in 180 s, which projects to roughly 825 s of
+matching alone, and it was killed at the 30-minute limit before mapping started.
+No number is quoted from it. The two sequential rows are complete measurements.
+
+ATE is rig-frame, joined to `ground_truth.txt` on timestamp and aligned rigidly
+with the scale held at 1.0, the same definition C11 uses. The rig runs also
+carry a per-image camera-centre ATE (13.82 mm rigid for ALIKED + sequential),
+and the SIM(3) scale they need is 1.0157 rather than 0.05-0.09.
+
+**The rig extrinsics the mapper recovered**, against the calibration it was
+handed (`ba_refine_sensor_from_rig` is on, so it moved them), for
+both sequential rig runs:
+
+| camera | SIFT: translation (mm) | SIFT: rotation (deg) | ALIKED: translation (mm) | ALIKED: rotation (deg) |
+|---|---|---|---|---|
+| `back_stereo_camera_left` | 12.65 | 1.978 | 12.66 | 2.083 |
+| `back_stereo_camera_right` | 2.85 | 1.936 | 7.52 | 2.044 |
+| `front_stereo_camera_left` | 7.73 | 0.498 | 10.33 | 0.525 |
+| `front_stereo_camera_right` | 16.14 | 0.608 | 15.99 | 0.551 |
+| `left_stereo_camera_left` | 15.36 | 0.458 | 20.17 | 0.432 |
+| `left_stereo_camera_right` | 12.44 | 0.445 | 11.64 | 0.368 |
+| `right_stereo_camera_right` | 9.46 | 0.291 | 9.11 | 0.291 |
+
+(`right_stereo_camera_left` is the reference sensor, identity by construction.)
+The mapper moved every camera by 3-20 mm and up to 2.1 degrees, the back pair
+worst — that is the pair with the least overlap with the rest of the rig over a
+0.66 m sweep. The drift is the same size as the trajectory error and is the
+honest explanation for most of it; holding the extrinsics with
+`--Mapper.ba_refine_sensor_from_rig 0` was not tried, and is the obvious next
+experiment.
+
+**The rig fixes the fragmentation and the scale, and it does both decisively.**
+On the same features and the same matcher, adding the rig takes COLMAP from
+4 disconnected models covering 56 of 226 images to **one model covering 221**
+(SIFT), and from 3 models covering 117 to **one covering 200** (ALIKED); it also
+turns a reconstruction 14 to 19 times too small (fitted scale 0.053-0.072) into a
+**metric** one (1.02352 and 1.01570), because the rig supplies the baseline a
+monocular reconstruction has no way to invent. On the honest metric — rigid ATE
+with the scale held at 1.0 — the rig rows are **10.23 mm** and **11.84 mm**,
+real numbers rather than ones rented from ground truth, against 109.35 mm for
+the same ALIKED configuration without the rig. **It does not fix the speed, but
+it changes the margin.** SIFT + sequential + rig runs in **92.19 s**, 1.5x
+slower than the same run without the rig (62.90 s) yet reconstructing four times
+as much of the sequence, and ALIKED + sequential + rig runs in 196.41 s against
+401.68 s — the mapper's 366.57 s falls to 89.51 s, exactly where a rig should
+pay, while matching *rises* (24.88 s to 98.34 s) because `expand_rig_images`
+turns each sequential pair into a frame-to-frame pair and lifts the verified pair
+count from 1553 to 7753. **C10 survives with its margin cut**: the fairest
+COLMAP configuration on this dataset is 92.19 s, which is 2.3x the blob's
+40.07 s and 4.8x colsfm's 19.35 s, not the order of magnitude the paper claims —
+though cuSfM is still refining a supplied trajectory while COLMAP registers from
+scratch. **C11 survives on the numbers** (5.00 and 4.33 mm against 10.23 mm) but
+the fragmentation half of §6.3.1 does **not** survive a rig-aware COLMAP: given
+the rig, COLMAP produces a single connected model covering 221 of 226 images,
+and what remains of cuSfM's accuracy lead is extrinsic stability, not coverage
+and not scale.
 
 ---
 
