@@ -285,7 +285,7 @@ class VisionMappingConfig:
 
     min_num_matches_per_pair: int
     """Drop an image pair with fewer matches than this."""
-    depth_threshold: int
+    depth_threshold: float
     """World-frame Z cap in metres, one axis and one-sided; not a camera depth."""
     search_depth: int
     """Maximum BFS hop count when growing one track over the match graph."""
@@ -555,7 +555,7 @@ def read_config_directory(
         ),
         vision_mapping=VisionMappingConfig(
             min_num_matches_per_pair=int(mapping_message.min_num_matches_per_pair),
-            depth_threshold=int(mapping_message.depth_threshold),
+            depth_threshold=float(mapping_message.depth_threshold),
             search_depth=int(mapping_message.search_depth),
             min_correspondences=int(mapping_message.min_correspondences),
             initial_max_pixel_error=float(mapping_message.initial_max_pixel_error),

@@ -49,7 +49,7 @@ Tables 2-6 is out of reach; that is stated per claim rather than glossed over.
 | C5 | Stereo relative pose estimation for loop edges | **holds** as described, but is **inert as shipped** | **holds with caveats** — a different estimator, measurably worse |
 | C6 | Pose graph optimisation over rig nodes | **holds** | **holds** — parity to 1e-4 m / 1e-3 deg |
 | C7 | Iterative triangulation with decaying thresholds + robust loss | **holds** | **holds** |
-| C8 | Extrinsic refinement | mechanism **holds**; the accuracy benefit is **not testable here** | **does not hold** — silent no-op (fix in progress) |
+| C8 | Extrinsic refinement | mechanism **holds**; the accuracy benefit is **not testable here** | **holds** after the fix (commits 7ec2f37, 2f453e1): regularised pass, ATE 4.28 mm vs 4.33 fixed, 4/4 bounds |
 | C9 | COLMAP-compatible output, TUM poses | **holds with caveats** (no `rigs.txt`/`frames.txt`; a fake reprojection error) | **holds** |
 | C10 | Order-of-magnitude runtime win over COLMAP; 20x mapping | **holds with caveats** — 17.0 % of COLMAP's wall clock, mapping 29x faster, one model vs two to four | **holds** — 8.2 % of COLMAP's wall clock, mapping 72x faster |
 | C11 | Better accuracy than COLMAP | **holds** on Galileo | **holds** on Galileo |
@@ -677,6 +677,18 @@ testable here** for want of extrinsic ground truth and the KITTI sequences.
 nothing.
 
 ---
+
+**Addendum (after the audit ran).** The no-op was fixed in two commits. `7ec2f37` gives the rig a
+camera reference sensor so COLMAP no longer freezes `sensor_from_rig`; a 20 mm perturbation
+then recovers to 0.7 mm. Unregularised, the refinement overfit Galileo (extrinsics walked
+9-235 mm, ATE 4.33 -> 5.70 mm). `2f453e1` adds the blob's prior terms on pyceres (absolute per
+camera, relative per co-observed camera pair per frame; sigmas 0.01 m / 2 deg recovered from
+the blob's own logged costs), alternating with pycolmap BA. Measured in
+`data/bench/galileo_ext_compare.md`: ATE **4.281 mm** (fixed 4.327, blob 5.00), reprojection
+0.898 px, extrinsic walk 1.2-2.8 mm against the blob's 1.1-10.9 mm, 4 of 7 shift directions
+aligned with the blob's, 4/4 acceptance bounds. Remaining difference: the blob moves the front
+stereo pair ~10 mm, colsfm ~2 mm, with prior budget unspent, so the difference sits in the
+reprojection evidence, not the priors. Verdict for colsfm therefore changes to **holds**.
 
 ## C9 — Format support
 
