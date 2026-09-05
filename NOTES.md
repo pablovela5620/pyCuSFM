@@ -304,6 +304,25 @@ Tempting: pin `glog=0.6` (SONAME `libglog.so.1`) and `libopencv=4.6` (`.so.406`)
 
 Hence the README's apt line for the host libs and the hard Ubuntu 24.04 requirement.
 
+
+### Video frame references (rerun 0.37.1) — what they buy here, and what they don't
+
+0.37.1 lets `VideoFrameReference` point at a `VideoStream` on another entity. Measured on
+this recording (306 MB): **302 MB is the four H.264 `VideoStream`s under `rig_00`, logged
+once**; everything else is 4 MB. So references cannot shrink *this* file — there was never a
+duplicate to remove, and `AssetVideo(path=...)` **embeds** the bytes (77.6 MB mp4 -> 78.0 MB
+rrd; Rerun has no external-file video reference). They do give the cuSFM rig imagery for
+free: `log_video_references` puts `VideoFrameReference` columns under
+`rig_01/cam_NN/pinhole/video` pointing at `rig_00`'s streams — 72,436 references cost 0.3 MB
+(306.74 -> 307.05 MB), pixel-verified identical frames on both rigs at the same cursor.
+
+Two gotchas: (1) a single *static* reference (`nanoseconds=0`) rendered a **different**
+frame than the stream at the same cursor on 0.37.1 — use one reference per source sample on
+the stream's timeline, which tracks exactly; (2) the viewer opens on `log_time`, where the
+video has no data, so validation screenshots need the time cursor moved onto `video_time`
+(viewer MCP `set_time`) or they are black. Nothing here is rectified — raw fisheye under a
+`Pinhole` with distortion coefficients — so the same frames are valid on both rigs.
+
 ## Gotchas found
 
 1. **`tensorrt-cu13==10.13.3.9` is broken on PyPI** — it depends on the retired

@@ -23,6 +23,7 @@ Output follows the ``exoego:v2`` rig schema (see simplecv's
             /image                    EncodedImage (JPEG)
       /world/rig_01                   AnyValues + world_T_rig(t)  <- cuSFM refined
         /cam_NN/pinhole               same calibration, refined motion
+          /video                      VideoFrameReference -> rig_00's VideoStream (no copy)
       /world/points                   Points3D (cuSFM sparse cloud)
 
 ``rig_01`` is rigidly aligned to ``rig_00`` with a scale-free Umeyama fit, and the
@@ -1726,6 +1727,40 @@ def log_video_streams(sequence: PreparedSequence, rig_index: int) -> int:
     return total
 
 
+def log_video_references(sequence: PreparedSequence, source_rig: int, target_rig: int) -> int:
+    """Show ``source_rig``'s video under ``target_rig``'s cameras without copying it.
+
+    Rerun 0.37.1 lets a ``VideoFrameReference`` point at a ``VideoStream`` on
+    another entity, so the cuSFM rig gets the same imagery as the input rig for
+    a few hundred KB of timestamps instead of another ~300 MB of H.264. The
+    frames are geometrically valid on both rigs because nothing is rectified:
+    both log the raw fisheye under a ``Pinhole`` with distortion coefficients.
+
+    One reference per source sample, on the same timeline as the stream. A single
+    static reference is *not* used: measured on 0.37.1, it resolved to a different
+    frame than the stream at the same cursor, whereas per-frame references track
+    it exactly.
+
+    Returns the number of references logged.
+    """
+    total: int = 0
+    for camera_index, camera in enumerate(sequence.cameras):
+        samples: list[tuple[int, bytes]] = sequence.video_samples.get(camera.name, [])
+        if not samples:
+            continue
+        source: str = f"world/{entity_id('rig', source_rig)}/{entity_id('cam', camera_index)}/pinhole/video"
+        target: str = f"world/{entity_id('rig', target_rig)}/{entity_id('cam', camera_index)}/pinhole/video"
+        timestamps: Int[ndarray, "n"] = np.asarray([t for t, _ in samples], dtype=np.int64)
+        rr.log(target, rr.VideoFrameReference.from_fields(video_reference=source), static=True)
+        rr.send_columns(
+            target,
+            indexes=[rr.TimeColumn(TIMELINE, duration=1e-9 * timestamps.astype(np.float64))],
+            columns=rr.VideoFrameReference.columns(timestamp=timestamps),
+        )
+        total += len(samples)
+    return total
+
+
 def log_keyframe_highlight(sequence: PreparedSequence, rig_index: int) -> None:
     """Tint each camera's frustum by whether the current frame is a cuSFM keyframe.
 
@@ -1940,10 +1975,12 @@ def main(config: Config) -> None:
 
     if sequence.video_samples:
         frames: int = log_video_streams(sequence, INPUT_RIG_INDEX)
+        references: int = log_video_references(sequence, INPUT_RIG_INDEX, CUSFM_RIG_INDEX)
         log_keyframe_highlight(sequence, INPUT_RIG_INDEX)
         print(
             f"  logged {frames} video frames across {len(sequence.video_samples)} cameras "
-            f"(full rate); {int(sequence.keyframe_mask.sum())} marked as cuSFM keyframes"
+            f"(full rate); {int(sequence.keyframe_mask.sum())} marked as cuSFM keyframes; "
+            f"{references} frame references give rig_01 the same imagery without copying it"
         )
     else:
         logged_images: int = log_images(sequence, INPUT_RIG_INDEX, dataset.image_stride)
