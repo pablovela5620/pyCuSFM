@@ -621,6 +621,7 @@ stage that is slower, at 2.89x here and 3.63x on Galileo.
 | loop edges in the pose graph | 90 | 0 | 74 |
 | vs input trajectory (mm RMSE / max) | 334.1 / 627.3 | 461.3 / 1134.9 | **312.7 / 608.4** |
 | would-be scale | 0.9401 | 0.9306 | 0.9402 |
+| mean reprojection (px) / points | 1.486 / 168 874 | 1.501 / 157 887 | 1.871 / 215 434 |
 | rig poses vs blob (mm RMSE / max) | — | 238.3 / 796.4 | **146.4 / 289.6** |
 | total runtime | 1133.5 s | 421.8 s (0.37x) | 1723.0 s (1.52x) |
 
