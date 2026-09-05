@@ -187,7 +187,9 @@ For scale, the blog's Pareto points on an RTX 4080 Laptop: 11.9 ms/pair at
 at 2.22x the pixels of the 1024^2 point, on a much larger GPU. Nothing here says
 our engines are slow.
 
-### The release end-to-end pipeline graph: not measured, and the reason is a bug
+### The release end-to-end pipeline graph: three failed attempts, and the bug behind them
+
+*Superseded by section 3b, which has the numbers. Kept because the failure mode — a GPU provider that advertises itself and then silently runs on the CPU — is the thing to watch for, not the thing to forget.*
 
 `raco_aliked_lightglue_pipeline_k2048.onnx` (release v3.0, 65.8 MB) through ONNX
 Runtime 1.29.0 in the `bench` environment
@@ -223,13 +225,15 @@ produced a TensorRT number:
    mentioned in the GPU requirements page"), so prepending the wheel's
    `tensorrt_libs` is not the whole fix. Killed at the time box.
 
-**So the head-to-head — release pipeline graph against our two engines at the
-same shape — is unfinished, and the blocker is an environment defect in
-`pixi.toml`, not the graph.** `[feature.bench]` needs the same
-`activation.env.LD_LIBRARY_PATH` the other GPU features carry, and the CUDA-EP
-failure needs a look after that. Fixing it is a prerequisite for any future
-MegaDepth-1500 benchmarking in that environment too, since that is what `bench`
-exists for.
+**The blocker was an environment defect in `pixi.toml`, not the graph.**
+`[feature.bench]` was missing the `activation.env.LD_LIBRARY_PATH` the other GPU
+features carry, and the CUDA-EP failure in attempt 3 was a second, separate hole:
+prepending the `tensorrt_libs` wheel directory is necessary but not sufficient,
+because `onnxruntime-gpu`'s CUDA provider also wants `libcurand`, which no wheel
+in the environment shipped. Commit `dc86918` fixes both — `libcurand` as a conda
+dependency, and an activation block putting `tensorrt_libs`, `nvidia/cudnn/lib`
+and `nvidia/cu13/lib` on `LD_LIBRARY_PATH`. Section 3b is the head-to-head that
+was blocked on it.
 
 The FP16 `torch.compile` baseline (item 3d) was not attempted: the `raco`
 environment's torch is CPU-only by design (`pixi.toml`,
@@ -245,6 +249,83 @@ One extractor batch of 8 at 1200x1920:
 | pageable float32 (what we do) | 210.9 MB | 17.17 | 2.15 | 12.3 |
 | pinned float32 | 210.9 MB | 6.14 | 0.77 | 34.4 |
 | pinned uint8 (upload raw, normalise in-graph) | 52.7 MB | 1.42 | 0.18 | 37.1 |
+
+---
+
+## 3b. The release end-to-end pipeline graph, measured
+
+`raco_aliked_lightglue_pipeline_k2048.onnx` (release v3.0, 65.8 MB) through ONNX
+Runtime 1.29.0 on the TensorRT execution provider, FP16, `trt_max_workspace_size`
+8 GiB, engine and timing cache on. One configuration per process, run
+sequentially under `tools/audit/raco_speed/run_release_ort.sh`. 30 timed calls
+after 5 warm-ups, median. **Inputs and outputs are both bound on the device**
+(`device_bound_inputs` and `device_bound_outputs` are true in every record), so
+these are GPU-only numbers: no H2D of the image tensor, no D2H of the matches.
+
+The environment fix of commit `dc86918` is what unblocked this; the session now
+comes up on `['TensorrtExecutionProvider', 'CUDAExecutionProvider',
+'CPUExecutionProvider']` and the script still refuses to report a number
+otherwise.
+
+| configuration | ms / call | **ms / pair** | engine build | peak RSS |
+| --- | --- | --- | --- | --- |
+| (a) 1024^2, 1 pair | 10.12 | **10.1** | 363 s | 8.1 GB (build), 3.1 GB (cached) |
+| (b) 1216x1920, 1 pair | 17.62 | **17.6** | 430 s | 8.2 GB (build), 3.1 GB (cached) |
+| (c) 1024^2, 4 pairs | 40.65 | **10.2** | 350 s | 8.9 GB (build), 3.2 GB (cached) |
+
+The graph takes a `2*pairs x 3 x H x W` interleaved `images` tensor, so 1920x1200
+becomes 1216x1920 — the height must be a multiple of 32, and 1200 is not.
+
+Memory behaved once the run was bounded: every configuration peaked near 8 GB
+while TensorRT built, and near 3.1 GB replaying a cached engine, against the
+60 GB budget. The 68.8 GB blow-up of section 3 was four configurations building
+in one process, not any single engine. Each build finished inside the 10-minute
+allowance, so (c) was in scope.
+
+### Two caveats on these numbers, both measured
+
+**GPU contention.** Another worker shared the 5090 throughout, in bursts between
+4% and 97% utilisation. The medians above are from rounds taken while the GPU
+was quiet; eight repeat rounds of all three configurations give the spread:
+
+| configuration | medians across rounds (ms / call) | best | fastest single call |
+| --- | --- | --- | --- |
+| (a) 1024^2, 1 pair | 10.1, 10.4, 11.0, 12.1, 12.1, 12.4, 14.7, 15.5, 17.5 | 10.1 | 9.34 |
+| (b) 1216x1920, 1 pair | 17.6, 18.3, 20.2, 21.8, 22.4, 22.5, 23.6, 23.8, 25.8, 29.2 | 17.6 | 16.79 |
+| (c) 1024^2, 4 pairs | 40.3, 40.7, 48.3, 51.5, 51.6, 53.8, 57.3, 66.3 | 40.3 | 37.04 |
+
+Contention inflates the median by up to 70%, so read the reported figures as the
+uncontended floor, accurate to about ±1 ms, not as tight measurements.
+
+**Contention also degrades the engine, permanently.** TensorRT picks tactics by
+timing them at build time, so an engine built on a busy GPU is a slower engine
+forever after. The 1216x1920 engine built while the GPU was quiet medians
+17.6 ms with a 16.79 ms floor; a second engine for the identical configuration,
+built while three TensorRT builds ran concurrently, medians 18.3 ms with an
+18.42 ms floor on the *same* quiet GPU — about 8% slower, and no rerun recovers
+it. Build engines on an idle GPU or do not trust the comparison.
+
+### What the end-to-end graph buys over our two-engine deployment
+
+At the resolution we deploy, 1920x1200, the fused graph does one pair in 17.6 ms
+against the 24.7 ms/pair of our extractor-plus-matcher split — **1.40x faster,
+saving 7.1 ms/pair** — and at 1024^2 it does 10.1 ms/pair, which has no
+two-engine counterpart to compare against (section 3 measured only 1200x1920)
+but sits 4.8x under the blog's 48.4 ms 1024^2/K=3584 Pareto point on a 4080
+Laptop, about what the GPU gap and K=2048-vs-3584 predict. Batching pairs buys
+nothing — (c) at four pairs per call is 10.2 ms/pair against (a)'s 10.1, so the
+graph is already saturating the 5090 at one pair.
+
+**That 1.40x does not survive contact with SfM, because the fused graph
+re-extracts both images of every pair.** Our split extracts each image once, at
+10.08 ms/image amortised over every pair the image joins, then matches at
+4.53 ms/pair; with `p` pairs per image the split costs `2*10.08/p + 4.53`
+ms/pair, which beats the fused graph's flat 17.6 ms as soon as **p > 1.5**. At
+Galileo's matching density `p` is far above 1.5 — at p=4 the split is 9.6 ms/pair
+and at p=8 it is 7.1 ms, against 17.6 ms fused. The release graph is the right
+shape for scoring isolated pairs and the wrong shape for reconstructing a scene,
+so **the end-to-end graph is not a deployment we should adopt**, and section 3's
+conclusion stands: our engines are not slow.
 
 ---
 
@@ -383,8 +464,21 @@ nvJPEG path against the 14.12 ms/image decode+resize baseline recorded above.
 pixi run -e colsfm python -m tools.audit.raco_speed.bench_device --mode engines
 pixi run -e colsfm python -m tools.audit.raco_speed.bench_device --mode transfer
 pixi run -e colsfm python -m tools.audit.raco_speed.bench_device --mode stage
-pixi run -e bench   python -m tools.audit.raco_speed.bench_release_ort   # one config; currently falls back to CPU, see section 3
+
+# The release pipeline graph, one configuration per process, under an RSS watchdog:
+./tools/audit/raco_speed/run_release_ort.sh --height 1024 --width 1024 --pair-count 1
+./tools/audit/raco_speed/run_release_ort.sh --height 1216 --width 1920 --pair-count 1
+./tools/audit/raco_speed/run_release_ort.sh --height 1024 --width 1024 --pair-count 4
 ```
+
+Run those three sequentially, never concurrently, and only on an idle GPU: as
+section 3b shows, TensorRT times its tactics during the build, so an engine built
+under load stays about 8% slow for its whole life. Pass a distinct `--cache-dir`
+per configuration to keep the engines apart.
+
+`bench_release_ort.py` refuses to report a number unless
+`session.get_providers()` really contains `TensorrtExecutionProvider`, so the
+silent CPU fallback of section 3 cannot recur unnoticed.
 
 The release graph lands in `data/cusfm_models/raco_release/` (gitignored) via
 `gh release download v3.0 --repo fabio-sim/LightGlue-ONNX --pattern 'raco_aliked_lightglue_pipeline_k2048.onnx'`.
