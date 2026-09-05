@@ -24,7 +24,8 @@ results.
 | `pairs.py` | Which image pairs get matched. The replacement for `feature_matcher_task_builder_main`. |
 | `matching.py` | LightGlue matching plus COLMAP's geometric verification, then the spatial subsample. The replacement for `feature_matcher_main`. |
 | `retrieval.py` | Image retrieval for loop closure, brute force or vocabulary tree. The replacement for `generate_bow_vocabulary_main` and `generate_bow_index_main`. |
-| `loop_closure.py` | Loop-closure candidate selection and verification. The replacement for `generate_association_main`'s `RetrievalLoopAssociations`. |
+| `loop_closure.py` | Loop-closure candidate selection, gating and rig-edge assembly. The replacement for `generate_association_main`'s `RetrievalLoopAssociations`. |
+| `loop_pose.py` | The metric rig-to-rig relative pose a loop edge carries: a local triangulated map in the source rig frame, then generalized resection of the target rig. The replacement for `StereoPoseEstimator`. |
 | `pose_graph.py` | Rig-level pose graph optimisation on pyceres with a Python residual. The replacement for `pose_graph_main`. |
 | `reconstruction.py` | A `pycolmap.Reconstruction` built from `frames_meta.json`: the rig, the frames and the images, with the vehicle body as the rig's reference sensor. |
 | `mapping.py` | Triangulation and global bundle adjustment. The replacement for `keypoints_mapper_main`. |
@@ -44,7 +45,7 @@ row per stage under these names:
 | 2 | `feature_extraction` | `database`, `cameras`, `features` | `feature_extractor_main` (per-image half) |
 | 3 | `pair_selection` | `pairs` | `feature_matcher_task_builder_main` |
 | 4 | `matching` | `matching` | `feature_matcher_main` |
-| 5 | `loop_closure` | `retrieval`, `loop_closure` | `generate_bow_*_main` + `generate_association_main` |
+| 5 | `loop_closure` | `retrieval`, `loop_closure`, `loop_pose` | `generate_bow_*_main` + `generate_association_main` |
 | 6 | `pose_graph` | `pose_graph` | `pose_graph_main` |
 | 7 | `reconstruction` | `reconstruction`, `mapping` | `keypoints_mapper_main` |
 | 8 | `export` | `export` | `kpmap_to_colmap`, `extract_pose_from_map_main`, `update_keyframe_pose_main` |

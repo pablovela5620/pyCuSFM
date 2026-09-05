@@ -544,7 +544,7 @@ shipped configs, and A/B re-runs of the real binaries. `colsfm/` implements the 
 | 7 | **A 500-match spatial cap in place of the blob's SSC NMS** | The blob thins each pair to a spatially uniform top 500 using the LightGlue score as the keypoint response. pycolmap exposes no per-match score: `Database.read_matches` and `FeatureMatcher.match` both return bare `uint32[m, 2]` index pairs. `subsample_matches_by_coverage` lays a grid of about `match_top_k` cells over image 0 and keeps one match per occupied cell, after verification, so every survivor is an inlier of the same RANSAC. Measured over the 331 Galileo pairs: uncapped 1300 matches per pair, 1.80 px, 5.39 mm ATE; capped 156 matches per pair, 1.33 px, 4.32 mm; the blob 430 matches, 1.55 px, 5.00 mm. The cap also takes bundle adjustment from 27.7 s to 2.8 s. |
 | 8 | **Relative acceptance bounds, not absolute ones** | The first bounds were absolute: registered >= 220, ATE <= 5 mm, reprojection <= 1.7 px. The ATE and reprojection figures came from the older NOTES table above (3.9 mm, 1.54 px), measured by the demo. When `colsfm.benchmark` measures the blob itself it gets **5.00 mm** and **1.550 px**. So the absolute 5 mm bound told the port to beat the binary it reproduces, and would have failed a bit-perfect clone. Absolute figures also break on a new machine or a re-run of A. Every bound is now a ratio against run A as this harness measures it. |
 | 9 | **Vocabulary-tree retrieval above 500 images** | `RetrievalConfig.backend` is `auto`: brute-force mutual-nearest-neighbour voting at or below 500 images, a hierarchical k-means vocabulary with TF-IDF and the DBoW2 L1 score above it. Brute force is quadratic in images times descriptors (gotcha 12). The vocab backend builds in 42 s on RoboCap and answers all 4528 queries in 1.5 s, and it recovers every one of the blob's 90 loop pairs. |
-| 10 | **Loop closure off by default** | On Galileo, turning loops on moves camera positions by 5 to 13 mm against a 5 mm ATE budget: a short, low-drift sweep has nothing for a loop to fix. On RoboCap the retrieval is right but the loop-edge measurement is not (see the deviations below), and the 488 edges make the pose graph worse: 609.0 mm against 460.8 mm for the input trajectory alone. `LoopClosureConfig.enabled` stays False and the caller decides per dataset. |
+| 10 | **Loop closure off by default** | On Galileo, turning loops on moves camera positions by 5 to 13 mm against a 5 mm ATE budget: a short, low-drift sweep has nothing for a loop to fix. On RoboCap the retrieval is right and `colsfm.loop_pose`'s metric rig-to-rig measurement takes the pose graph from 609.0 mm to **408.1 mm** against the blob's PGO, past the 460.8 mm of the input trajectory alone — but not past the 135.0 mm the blob's own edges reach, and the remaining gap is a 6.5 deg rotation disagreement two independent image-based estimators put on the blob's side (see the deviations below). `LoopClosureConfig.enabled` stays False and the caller decides per dataset. |
 | 11 | **Its own pixi environment and solve group** | `colsfm` is `no-default-feature`, so the fragile CUDA 13 plus TensorRT solve of the default environment is untouched. Verified: the `default`, `raco` and `bench` blocks of `pixi.lock` are byte-identical to `HEAD`, and no package was removed. |
 
 ### Results: blob against colsfm
@@ -613,7 +613,8 @@ The blob spends 705.7 s of its 1133.5 s on stages 2, 3 and 4, which exist only t
 closures. colsfm skips all three by default, which is most of the 0.37x. Matching is the one
 stage that is slower, at 2.89x here and 3.63x on Galileo.
 
-RoboCap with loop closure: pending (estimator rewrite in progress)
+RoboCap with loop closure: not run. The estimator rewrite landed (deviation 6) but the
+stage stays off by default, so there is no run to compare.
 
 ### Where colsfm deviates from the blob
 
@@ -638,15 +639,26 @@ RoboCap with loop closure: pending (estimator rewrite in progress)
 5. **No 3-D depth residual.** `VehicleCameraReprojectionCost3D` handles keypoints that carry
    depth. pycolmap's bundle adjuster is 2-D only, and Galileo sets
    `keypoint_feature_has_depth: false`.
-6. **The loop-edge estimator is a two-view estimate plus prior-pose scale**, not the blob's
-   four-view stereo estimator with baseline-locked scale and no `StereoPoseRefineSolver`.
-   Measured on RoboCap against the blob's 90 LOOP edges: retrieval and pair selection are
-   right (all 90 blob pairs are covered by our 488 edges to within 2 rig frames, and feeding
-   the blob's own edges through `solve_pose_graph` lands 135.0 mm from its result, while
-   oracle poses on our own pairs land at 39.9 mm), but our measurement lands at 609.0 mm,
-   worse than the 460.8 mm of the input trajectory. Stereo triangulation plus PnP was measured
-   at 434.5 mm, better than the input but still far from 39.9 mm. The estimator is the open
-   item; the retrieval is not.
+6. **The loop-edge estimator is a local metric map plus generalized resection**
+   (`colsfm.loop_pose`), not the blob's four-view stereo estimator with baseline-locked
+   scale and `StereoPoseRefineSolver`. It triangulates points in the source rig frame from
+   that rig's four cameras and its temporal neighbours, then resections the whole target rig
+   with `pycolmap.estimate_and_refine_generalized_absolute_pose`, so the edge takes nothing
+   from the prior pose of the pair. Measured on RoboCap against the blob's 90 LOOP edges:
+   retrieval and pair selection are right (all 90 blob pairs are covered by our 488 edges to
+   within 2 rig frames; the blob's own edges through `solve_pose_graph` land 135.0 mm from
+   its result and oracle poses on our own pairs land at 39.9 mm), the old two-view plus
+   prior-scale measurement landed at 609.0 mm, and this one lands at **408.1 mm** on that pair set and
+   404.4 mm end to end — better than the 460.8 mm of the input trajectory, not as good as
+   135.0 mm. What is left is
+   rotational: on the blob's own 90 pairs our translations move off the odometry towards the
+   blob's (median 132 mm against the odometry's 355 mm and the blob's 160 mm), while our
+   rotations sit 6.5 deg from the blob's and 1.5 deg from the odometry's — and
+   `pycolmap.estimate_generalized_relative_pose`, which shares only the correspondences,
+   agrees with ours to 0.35 deg. Substituting the blob's rotations into our edges takes the
+   pose graph from 392 mm to 266 mm; substituting its translations changes nothing. RoboCap
+   ships no ground truth, so this is where it rests; the full tables are in
+   `colsfm/loop_closure.py`.
 7. **The epipolar gate is in pixels.** The blob's
    `max_mean_point_to_epipolarline_error: 10e-6` rejects 168 of 180 RoboCap candidates and
    makes the blob produce zero loop associations. colsfm uses `ransac_max_error_px = 4.0`,

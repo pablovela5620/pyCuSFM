@@ -29,19 +29,18 @@ from scipy.spatial.transform import Rotation
 
 from colsfm.frames_meta import FramesMeta, parse_message, read_frames_meta
 from colsfm.loop_closure import (
-    LoopCandidate,
     LoopClosureConfig,
     LoopClosureResult,
-    Matches,
     MatchFunction,
+    RetrievalHit,
     calibrated_cameras,
-    estimate_relative_camera_pose,
     find_loop_edges,
     is_good_match,
     minimum_time_gap_seconds,
     select_best_candidates,
     session_duration_seconds,
 )
+from colsfm.loop_pose import Matches
 from colsfm.pose_graph import PoseGraphEdge, RigNode, gate_loop_edges, sequential_edges, solve_pose_graph
 from colsfm.retrieval import (
     ALIKED_DESCRIPTOR_DIM,
@@ -524,21 +523,28 @@ def test_stored_weights_scale_the_information_matrix_by_the_inlier_count(scene: 
     It is off by default: the blob's own solver discards the stored matrix, and measured
     against its archived Galileo result the identity lands 0.28 mm away against 2.17 mm
     (`docs/spec/pose_graph_main.md` §8 item 6).
+
+    The check reads the inlier count off the candidate rather than comparing two runs
+    edge for edge: both generalized estimators are RANSAC and pycolmap's own
+    `set_random_seed` does not reach them, so a pair sitting on the inlier gate falls either
+    way between runs. The poses themselves agree to 0.1 mm; only the gate decision moves.
     """
+    config: LoopClosureConfig = LoopClosureConfig(enabled=True, use_stored_weights=True)
     identity_run: LoopClosureResult = find_loop_edges(
         scene.frames_meta, scene.database_path, scene.index, LoopClosureConfig(enabled=True), match_fn
     )
-    weighted_run: LoopClosureResult = find_loop_edges(
-        scene.frames_meta, scene.database_path, scene.index, LoopClosureConfig(enabled=True, use_stored_weights=True), match_fn
-    )
-    assert len(weighted_run.edges) == len(identity_run.edges)
+    weighted_run: LoopClosureResult = find_loop_edges(scene.frames_meta, scene.database_path, scene.index, config, match_fn)
+    assert identity_run.edges
+    assert weighted_run.edges
     for edge in identity_run.edges:
         np.testing.assert_array_equal(edge.information, np.eye(6))
+
+    inliers_by_pair: dict[tuple[int, int], int] = {
+        (candidate.source_rig_id, candidate.target_rig_id): candidate.num_inliers for candidate in weighted_run.candidates
+    }
     for edge in weighted_run.edges:
-        diagonal: Float64[ndarray, "6"] = np.diag(edge.information)
-        assert np.allclose(edge.information, np.diag(diagonal))
-        assert diagonal.min() == diagonal.max()
-        assert diagonal[0] > 1.0
+        expected: float = inliers_by_pair[(edge.source, edge.target)] * config.loop_residual_weight
+        np.testing.assert_allclose(edge.information, np.eye(6) * expected)
 
 
 # --------------------------------------------------------------------------------------
@@ -546,53 +552,53 @@ def test_stored_weights_scale_the_information_matrix_by_the_inlier_count(scene: 
 # --------------------------------------------------------------------------------------
 
 
-def _candidate(delta_seconds: float, num_inliers: int, score: float, candidate_keyframe_id: int = 0) -> LoopCandidate:
-    """Build a `LoopCandidate` carrying only the fields the banding rule reads.
+def _hit(delta_seconds: float, score: float, candidate_keyframe_id: int) -> RetrievalHit:
+    """Build a retrieval hit with a chosen time gap and score.
 
     Args:
         delta_seconds: `t_query - t_candidate` in seconds.
-        num_inliers: Geometric inlier count, the primary ranking key.
-        score: Retrieval score, the tie-break.
-        candidate_keyframe_id: Distinguishes candidates in assertions.
+        score: Retrieval score.
+        candidate_keyframe_id: Id to identify the hit by in the assertions.
 
     Returns:
-        The candidate.
+        The hit.
     """
-    return LoopCandidate(
+    return RetrievalHit(
         query_keyframe_id=1,
         candidate_keyframe_id=candidate_keyframe_id,
         source_rig_id=1,
         target_rig_id=candidate_keyframe_id + 100,
         score=score,
         delta_seconds=delta_seconds,
-        num_matches=200,
-        num_inliers=num_inliers,
-        source_T_target=pycolmap.Rigid3d(),
     )
 
 
-def test_two_candidates_in_the_same_band_collapse_to_the_one_with_more_inliers() -> None:
-    """`SelectBestCandidates` keeps one candidate per 10 s band of `|dt|` (spec §6.4)."""
-    kept: list[LoopCandidate] = select_best_candidates(
-        [_candidate(20.0, 40, 0.5, candidate_keyframe_id=1), _candidate(23.0, 90, 0.2, candidate_keyframe_id=2)], band_seconds=10.0
+def test_two_hits_in_the_same_band_collapse_to_the_better_scoring_one() -> None:
+    """`SelectBestCandidates` keeps one hit per 10 s band of `|dt|` (spec §6.4).
+
+    The band is ranked by retrieval score, not by inlier count: nothing has been matched
+    when the band is chosen. See `select_best_candidates` for why.
+    """
+    kept: list[RetrievalHit] = select_best_candidates(
+        [_hit(20.0, 0.2, candidate_keyframe_id=1), _hit(23.0, 0.5, candidate_keyframe_id=2)], band_seconds=10.0
     )
-    assert [candidate.candidate_keyframe_id for candidate in kept] == [2]
+    assert [hit.candidate_keyframe_id for hit in kept] == [2]
 
 
-def test_a_tie_on_inliers_is_broken_by_the_retrieval_score() -> None:
-    """Equal inlier counts fall back to the BoW score, as the blob's comparator does."""
-    kept: list[LoopCandidate] = select_best_candidates(
-        [_candidate(20.0, 60, 0.2, candidate_keyframe_id=1), _candidate(22.0, 60, 0.7, candidate_keyframe_id=2)], band_seconds=10.0
+def test_a_weaker_hit_does_not_displace_the_incumbent_of_its_band() -> None:
+    """The first hit of a band survives a later, lower-scoring one."""
+    kept: list[RetrievalHit] = select_best_candidates(
+        [_hit(20.0, 0.7, candidate_keyframe_id=1), _hit(22.0, 0.2, candidate_keyframe_id=2)], band_seconds=10.0
     )
-    assert [candidate.candidate_keyframe_id for candidate in kept] == [2]
+    assert [hit.candidate_keyframe_id for hit in kept] == [1]
 
 
-def test_candidates_in_different_bands_both_survive() -> None:
+def test_hits_in_different_bands_both_survive() -> None:
     """A revisit far from the first one opens a new band and is kept."""
-    kept: list[LoopCandidate] = select_best_candidates(
-        [_candidate(20.0, 40, 0.5, candidate_keyframe_id=1), _candidate(45.0, 35, 0.4, candidate_keyframe_id=2)], band_seconds=10.0
+    kept: list[RetrievalHit] = select_best_candidates(
+        [_hit(20.0, 0.5, candidate_keyframe_id=1), _hit(45.0, 0.4, candidate_keyframe_id=2)], band_seconds=10.0
     )
-    assert [candidate.candidate_keyframe_id for candidate in kept] == [1, 2]
+    assert [hit.candidate_keyframe_id for hit in kept] == [1, 2]
 
 
 # --------------------------------------------------------------------------------------
@@ -688,36 +694,23 @@ def test_the_fixed_ten_second_gate_is_unusable_on_galileo() -> None:
 
 
 # --------------------------------------------------------------------------------------
-# d. the calibrated two-view path
+# e. the cameras
 # --------------------------------------------------------------------------------------
 
 
-def test_an_uncalibrated_camera_recovers_no_relative_pose(scene: SquareRigScene, match_fn: MatchFunction) -> None:
-    """`Camera.has_prior_focal_length` defaults to False and silently kills the pose recovery.
+def test_every_camera_is_built_with_a_prior_focal_length(scene: SquareRigScene) -> None:
+    """`calibrated_cameras` sets `has_prior_focal_length`, which nothing else does.
 
-    `docs/spec/pycolmap-capabilities.md` §5: with the flag false a pinhole pair comes back
-    `UNCALIBRATED` with `cam2_from_cam1 = None`. `calibrated_cameras` sets it for exactly
-    this reason.
+    `docs/spec/pycolmap-capabilities.md` §5: a freshly built camera has the flag false, and
+    with it false every COLMAP estimator that can fall back to an uncalibrated model does —
+    a fisheye pair comes back `DEGENERATE` with zero inliers and no warning. The loop stage
+    no longer estimates a two-view geometry, but the same cameras go on to the mapper.
     """
-    query_id: int = 1
-    candidate_id: int = 2 * scene.revisit_offset + 1
-    matches: Matches = match_fn(query_id, candidate_id)
-    keypoints: dict[int, Float64[ndarray, "n 2"]] = {}
-    database: pycolmap.Database = pycolmap.Database.open(str(scene.database_path))
-    for image_id in (query_id, candidate_id):
-        keypoints[image_id] = np.ascontiguousarray(database.read_keypoints(image_id)[:, :2], dtype=np.float64)
-    database.close()
-
-    cameras: dict[int, pycolmap.Camera] = calibrated_cameras(scene.frames_meta)
-    config: LoopClosureConfig = LoopClosureConfig()
-    calibrated: tuple[pycolmap.Rigid3d, int] | None = estimate_relative_camera_pose(
-        cameras[0], keypoints[query_id], cameras[0], keypoints[candidate_id], matches, config
-    )
-    assert calibrated is not None
-    assert calibrated[1] > config.min_inliers
-
     naive: pycolmap.Camera = pycolmap.Camera(
         camera_id=0, model="PINHOLE", width=IMAGE_WIDTH, height=IMAGE_HEIGHT, params=[FOCAL_LENGTH_PX, FOCAL_LENGTH_PX, IMAGE_WIDTH / 2, IMAGE_HEIGHT / 2]
     )
     assert naive.has_prior_focal_length is False
-    assert estimate_relative_camera_pose(naive, keypoints[query_id], naive, keypoints[candidate_id], matches, config) is None
+    cameras: dict[int, pycolmap.Camera] = calibrated_cameras(scene.frames_meta)
+    assert cameras
+    for camera in cameras.values():
+        assert camera.has_prior_focal_length is True

@@ -6,7 +6,8 @@ verified `colsfm.pose_graph.PoseGraphEdge`s of kind `"loop"`. It reimplements
 (`docs/spec/generate_association_main.md` §6.4) and
 `PoseGraph::FindBestLoopCandidateForFrame` (`docs/spec/pose_graph_main.md` §6.4), which
 are two views of the same pipeline, and deliberately departs from the blob in four
-places — every one of them measured, every one documented below.
+places — every one of them measured, every one documented below. The measurement itself
+lives in `colsfm.loop_pose`; this module decides *which* rig frames to measure.
 
 Pipeline per rig frame
 ----------------------
@@ -15,19 +16,24 @@ Pipeline per rig frame
    paths ("Skip, due to frame N is not a left camera frame"). Metadata that declares no
    stereo pair falls back to every camera.
 2. Retrieval: `RetrievalIndex.query(top_k=20)` with a temporal gate (below), then the
-   `good_score_threshold` gate.
-3. Verification: `match_fn(image_a, image_b)` for the raw matches — injected so this
-   module never depends on the matching worker — then
-   `pycolmap.estimate_two_view_geometry` with `compute_relative_pose=True` on **calibrated**
-   cameras.
-4. `is_good`: `inliers > min_inliers and inliers / matches > min_inlier_ratio`
-   (30 and 0.25, `docs/spec/generate_association_main.md` §6.6, §7.1 item 6).
-5. Metric scale: rotation and translation *direction* from the two-view geometry, magnitude
-   from the prior poses in `frames_meta` (§7.3 "Scale").
-6. `select_best_candidates`: one candidate per 10 s band of `|dt|`, ranked by inlier count
-   then retrieval score (§6.4, §7.1 item 5).
-7. Rig conversion, one edge per unordered rig pair, then
-   `colsfm.pose_graph.gate_loop_edges` with real thresholds.
+   `good_score_threshold` gate and a same-rig-frame gate.
+3. `select_best_candidates`: one hit per 10 s band of `|dt|` per query (§6.4, §7.1 item 5),
+   then one rig pair overall, keeping the best retrieval score.
+4. Measurement: `colsfm.loop_pose.estimate_rig_relative_pose` on each surviving rig pair —
+   a metric point cloud triangulated in the source rig frame from its own cameras and its
+   temporal neighbours, then `estimate_and_refine_generalized_absolute_pose` for the whole
+   target rig. Its gates are `is_good`'s: `inliers > min_inliers` and
+   `inliers / observations > min_inlier_ratio` (30 and 0.25,
+   `docs/spec/generate_association_main.md` §6.6, §7.1 item 6), plus a cross-check of the
+   translation direction against the generalized essential matrix.
+5. One edge per rig pair, then `colsfm.pose_graph.gate_loop_edges` with real thresholds.
+
+Steps 1-3 read nothing but the retrieval index and the timestamps. That is deliberate: the
+pipeline learns which image pairs to match by running this whole stage once with a matcher
+that returns nothing, so any pair whose request depends on a match result would never be
+matched in production (`colsfm.pipeline._find_loop_edges`, `colsfm.loop_pose`). It is also
+why the band in step 3 is ranked by retrieval score where the blob ranks by inlier count —
+see `select_best_candidates`.
 
 The temporal gate
 -----------------
@@ -56,9 +62,11 @@ What is deliberately not copied
 * `max_mean_point_to_epipolarline_error: 10e-6`. Measured on RoboCap it rejects 168 of 180
   candidates and the blob produces **zero** loop associations
   (`docs/spec/generate_association_main.md` §6.4). The gate here is
-  `ransac_max_error_px` (4.0 px, COLMAP's own default), expressed in pixels.
-* The four-view stereo estimator with baseline-locked scale, replaced by a plain two-view
-  estimate plus prior-pose scale (§7.2).
+  `RigPoseConfig.ransac_max_error_px`, expressed in pixels.
+* The four-view stereo estimator with baseline-locked scale, replaced by the local metric
+  map and generalized resection of `colsfm.loop_pose` — a strictly larger version of the
+  same idea, using every camera of the rig and its temporal neighbours rather than one
+  stereo pair.
 * The `scale = 0.47` fallback for an out-of-range scale — the candidate is rejected instead.
 * `loop_edge_translation_threshold_meters` / `loop_edge_rotation_threshold_degrees` default
   to **0.0** in every shipped config, which rejects every candidate and is why
@@ -77,129 +85,198 @@ Galileo result, the identity lands 0.28 mm away and the stored weights 2.17 mm a
 identity is the default and `LoopClosureConfig.use_stored_weights` is the documented
 option, weighting by inlier count (the more standard of the blob's two schemes).
 
-Measured on RoboCap: the retrieval is solved, the estimator is not
---------------------------------------------------------------------
+Measured on RoboCap: retrieval is solved, the measurement is better, the gap is elsewhere
+------------------------------------------------------------------------------------------
 
-Once `colsfm.retrieval`'s vocab backend gave this stage real candidates on RoboCap (4528
-keyframes, 1132 rig frames, a 124 m walk), the whole funnel was run end to end against the
-blob's own 90 LOOP edges. Retrieval and selection are **right**; the two-view estimator of
-step 3-5 above is **not good enough**, and these are the numbers that show it.
+RoboCap is 4528 fisheye keyframes, 1132 rig frames, four cameras pointing in three
+directions, a 124 m walk over 150.8 s. The blob's own run emits **90** LOOP constraints and
+a PGO output; everything below is scored against that output after rigid alignment.
 
-Funnel, `good_score_threshold` 0.1, temporal gap 12.07 s (0.08 x the 150.8 s session):
+Retrieval and pair selection were settled first, and they are right: the vocab backend's
+gated top-20 covers all 90 of the blob's LOOP pairs, and replacing only the *measurement* on
+our own 488 gated rig pairs with the blob's optimised relative poses lands **39.9 mm** from
+its PGO, against 460.8 mm for the input trajectory alone. So the pair set can carry the
+answer; what it is fed decides everything.
+
+Estimators, on that one fixed 488-pair set:
+
+| measurement of `source_T_target` | edges | translation error vs the oracle, median / p90 | rotation error, median | RMSE vs the blob's PGO |
+|---|---|---|---|---|
+| none (the input trajectory) | 0 | — | — | 460.8 mm |
+| the oracle (the blob's own PGO) | 488 | 0 / 0 mm | 0.00 deg | **39.9 mm** |
+| the input odometry's own relative pose | 488 | 383 / 799 mm | 6.79 deg | 460.8 mm |
+| two-view essential + prior-pose scale (what this stage used to ship) | 488 | 346 / 809 mm | 7.30 deg | 609.0 mm |
+| `loop_pose`, stereo pair only (`neighbour_span=0`) | 189 | 197 / 1140 mm | 6.63 deg | 457.0 mm |
+| **`loop_pose`, the default (`neighbour_span=1`)** | 425 | 219 / 776 mm | 6.90 deg | **408.1 mm** |
+| `loop_pose`, `neighbour_span=2` | 448 | 231 / 773 mm | 6.92 deg | 418.5 mm |
+| `loop_pose`, no direction cross-check | 430 | 228 / 776 mm | 6.91 deg | 418.4 mm |
+| `loop_pose`, direction cross-check at 25 deg | 414 | 227 / 779 mm | 6.85 deg | 407.6 mm |
+
+The new estimator is a clear improvement on the old one — 609.0 mm to 408.1 mm, from worse
+than no loops to better than no loops — and `neighbour_span=1` is the knee: the temporal
+neighbours more than double the usable triangulation baseline over the 86 mm stereo pair,
+and a second step adds nothing. But 408 mm is not 39.9 mm, and no gate closes the rest.
+Every knob was swept on the same edges and every one is flat:
+
+| selectivity or weighting | edges | RMSE vs the blob's PGO |
+|---|---|---|
+| all edges | 433 | 408.0 mm |
+| only the 213 within 2 rig frames of a blob LOOP pair | 213 | 389.1 mm |
+| `||t|| <= 0.5 m` / `<= 1 m` | 361 / 425 | 417.4 / 407.0 mm |
+| inlier ratio `>= 0.30` / `>= 0.35` / `>= 0.40` | 339 / 274 / 206 | 413.0 / 412.3 / 419.1 mm |
+| within 0.3 m / 0.5 m of the prior | 209 / 408 | 439.5 / 405.9 mm |
+| loop information `0.3` / `0.1` / `0.01 * I6` | 433 | 408.5 / 409.9 / 413.4 mm |
+
+Nothing here is worth 250 mm, which says the residual is not a few bad edges.
+
+The whole stage, end to end
+---------------------------
+
+Everything above varies the measurement on one frozen pair set. Running the stage as
+`colsfm.pipeline` runs it — retrieval, banding, batch matching, measurement, gating, with
+the `data/cusfm_configs/loop-closure-fixed` profile's own 1.0 m / 10 deg edge gates:
 
 | stage | count |
 |---|---|
 | query keyframes (left camera of the one stereo pair) | 1132 |
-| retrieval hits after the temporal gate | 22 640 |
+| retrieval hits after the 12.07 s temporal gate | 22 640 |
 | dropped by `good_score_threshold` | 4 926 |
-| dropped by `estimate_two_view_geometry` | 782 |
-| dropped by `is_good` | 0 |
-| dropped by the scale range | 5 |
-| verified | 16 927 |
-| after `select_best_candidates` | 1 729 |
-| after one edge per rig pair | 1 585 |
-| after `gate_loop_edges` (3.0 m / 30 deg) | 488 |
+| after `select_best_candidates` | 1 747 |
+| after one rig pair each | 1 573 |
+| dropped by `is_good_match` | 586 |
+| dropped by the direction cross-check | 66 |
+| measured | 921 |
+| **after `gate_loop_edges` (1.0 m / 10 deg)** | **74** |
 
-All **90** of the blob's LOOP pairs are covered by those 488 edges to within 2 rig frames
-(and by the verified candidates too), so nothing true is being missed.
-
-Pose graph, 1131 sequential edges from the input priors plus the loop edges, against the
-blob's `vehicle_pose.tum` after rigid alignment:
+14 443 image pairs are asked of the matcher, of which 6 057 were new — fewer than the
+15 325 the old two-view funnel needed, because banding on the retrieval score shortlists rig
+pairs before anything is matched. The measurement pass takes 437 s over 1573 rig pairs. Two
+runs of the same code give 74 and 75 edges and 404.4 and 402.4 mm: both generalized
+estimators are RANSAC and pycolmap's `set_random_seed` does not reach them, so a pair on the
+inlier gate falls either way. The poses themselves are stable to 0.1 mm.
 
 | edges fed to `solve_pose_graph` | RMSE vs the blob's PGO |
 |---|---|
-| sequential only (the input trajectory) | 460.8 mm |
-| sequential + the blob's own 90 LOOP edges | **135.0 mm** |
-| sequential + **oracle** poses on our 488 rig pairs | **39.9 mm** |
-| sequential + our 488 two-view + prior-scale edges | 609.0 mm |
+| sequential only | 460.8 mm |
+| + our 74 loop edges | **404.4 mm** |
+| + oracle poses on those same 74 rig pairs | 261.8 mm |
+| + the blob's own 90 loop edges | 135.0 mm |
 
-The middle two rows are the controls that localise the fault. Our `sequential_edges`
-reproduce the blob's CONSECUTIVE edges to **0.00 mm**, and feeding the blob's own loop
-edges through `colsfm.pose_graph.solve_pose_graph` lands 135 mm from its result — so the
-solver and the edge conventions are right. Replacing only the *measurement* on our own 488
-rig pairs with the blob's optimised relative poses lands at 39.9 mm — so the **pair
-selection is right too**. What is left is the measurement itself.
+Two things to read off that table. The 74 edges are the *accurate* ones — their translation
+error against the oracle is a median of 77 mm and their rotation error 3.80 deg, against
+219 mm and 6.90 deg over the unfiltered 488 — so the funnel's selectivity works. But the
+oracle on the same 74 pairs only reaches 261.8 mm, so this configuration is capped by its
+**pair set**, not by its measurement: `loop_edge_rotation_threshold_degrees: 10` throws away
+847 of the 921 measured pairs, and covers 56 of the blob's 90 loop pairs instead of all 90,
+because a real RoboCap revisit rotates by a median of 11.8 deg and that gate was tuned
+against an estimator whose rotations were smaller. `LoopClosureConfig` defaults to 30 deg
+for exactly this reason; the config profile overrides it.
 
-Why the measurement is weak, and what would fix it
---------------------------------------------------
+The gap is the rotation, and it is not ours
+-------------------------------------------
 
-`docs/spec/generate_association_main.md` §7.2 recommends replacing the blob's four-view
-stereo estimator with "a plain 2-view essential-matrix estimate between query and
-candidate; recover metric scale afterwards from the given poses". On RoboCap that
-recommendation is **wrong**, and not for the reason it looks like:
+Running the estimator on the blob's **own** 90 loop rig pairs compares two independent
+measurements of the same quantity with no pair selection and no pose graph in between. We
+measured 87 of them:
 
-* Taking the magnitude from the prior means the edge can never contradict the prior about
-  distance — which is exactly the drift a loop closure exists to remove. Our edges have a
-  median `||t||` of 0.417 m where the blob's have 0.157 m.
-* The translation *direction* is the harder problem. A revisit baseline here is 0.2-0.4 m
-  against a scene several metres deep, so the essential matrix barely constrains it. Our
-  direction sits 30 deg from the prior's — but the prior and the blob's own PGO sit
-  **44 deg** apart on the same pairs, so a few tens of degrees is simply the noise floor of
-  a 0.3 m vector, not a bug.
+| quantity, median over the 87 pairs | ours | the input odometry | the blob's own LOOP edge |
+|---|---|---|---|
+| `||t||` of the edge | 132 mm | 355 mm | 160 mm |
+| relative rotation angle | 11.8 deg | 11.8 deg | 7.3 deg |
+| translation vs the blob's edge | 180 mm | 329 mm | — |
+| rotation vs the blob's edge | 6.5 deg | 6.4 deg | — |
 
-Replacing the whole estimate with metric stereo triangulation plus PnP — triangulate the
-query rig's own stereo matches against its **86 mm** known baseline, then
-`pycolmap.estimate_and_refine_absolute_pose` of the candidate camera against those metric
-points — was measured on the same 488 pairs and is the only variant that moves the
-trajectory the way the blob's did:
+The **translation** result is the estimator working: the odometry says these revisits are
+355 mm apart, the blob measured 160 mm, we measured 132 mm, and we cut the disagreement with
+the blob's own number from 329 mm to 180 mm. A measurement that took its magnitude from the
+prior could not do that.
 
-| loop edge measurement | RMSE vs the blob's PGO |
-|---|---|
-| two-view + prior scale (what this module ships) | 609.0 mm (worse than the input) |
-| stereo triangulation + PnP | **434.5 mm** (better than the input's 460.8 mm) |
+The **rotation** is the whole remaining gap, and the blob is the outlier, not us:
 
-It is not implemented here because 434.5 mm is still far from the 39.9 mm the same pairs
-allow: an 86 mm baseline triangulating a scene metres deep leaves depth errors of the same
-order as the loop translation itself. Closing the rest of the gap needs the blob's
-refinement and its selectivity as well — `StereoPoseRefineSolver`, the occupied-area and
-inlier gates of `docs/spec/generate_association_main.md` §6.4, and the ~8 % acceptance rate
-that leaves it with 90 edges where this module keeps 488. That is the next piece of work,
-and it is an estimator problem, not a retrieval one.
+* Two independent image-based estimators — the generalized resection of `colsfm.loop_pose`
+  and `pycolmap.estimate_generalized_relative_pose`, which share their correspondences and
+  nothing else — agree with each other to **0.35 deg** (p90 0.63 deg) and both sit
+  **6.5 deg** from the blob's stored rotation and **1.5 deg** from the odometry's.
+* The blob's PGO followed its own edges: its output's relative rotation sits 1.1 deg from
+  its LOOP edges and 6.0 deg from the odometry's.
+* Rebuilding our edges component by component: our rotation with the blob's translation
+  scores 392.9 mm, the blob's rotation with our translation scores **265.6 mm**. All of the
+  correction the blob's PGO applies is rotational.
+* The convention is not the explanation. Parsed exactly as stored, the blob's 1131
+  CONSECUTIVE constraints reproduce `sequential_edges` to **0.0000 mm and 0.0000 deg**;
+  inverting them gives 228 mm and 7.9 deg. So `pose_source_to_target` is read correctly,
+  rotation included, and the 6.5 deg is a real disagreement about the world.
 
-**Consequence for callers today:** on a long sequence this stage now produces hundreds of
-loop edges where it used to produce none, and on RoboCap they make the pose graph
-measurably worse. `LoopClosureConfig.enabled` stays **False**, and a caller that turns it
-on must measure the trajectory before and after rather than assume loops help.
+A 6 deg rotation error is not something a resection with ~1900 inliers at an 8 px threshold
+on a 630 px focal length can hide — the residuals would be tens of pixels. The odometry
+agreeing with us is also the expected pattern for a visual-inertial front end, whose
+orientation drifts far more slowly than its position. RoboCap ships **no ground truth**
+(NOTES.md §"RoboCap reconstruction quality"), so this cannot be settled outright; what can
+be said is that the reference this stage is scored against carries a rotation two
+independent estimators here disagree with, and that scoring against it caps what any
+measurement in this module can reach.
 
-Everything is behind `LoopClosureConfig.enabled`, which is **False**. On Galileo, turning
-loops on moves camera positions by 5-13 mm against a 5 mm ATE budget
-(`docs/spec/pose_graph_main.md` §8): on a short, low-drift sequence they can easily hurt.
-The pipeline decides per dataset.
+Where that leaves the stage
+---------------------------
+
+`LoopClosureConfig.enabled` stays **False**. The estimator is a real improvement — it beats
+the old one by 200 mm and beats running no loops at all, on the frozen pair set and end to
+end — but 402 mm against a 135 mm target is not a result worth switching on by default, and
+the one number that would justify switching it on (agreement with something that is actually
+ground truth) does not exist for this dataset. A caller who turns it on must measure the
+trajectory before and after, and should raise `loop_edge_rotation_threshold_degrees` above
+10 first, because that gate now costs more than it saves.
+
+On Galileo the same switch stays off for a different reason: turning loops on moves camera
+positions by 5-13 mm against a 5 mm ATE budget (`docs/spec/pose_graph_main.md` §8), because
+a 0.93 s, 0.66 m sweep has no drift for a loop to remove. The pipeline decides per dataset.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Final, TypeAlias
+from typing import Final
 
 import numpy as np
 import pycolmap
-from jaxtyping import Float32, Float64, Int, UInt32
+from jaxtyping import Float32
 from numpy import ndarray
 
 from colsfm.cameras import colmap_cameras
-from colsfm.frames_meta import CameraParams, FramesMeta, KeyframeMeta, RigFrame
+from colsfm.frames_meta import FramesMeta, KeyframeMeta, RigFrame
+from colsfm.loop_pose import (
+    DEFAULT_RIG_POSE_CONFIG,
+    Keypoints,
+    MatchFunction,
+    RigFrameIndex,
+    RigGeometry,
+    RigImageCache,
+    RigLandmarks,
+    RigPoseConfig,
+    RigPoseEstimate,
+    RigPoseOutcome,
+    RigPoseRejection,
+    build_image_cache,
+    build_rig_geometry,
+    estimate_rig_relative_pose,
+    triangulate_rig_landmarks,
+)
 from colsfm.pose_graph import Information6, PoseGraphEdge, gate_loop_edges, loop_edge_information
-from colsfm.retrieval import Candidate, RetrievalIndex
-
-Matches: TypeAlias = Int[ndarray, "n_matches 2"]
-"""Raw feature matches: keypoint index in the first image, keypoint index in the second."""
-
-MatchFunction: TypeAlias = Callable[[int, int], Matches]
-"""`match_fn(image_id_a, image_id_b) -> matches`, injected by the caller.
-
-The production implementation is LightGlue (TensorRT engine or torch); the tests use a
-synthetic one. Keeping it a callable is what stops this module depending on the matching
-stage, which another worker owns.
-"""
-
-Keypoints: TypeAlias = Float64[ndarray, "n_keypoints 2"]
-"""Keypoint pixel coordinates, `x` then `y`, in the original image."""
+from colsfm.retrieval import RetrievalIndex
 
 MICROSECONDS_PER_SECOND: Final[float] = 1e6
 """Timestamps are integer microseconds everywhere in `frames_meta.json`."""
+
+REJECTION_COUNTER: Final[Mapping[RigPoseRejection | None, str]] = {
+    "no_observations": "rejected_no_matches",
+    "no_pose": "rejected_by_geometry",
+    "too_few_inliers": "rejected_by_is_good",  # the same rule `is_good_match` states
+    "direction_disagreement": "rejected_by_direction",
+    None: "rejected_by_geometry",
+}
+"""Which diagnostic counter each `colsfm.loop_pose` rejection lands in."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,20 +308,15 @@ class LoopClosureConfig:
     blob reuses `loop_interval_threshold_in_seconds` here; it is separate so the temporal
     gate can be lowered without also merging every candidate into one band."""
     min_inliers: int = 30
-    """`min_matches_num`: a good loop edge needs strictly more inliers than this."""
+    """`min_matches_num`: a good loop edge needs strictly more inliers than this. Here the
+    inliers are the 2-D-3-D observations `colsfm.loop_pose`'s generalized resection kept."""
     min_inlier_ratio: float = 0.25
-    """`min_matches_ratio`: inliers / raw matches must be strictly greater than this."""
-    ransac_max_error_px: float = 4.0
-    """RANSAC inlier threshold in pixels. Replaces the blob's unusable 1e-5 normalised-plane
-    epipolar gate; 4.0 px is COLMAP's own `TwoViewGeometryOptions` default."""
-    ransac_confidence: float = 0.999
-    """RANSAC confidence, COLMAP's default and the blob's `min_ransac_confidence` rounded up."""
-    min_scale_meters: float = 0.02
-    """Smallest prior baseline that yields a usable translation direction. Below this the
-    two views are effectively co-located and the essential matrix is degenerate."""
-    max_scale_meters: float = 50.0
-    """`scale_upper_limit`. A prior baseline above this means the retrieval matched across
-    a whole session and the candidate is rejected rather than rescaled to the blob's 0.47."""
+    """`min_matches_ratio`: inliers over the observations offered, strictly greater."""
+    rig_pose: RigPoseConfig = DEFAULT_RIG_POSE_CONFIG
+    """Settings of the metric rig-to-rig estimator in `colsfm.loop_pose`, which measures
+    every surviving rig pair. `min_inliers` above overrides the copy in here and
+    `min_inlier_ratio` has no copy at all, so the blob's own gate lives once, in
+    `is_good_match`."""
     max_translation_m: float = 3.0
     """`loop_edge_translation_threshold_meters`, applied by `gate_loop_edges`. The shipped
     isaac config leaves it at 0.0, which rejects everything; `data/cusfm_configs/
@@ -273,6 +345,29 @@ class LoopClosureConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class RetrievalHit:
+    """One retrieval hit that passed the score, time and rig gates, before any matching.
+
+    The funnel bands and deduplicates these, and only the survivors are handed to the
+    matcher. Nothing here needs an image pair to have been matched, which is what lets the
+    stage name every pair it will need in a single dry run (`find_loop_edges`).
+    """
+
+    query_keyframe_id: int
+    """Keyframe the query was issued from."""
+    candidate_keyframe_id: int
+    """Retrieved keyframe."""
+    source_rig_id: int
+    """`synced_sample_id` of the query keyframe's rig frame."""
+    target_rig_id: int
+    """`synced_sample_id` of the candidate keyframe's rig frame."""
+    score: float
+    """Retrieval score in `[0, 1]`."""
+    delta_seconds: float
+    """`t_query - t_candidate` in seconds; `select_best_candidates` bands on its magnitude."""
+
+
+@dataclass(frozen=True, slots=True)
 class LoopCandidate:
     """One retrieval candidate that survived two-view verification."""
 
@@ -289,11 +384,16 @@ class LoopCandidate:
     delta_seconds: float
     """`t_query - t_candidate` in seconds; `SelectBestCandidates` bands on its magnitude."""
     num_matches: int
-    """Raw matches `match_fn` returned."""
+    """2-D-3-D observations the generalized PnP was offered."""
     num_inliers: int
-    """Matches the two-view geometry kept."""
+    """2-D-3-D observations it kept."""
+    num_landmarks: int
+    """Landmarks in the source rig frame's local metric map."""
+    direction_disagreement_deg: float
+    """Angle between this translation direction and the generalized essential matrix's;
+    `nan` when that cross-check was unavailable. See `colsfm.loop_pose`."""
     source_T_target: pycolmap.Rigid3d
-    """Rig-frame relative pose, `world_T_source^-1 * world_T_target`, metrically scaled."""
+    """Rig-frame relative pose, `world_T_source^-1 * world_T_target`, in metres."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,20 +419,22 @@ class LoopClosureDiagnostics:
     """Hits dropped by the temporal gate."""
     rejected_by_same_rig: int
     """Hits whose rig frame is the query's own; an intra-rig pair is an extrinsic edge."""
-    rejected_no_matches: int
-    """Hits where `match_fn` returned too few matches to estimate a geometry."""
-    rejected_by_geometry: int
-    """Hits whose two-view geometry was not `CALIBRATED` or recovered no relative pose."""
-    rejected_by_is_good: int
-    """Hits that failed `inliers > min_inliers and inliers / matches > min_inlier_ratio`."""
-    rejected_by_scale: int
-    """Hits whose prior baseline fell outside `[min_scale_meters, max_scale_meters]`."""
-    verified: int
-    """Hits that produced a metric relative pose."""
     after_banding: int
-    """Candidates left after `select_best_candidates` over every query."""
+    """Hits left after `select_best_candidates` over every query."""
     after_deduplication: int
-    """Edges left after keeping the best candidate per unordered rig pair."""
+    """Rig pairs left after keeping the best-scoring hit per unordered rig pair; this is
+    what the metric estimator is actually run on."""
+    rejected_no_matches: int
+    """Rig pairs whose local map and loop matches yielded too few 2-D-3-D observations."""
+    rejected_by_geometry: int
+    """Rig pairs the generalized PnP failed on outright."""
+    rejected_by_is_good: int
+    """Rig pairs that failed `inliers > min_inliers and inliers / observations > min_inlier_ratio`."""
+    rejected_by_direction: int
+    """Rig pairs whose refined translation direction disagreed with the generalized
+    essential matrix's by more than `RigPoseConfig.max_direction_disagreement_deg`."""
+    verified: int
+    """Rig pairs that produced a metric relative pose."""
     edges: int
     """Edges left after `gate_loop_edges`, i.e. what the caller receives."""
 
@@ -364,9 +466,13 @@ def is_good_match(num_inliers: int, num_matches: int, config: LoopClosureConfig)
     `is_good = matched_num > min_matches_num && matched_num / matches.size() > min_matches_ratio`,
     i.e. 30 inliers and a 25 % inlier ratio, both strict.
 
+    The blob counts two-view feature matches; this stage counts the 2-D-3-D observations of
+    `colsfm.loop_pose`'s generalized resection, which is the same quantity one stage further
+    on — how much of what the matcher offered the geometry actually explained.
+
     Args:
-        num_inliers: Matches the geometric verification kept.
-        num_matches: Raw matches the matcher produced.
+        num_inliers: Observations the geometry kept.
+        num_matches: Observations it was offered.
 
     Returns:
         True when the pair may become a loop edge.
@@ -408,37 +514,42 @@ def minimum_time_gap_seconds(timestamps_us: Sequence[int], config: LoopClosureCo
     return max(config.loop_interval_threshold_in_seconds, config.loop_closure_interval_ratio * session_duration_seconds(timestamps_us))
 
 
-def select_best_candidates(candidates: Sequence[LoopCandidate], band_seconds: float) -> list[LoopCandidate]:
-    """`SelectBestCandidates`: keep one candidate per band of `|dt|` (spec §6.4).
+def select_best_candidates(hits: Sequence[RetrievalHit], band_seconds: float) -> list[RetrievalHit]:
+    """`SelectBestCandidates`: keep one hit per band of `|dt|` (spec §6.4).
 
-    Sorts ascending by `|dt|` and walks greedily: a candidate more than `band_seconds`
-    beyond the last emitted one opens a new band, otherwise it replaces the last emitted
-    one when it has more inliers, or the same inliers and a higher retrieval score. This is
-    what stops a single revisit producing 20 near-duplicate loop edges (spec §7.1 item 5).
+    Sorts ascending by `|dt|` and walks greedily: a hit more than `band_seconds` beyond the
+    last emitted one opens a new band, otherwise it replaces the last emitted one when it
+    scores higher. This is what stops a single revisit producing 20 near-duplicate loop
+    edges (spec §7.1 item 5).
+
+    **Departure from the blob, measured.** `SelectBestCandidates` ranks a band first by the
+    geometric inlier count and only then by the retrieval score. Ranking by inliers needs
+    every candidate matched *before* the band is chosen, which is 15 325 image pairs on
+    RoboCap where the banded shortlist needs 6 000 — and the pipeline has to name every pair
+    it will match in one dry run, before any match result exists (`find_loop_edges`). The
+    retrieval score is the only ranking available at that point. Measured on RoboCap the two
+    orders pick nearly the same pairs, because a band is a 10 s window of one revisit and its
+    candidates are near-duplicates of each other.
 
     Args:
-        candidates: Verified candidates for one query keyframe.
+        hits: Retrieval hits for one query keyframe that passed the score and time gates.
         band_seconds: Band width in seconds; the blob uses
             `loop_interval_threshold_in_seconds`.
 
     Returns:
-        The kept candidates, in ascending `|dt|` order.
+        The kept hits, in ascending `|dt|` order.
     """
-    ordered: list[LoopCandidate] = sorted(candidates, key=lambda candidate: (abs(candidate.delta_seconds), candidate.candidate_keyframe_id))
-    kept: list[LoopCandidate] = []
+    ordered: list[RetrievalHit] = sorted(hits, key=lambda hit: (abs(hit.delta_seconds), hit.candidate_keyframe_id))
+    kept: list[RetrievalHit] = []
     last_gap_seconds: float = -np.inf
-    for candidate in ordered:
-        gap_seconds: float = abs(candidate.delta_seconds)
+    for hit in ordered:
+        gap_seconds: float = abs(hit.delta_seconds)
         if gap_seconds - last_gap_seconds > band_seconds:
-            kept.append(candidate)
+            kept.append(hit)
             last_gap_seconds = gap_seconds
             continue
-        incumbent: LoopCandidate = kept[-1]
-        better: bool = candidate.num_inliers > incumbent.num_inliers or (
-            candidate.num_inliers == incumbent.num_inliers and candidate.score > incumbent.score
-        )
-        if better:
-            kept[-1] = candidate
+        if hit.score > kept[-1].score:
+            kept[-1] = hit
     return kept
 
 
@@ -483,106 +594,64 @@ def calibrated_cameras(frames_meta: FramesMeta) -> dict[int, pycolmap.Camera]:
     return cameras
 
 
-def _two_view_options(config: LoopClosureConfig) -> pycolmap.TwoViewGeometryOptions:
-    """Options for `estimate_two_view_geometry`.
-
-    `compute_relative_pose` defaults to False, so without setting it `cam2_from_cam1` is
-    None even on a perfectly good calibrated pair.
+def rig_geometry(frames_meta: FramesMeta) -> RigGeometry:
+    """The rig the metric estimator resections against.
 
     Args:
-        config: The loop-closure settings.
+        frames_meta: The parsed metadata.
 
     Returns:
-        The options, with the RANSAC threshold in pixels.
+        Calibrated cameras, their `cam_T_vehicle` extrinsics and the declared stereo
+        partnerships, in `colsfm.loop_pose`'s parallel-tuple form.
     """
-    options: pycolmap.TwoViewGeometryOptions = pycolmap.TwoViewGeometryOptions()
-    options.compute_relative_pose = True
-    options.min_num_inliers = config.min_inliers
-    options.ransac.max_error = config.ransac_max_error_px
-    options.ransac.confidence = config.ransac_confidence
-    return options
-
-
-def estimate_relative_camera_pose(
-    camera_query: pycolmap.Camera,
-    keypoints_query: Keypoints,
-    camera_candidate: pycolmap.Camera,
-    keypoints_candidate: Keypoints,
-    matches: Matches,
-    config: LoopClosureConfig,
-) -> tuple[pycolmap.Rigid3d, int] | None:
-    """Verify one pair and return `cam_candidate_T_cam_query` with a unit translation.
-
-    Args:
-        camera_query: Calibrated camera of the query keyframe.
-        keypoints_query: Float64 keypoint pixels of the query, shape `[n_keypoints, 2]`.
-        camera_candidate: Calibrated camera of the candidate keyframe.
-        keypoints_candidate: Float64 keypoint pixels of the candidate, `[n_keypoints, 2]`.
-        matches: Int match indices with shape `[n_matches, 2]`.
-        config: The loop-closure settings.
-
-    Returns:
-        The direction-only relative pose and the inlier count, or None when the geometry is
-        not calibrated or recovers no pose.
-    """
-    match_pairs: UInt32[ndarray, "n_matches 2"] = np.ascontiguousarray(matches, dtype=np.uint32)
-    geometry: pycolmap.TwoViewGeometry = pycolmap.estimate_two_view_geometry(
-        camera_query,
-        np.ascontiguousarray(keypoints_query, dtype=np.float64),
-        camera_candidate,
-        np.ascontiguousarray(keypoints_candidate, dtype=np.float64),
-        match_pairs,
-        _two_view_options(config),
+    partners: dict[int, int] = {}
+    for pair in frames_meta.stereo_pairs:
+        partners[pair.left_camera_params_id] = pair.right_camera_params_id
+        partners[pair.right_camera_params_id] = pair.left_camera_params_id
+    return build_rig_geometry(
+        calibrated_cameras(frames_meta),
+        {camera_id: camera.vehicle_T_cam for camera_id, camera in frames_meta.cameras.items()},
+        partners,
     )
-    if geometry.config != pycolmap.TwoViewGeometryConfiguration.CALIBRATED:
-        return None
-    if geometry.cam2_from_cam1 is None:
-        return None
-    return geometry.cam2_from_cam1, len(geometry.inlier_matches)
 
 
-def _metric_relative_rig_pose(
-    direction_only: pycolmap.Rigid3d,
-    query: KeyframeMeta,
-    candidate: KeyframeMeta,
-    cameras: Mapping[int, CameraParams],
-    config: LoopClosureConfig,
-) -> pycolmap.Rigid3d | None:
-    """Scale a two-view estimate with the prior poses and move it into the rig frame.
-
-    The essential matrix fixes rotation and translation *direction* only. The blob recovers
-    the magnitude from the known stereo baseline through a four-view estimator because it
-    refuses to trust the prior pose; with `init_pose_mode: GIVEN` the prior is right there,
-    so the magnitude is `||prior_cam_candidate_T_cam_query.translation||`
-    (`docs/spec/generate_association_main.md` §7.3).
-
-    The rig conversion is `docs/spec/pose_graph_main.md` §6.7:
-    `rig_source_T_rig_target = vehicle_T_cam(query) * cam_query_T_cam_candidate *
-    vehicle_T_cam(candidate)^-1`, which is exactly `world_T_rig_query^-1 *
-    world_T_rig_candidate` when the estimate agrees with the priors.
+def rig_frame_index(frames_meta: FramesMeta) -> RigFrameIndex:
+    """The rig frames, their prior poses and their images, in time order.
 
     Args:
-        direction_only: `cam_candidate_T_cam_query` with a unit-norm translation.
-        query: The query keyframe's metadata.
-        candidate: The candidate keyframe's metadata.
-        cameras: Calibration and rig extrinsic per `camera_params_id`.
+        frames_meta: The parsed metadata.
+
+    Returns:
+        The index `colsfm.loop_pose` walks to find a rig frame's neighbours and images.
+    """
+    keyframe_by_id: dict[int, KeyframeMeta] = frames_meta.keyframe_by_id()
+    rig_frames: tuple[RigFrame, ...] = frames_meta.rig_frames()
+    keyframe_by_rig_camera: dict[tuple[int, int], int] = {}
+    for rig in rig_frames:
+        for keyframe_id in rig.keyframe_ids:
+            keyframe_by_rig_camera.setdefault((rig.synced_sample_id, keyframe_by_id[keyframe_id].camera_params_id), keyframe_id)
+    return RigFrameIndex(
+        sequence=tuple(rig.synced_sample_id for rig in rig_frames),
+        world_T_rig={rig.synced_sample_id: rig.world_T_vehicle for rig in rig_frames},
+        keyframe_by_rig_camera=keyframe_by_rig_camera,
+    )
+
+
+def rig_pose_config(config: LoopClosureConfig) -> RigPoseConfig:
+    """The estimator settings, with this stage's own inlier floor written over them.
+
+    `min_inliers` is the blob's `min_matches_num` (spec §6.6) and belongs to the
+    loop-closure stage, so it is kept in one place rather than duplicated in two configs
+    that could drift apart. The ratio half of the rule stays here too, in `is_good_match`,
+    which this stage applies to the counts the estimator reports.
+
+    Args:
         config: The loop-closure settings.
 
     Returns:
-        The metric rig-frame relative pose, or None when the prior baseline is degenerate
-        or implausibly long.
+        The `RigPoseConfig` the metric estimator actually runs with.
     """
-    prior_candidate_T_query: pycolmap.Rigid3d = candidate.world_T_cam.inverse() * query.world_T_cam
-    scale_meters: float = float(np.linalg.norm(prior_candidate_T_query.translation))
-    if not config.min_scale_meters <= scale_meters <= config.max_scale_meters:
-        return None
-
-    unit_translation: Float64[ndarray, "3"] = np.asarray(direction_only.translation, dtype=np.float64)
-    scaled: pycolmap.Rigid3d = pycolmap.Rigid3d(direction_only.rotation, unit_translation * scale_meters)
-    cam_query_T_cam_candidate: pycolmap.Rigid3d = scaled.inverse()
-    vehicle_T_cam_query: pycolmap.Rigid3d = cameras[query.camera_params_id].vehicle_T_cam
-    vehicle_T_cam_candidate: pycolmap.Rigid3d = cameras[candidate.camera_params_id].vehicle_T_cam
-    return vehicle_T_cam_query * cam_query_T_cam_candidate * vehicle_T_cam_candidate.inverse()
+    return replace(config.rig_pose, min_inliers=config.min_inliers)
 
 
 def _read_keypoints(database_path: Path, image_ids: Sequence[int]) -> dict[int, Keypoints]:
@@ -628,18 +697,25 @@ def find_loop_edges(
     config: LoopClosureConfig,
     match_fn: MatchFunction,
 ) -> LoopClosureResult:
-    """Retrieve, verify and convert loop candidates into rig-level pose-graph edges.
+    """Retrieve, shortlist, measure and gate loop candidates into rig-level pose-graph edges.
 
-    Returns a `LoopClosureResult` rather than a bare list so the caller can report why a
-    run produced no edge, which is the normal outcome on a short sequence.
+    The funnel is: retrieval hits, the score, time and same-rig gates, one hit per `|dt|`
+    band per query, one rig pair overall, then `colsfm.loop_pose.estimate_rig_relative_pose`
+    on each surviving rig pair and `gate_loop_edges` on the result. Everything before the
+    estimator needs only the retrieval index and the timestamps, which is what lets a caller
+    run the whole stage once with a matcher that returns nothing to learn the pair list, then
+    match it, then run it again for real (`colsfm.pipeline._find_loop_edges`).
+
+    Returns a `LoopClosureResult` rather than a bare list so the caller can report why a run
+    produced no edge, which is the normal outcome on a short sequence.
 
     Args:
         frames_meta: Parsed `frames_meta.json`; supplies the rig grouping, the prior poses
-            used for scale, the rig extrinsics and the calibration.
+            the local map is triangulated with, the rig extrinsics and the calibration.
         database_path: COLMAP database holding the keypoints `match_fn`'s indices refer to.
         index: Retrieval index over the same keyframe ids.
         config: Gates and thresholds. Nothing runs unless `config.enabled`.
-        match_fn: `match_fn(query_image_id, candidate_image_id) -> Int[ndarray, "m 2"]`.
+        match_fn: `match_fn(image_id_a, image_id_b) -> Int[ndarray, "m 2"]`.
 
     Returns:
         The gated loop edges and the diagnostics of the run.
@@ -660,13 +736,13 @@ def find_loop_edges(
             "rejected_by_score",
             "rejected_by_time",
             "rejected_by_same_rig",
+            "after_banding",
+            "after_deduplication",
             "rejected_no_matches",
             "rejected_by_geometry",
             "rejected_by_is_good",
-            "rejected_by_scale",
+            "rejected_by_direction",
             "verified",
-            "after_banding",
-            "after_deduplication",
         ),
         0,
     )
@@ -686,61 +762,13 @@ def find_loop_edges(
         print("Loop closure is disabled; set LoopClosureConfig.enabled to run it.")
         return LoopClosureResult(edges=[], diagnostics=diagnostics(0))
 
-    query_camera_ids: set[int] = _left_camera_ids(frames_meta, config)
-    cameras: dict[int, pycolmap.Camera] = calibrated_cameras(frames_meta)
-    keypoints: dict[int, Keypoints] = _read_keypoints(database_path, index.image_ids)
-    gap_us: int = round(gap_seconds * MICROSECONDS_PER_SECOND)
-
-    indexed: set[int] = set(index.image_ids)
-    verified: list[LoopCandidate] = []
-    banded: list[LoopCandidate] = []
-    for rig in frames_meta.rig_frames():
-        for query_id in rig.keyframe_ids:
-            query: KeyframeMeta = keyframe_by_id[query_id]
-            if query.camera_params_id not in query_camera_ids or query_id not in keypoints or query_id not in indexed:
-                continue
-            counters["queries"] += 1
-            # The blob applies the time gate AFTER retrieval, so temporal neighbours eat
-            # slots out of its top-20 and it needs an early abort when more than half the
-            # hits are too close (spec §6.4). Pushing the gate into the index instead keeps
-            # all `top_k` slots useful; the ungated query is issued only to report how many
-            # hits the gate would have consumed.
-            for hit in index.query(query_id, top_k=config.top_k):
-                if abs(timestamps_us[hit.image_id] - query.timestamp_microseconds) < gap_us:
-                    counters["rejected_by_time"] += 1
-            for_query: list[LoopCandidate] = []
-            for candidate in index.query(query_id, top_k=config.top_k, min_time_gap_us=gap_us, timestamps=timestamps_us):
-                counters["candidates_retrieved"] += 1
-                found: LoopCandidate | None = _verify_candidate(
-                    rig=rig,
-                    query=query,
-                    candidate=candidate,
-                    keyframe_by_id=keyframe_by_id,
-                    keypoints=keypoints,
-                    cameras=cameras,
-                    frames_meta=frames_meta,
-                    config=config,
-                    score_threshold=score_threshold,
-                    match_fn=match_fn,
-                    counters=counters,
-                )
-                if found is not None:
-                    for_query.append(found)
-            verified.extend(for_query)
-            banded.extend(select_best_candidates(for_query, config.candidate_band_seconds))
-
-    counters["after_banding"] = len(banded)
-    best_per_rig_pair: dict[tuple[int, int], LoopCandidate] = {}
-    for candidate in banded:
-        key: tuple[int, int] = (min(candidate.source_rig_id, candidate.target_rig_id), max(candidate.source_rig_id, candidate.target_rig_id))
-        incumbent: LoopCandidate | None = best_per_rig_pair.get(key)
-        if incumbent is None or candidate.num_inliers > incumbent.num_inliers:
-            best_per_rig_pair[key] = candidate
-    counters["after_deduplication"] = len(best_per_rig_pair)
+    shortlist: dict[tuple[int, int], RetrievalHit] = _shortlist_rig_pairs(
+        frames_meta, index, config, keyframe_by_id, timestamps_us, gap_seconds, score_threshold, counters
+    )
+    candidates: list[LoopCandidate] = _measure_rig_pairs(frames_meta, database_path, index, config, shortlist, match_fn, counters)
 
     edges: list[PoseGraphEdge] = []
-    for key in sorted(best_per_rig_pair):
-        candidate = best_per_rig_pair[key]
+    for candidate in candidates:
         information: Information6 = (
             loop_edge_information(float(candidate.num_inliers), config.loop_residual_weight)
             if config.use_stored_weights
@@ -756,86 +784,165 @@ def find_loop_edges(
             )
         )
     gated: list[PoseGraphEdge] = gate_loop_edges(edges, max_translation_m=config.max_translation_m, max_rotation_deg=config.max_rotation_deg)
-    return LoopClosureResult(edges=gated, diagnostics=diagnostics(len(gated)), candidates=verified)
+    return LoopClosureResult(edges=gated, diagnostics=diagnostics(len(gated)), candidates=candidates)
 
 
-def _verify_candidate(
-    rig: RigFrame,
-    query: KeyframeMeta,
-    candidate: Candidate,
-    keyframe_by_id: Mapping[int, KeyframeMeta],
-    keypoints: Mapping[int, Keypoints],
-    cameras: Mapping[int, pycolmap.Camera],
+def _shortlist_rig_pairs(
     frames_meta: FramesMeta,
+    index: RetrievalIndex,
     config: LoopClosureConfig,
+    keyframe_by_id: Mapping[int, KeyframeMeta],
+    timestamps_us: Mapping[int, int],
+    gap_seconds: float,
     score_threshold: float,
-    match_fn: MatchFunction,
     counters: dict[str, int],
-) -> LoopCandidate | None:
-    """Run one candidate through the score, rig, match, geometry, `is_good` and scale gates.
+) -> dict[tuple[int, int], RetrievalHit]:
+    """Retrieve, gate, band and deduplicate down to one hit per unordered rig pair.
 
     Args:
-        rig: Rig frame the query keyframe belongs to.
-        query: The query keyframe's metadata.
-        candidate: One retrieval hit.
-        keyframe_by_id: Every keyframe, indexed by id.
-        keypoints: Keypoint pixels per keyframe id.
-        cameras: Calibrated `pycolmap.Camera` per `camera_params_id`.
-        frames_meta: The parsed metadata, for the rig extrinsics.
+        frames_meta: The parsed metadata.
+        index: The retrieval index.
         config: Gates and thresholds.
-        score_threshold: The resolved `good_score_threshold` for the index's backend.
+        keyframe_by_id: Every keyframe, indexed by id.
+        timestamps_us: Capture time per keyframe id.
+        gap_seconds: The temporal gate actually applied.
+        score_threshold: The resolved retrieval score gate.
+        counters: Diagnostic counters, mutated in place.
+
+    Returns:
+        The best-scoring hit per unordered rig pair, keyed by that pair.
+    """
+    query_camera_ids: set[int] = _left_camera_ids(frames_meta, config)
+    gap_us: int = round(gap_seconds * MICROSECONDS_PER_SECOND)
+    indexed: set[int] = set(index.image_ids)
+
+    banded: list[RetrievalHit] = []
+    for rig in frames_meta.rig_frames():
+        for query_id in rig.keyframe_ids:
+            query: KeyframeMeta = keyframe_by_id[query_id]
+            if query.camera_params_id not in query_camera_ids or query_id not in indexed:
+                continue
+            counters["queries"] += 1
+            # The blob applies the time gate AFTER retrieval, so temporal neighbours eat
+            # slots out of its top-20 and it needs an early abort when more than half the
+            # hits are too close (spec §6.4). Pushing the gate into the index instead keeps
+            # all `top_k` slots useful; the ungated query is issued only to report how many
+            # hits the gate would have consumed.
+            for hit in index.query(query_id, top_k=config.top_k):
+                if abs(timestamps_us[hit.image_id] - query.timestamp_microseconds) < gap_us:
+                    counters["rejected_by_time"] += 1
+            for_query: list[RetrievalHit] = []
+            for candidate in index.query(query_id, top_k=config.top_k, min_time_gap_us=gap_us, timestamps=timestamps_us):
+                counters["candidates_retrieved"] += 1
+                if candidate.score < score_threshold:
+                    counters["rejected_by_score"] += 1
+                    continue
+                target: KeyframeMeta | None = keyframe_by_id.get(candidate.image_id)
+                if target is None:
+                    continue
+                if target.synced_sample_id == rig.synced_sample_id:
+                    counters["rejected_by_same_rig"] += 1
+                    continue
+                for_query.append(
+                    RetrievalHit(
+                        query_keyframe_id=query_id,
+                        candidate_keyframe_id=target.keyframe_id,
+                        source_rig_id=rig.synced_sample_id,
+                        target_rig_id=target.synced_sample_id,
+                        score=candidate.score,
+                        delta_seconds=(query.timestamp_microseconds - target.timestamp_microseconds) / MICROSECONDS_PER_SECOND,
+                    )
+                )
+            banded.extend(select_best_candidates(for_query, config.candidate_band_seconds))
+
+    counters["after_banding"] = len(banded)
+    shortlist: dict[tuple[int, int], RetrievalHit] = {}
+    for hit in banded:
+        key: tuple[int, int] = (min(hit.source_rig_id, hit.target_rig_id), max(hit.source_rig_id, hit.target_rig_id))
+        incumbent: RetrievalHit | None = shortlist.get(key)
+        if incumbent is None or hit.score > incumbent.score:
+            shortlist[key] = hit
+    counters["after_deduplication"] = len(shortlist)
+    return shortlist
+
+
+def _measure_rig_pairs(
+    frames_meta: FramesMeta,
+    database_path: Path,
+    index: RetrievalIndex,
+    config: LoopClosureConfig,
+    shortlist: Mapping[tuple[int, int], RetrievalHit],
+    match_fn: MatchFunction,
+    counters: dict[str, int],
+) -> list[LoopCandidate]:
+    """Run the metric rig-to-rig estimator over the shortlisted rig pairs.
+
+    Pairs are visited in source-rig order so that one source rig frame triangulates its
+    local map once however many candidates it has.
+
+    Args:
+        frames_meta: The parsed metadata.
+        database_path: COLMAP database holding the keypoints.
+        index: The retrieval index, for the set of images that carry descriptors.
+        config: Gates and thresholds.
+        shortlist: The best hit per unordered rig pair.
         match_fn: The injected matcher.
         counters: Diagnostic counters, mutated in place.
 
     Returns:
-        The verified candidate, or None when any gate rejected it.
+        One verified candidate per rig pair that passed every gate, in rig-pair order.
+
+    Raises:
+        FileNotFoundError: When `database_path` does not exist.
     """
-    if candidate.score < score_threshold:
-        counters["rejected_by_score"] += 1
-        return None
-    target: KeyframeMeta | None = keyframe_by_id.get(candidate.image_id)
-    if target is None or candidate.image_id not in keypoints:
-        counters["rejected_no_matches"] += 1
-        return None
-    if target.synced_sample_id == rig.synced_sample_id:
-        counters["rejected_by_same_rig"] += 1
-        return None
+    keypoints: dict[int, Keypoints] = _read_keypoints(database_path, index.image_ids)
+    geometry: RigGeometry = rig_geometry(frames_meta)
+    rig_index: RigFrameIndex = rig_frame_index(frames_meta)
+    pose_config: RigPoseConfig = rig_pose_config(config)
+    images: RigImageCache = build_image_cache(rig_index, geometry, keypoints)
 
-    matches: Matches = np.asarray(match_fn(query.keyframe_id, target.keyframe_id))
-    if matches.ndim != 2 or matches.shape[0] <= config.min_inliers:
-        counters["rejected_no_matches"] += 1
-        return None
+    candidates: list[LoopCandidate] = []
+    local_map: RigLandmarks | None = None
+    current_source: int | None = None
+    for key in sorted(shortlist, key=lambda pair: (shortlist[pair].source_rig_id, pair)):
+        hit: RetrievalHit = shortlist[key]
+        if hit.source_rig_id != current_source:
+            current_source = hit.source_rig_id
+            local_map = triangulate_rig_landmarks(hit.source_rig_id, rig_index, geometry, keypoints, match_fn, pose_config, images)
+        outcome: RigPoseOutcome = estimate_rig_relative_pose(
+            hit.source_rig_id,
+            hit.target_rig_id,
+            index=rig_index,
+            geometry=geometry,
+            keypoints=keypoints,
+            match_fn=match_fn,
+            config=pose_config,
+            landmarks=local_map,
+            cache=images,
+        )
+        if outcome.estimate is None:
+            counters[REJECTION_COUNTER[outcome.rejection]] += 1
+            continue
+        estimate: RigPoseEstimate = outcome.estimate
+        if not is_good_match(estimate.num_inliers, estimate.num_observations, config):
+            counters["rejected_by_is_good"] += 1
+            continue
+        counters["verified"] += 1
+        candidates.append(
+            LoopCandidate(
+                query_keyframe_id=hit.query_keyframe_id,
+                candidate_keyframe_id=hit.candidate_keyframe_id,
+                source_rig_id=hit.source_rig_id,
+                target_rig_id=hit.target_rig_id,
+                score=hit.score,
+                delta_seconds=hit.delta_seconds,
+                num_matches=estimate.num_observations,
+                num_inliers=estimate.num_inliers,
+                num_landmarks=estimate.num_landmarks,
+                direction_disagreement_deg=estimate.direction_disagreement_deg,
+                source_T_target=estimate.source_T_target,
+            )
+        )
+    return candidates
 
-    estimate: tuple[pycolmap.Rigid3d, int] | None = estimate_relative_camera_pose(
-        cameras[query.camera_params_id],
-        keypoints[query.keyframe_id],
-        cameras[target.camera_params_id],
-        keypoints[target.keyframe_id],
-        matches,
-        config,
-    )
-    if estimate is None:
-        counters["rejected_by_geometry"] += 1
-        return None
-    direction_only, num_inliers = estimate
-    if not is_good_match(num_inliers, int(matches.shape[0]), config):
-        counters["rejected_by_is_good"] += 1
-        return None
 
-    source_T_target: pycolmap.Rigid3d | None = _metric_relative_rig_pose(direction_only, query, target, frames_meta.cameras, config)
-    if source_T_target is None:
-        counters["rejected_by_scale"] += 1
-        return None
-
-    counters["verified"] += 1
-    return LoopCandidate(
-        query_keyframe_id=query.keyframe_id,
-        candidate_keyframe_id=target.keyframe_id,
-        source_rig_id=rig.synced_sample_id,
-        target_rig_id=target.synced_sample_id,
-        score=candidate.score,
-        delta_seconds=(query.timestamp_microseconds - target.timestamp_microseconds) / MICROSECONDS_PER_SECOND,
-        num_matches=int(matches.shape[0]),
-        num_inliers=num_inliers,
-        source_T_target=source_T_target,
-    )
