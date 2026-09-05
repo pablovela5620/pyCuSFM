@@ -613,8 +613,25 @@ The blob spends 705.7 s of its 1133.5 s on stages 2, 3 and 4, which exist only t
 closures. colsfm skips all three by default, which is most of the 0.37x. Matching is the one
 stage that is slower, at 2.89x here and 3.63x on Galileo.
 
-RoboCap with loop closure: not run. The estimator rewrite landed (deviation 6) but the
-stage stays off by default, so there is no run to compare.
+**RoboCap with loop closure** (`--loop-closure`, measured in
+`data/bench/robocap_loops_compare.md`; the blob reference always runs with loop closure):
+
+| | blob | colsfm, no loops | colsfm, `--loop-closure` |
+|---|---|---|---|
+| loop edges in the pose graph | 90 | 0 | 74 |
+| vs input trajectory (mm RMSE / max) | 334.1 / 627.3 | 461.3 / 1134.9 | **312.7 / 608.4** |
+| would-be scale | 0.9401 | 0.9306 | 0.9402 |
+| rig poses vs blob (mm RMSE / max) | — | 238.3 / 796.4 | **146.4 / 289.6** |
+| total runtime | 1133.5 s | 421.8 s (0.37x) | 1723.0 s (1.52x) |
+
+With loops the colsfm trajectory sits closer to the input than the blob's does and its rig
+poses land within 146 mm of the blob's. Neither is ground truth (RoboCap ships none), but
+this is the direction the blob's loop closure moves the trajectory, and the 2x runtime bound
+still holds. The cost is the loop stage (721 s, of which most was re-matching 8 400 pairs
+stage 4 had already matched; the pipeline now skips those, not yet re-measured end to end)
+and a larger bundle adjustment (684 s against 138 s without loops). Loop closure stays off
+by default because the Galileo-class case gains nothing from it; for long sequences with
+revisits, turn it on.
 
 ### Where colsfm deviates from the blob
 

@@ -138,5 +138,8 @@ blob's 334.10 mm.
 2. **Matching is about 3x the blob.** 3.63x on Galileo (8.15 s against 2.25 s) and 2.89x on
    RoboCap (152.03 s against 52.53 s). It is the only stage that is slower, and it is now the
    largest single term in a colsfm run.
-3. **RoboCap with loop closure.** Blocked on item 1; loop closure stays off by default until
-   the estimator lands.
+3. **RoboCap with loop closure: measured.** With the rig-resection estimator (74 edges),
+   colsfm's disagreement with the input trajectory drops from 461 mm to 313 mm (blob: 334 mm)
+   and its rig poses land 146 mm RMSE from the blob's, at 1.52x the blob's runtime. Loop
+   closure stays off by default; the estimator's rotation gap (item 1) and the loop stage's
+   cost (721 s, mostly matching) are what remain.

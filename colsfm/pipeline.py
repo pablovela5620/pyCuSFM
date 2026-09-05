@@ -67,7 +67,7 @@ from serde.json import to_json
 
 from colsfm.cameras import colmap_cameras
 from colsfm.config import CusfmConfig, KeyframeSelectionConfig, PoseGraphConfig, read_config_directory
-from colsfm.database import ImagePair, create_database
+from colsfm.database import ImagePair, create_database, raw_match_counts
 from colsfm.export import (
     KEYFRAME_METADATA_SUBPATH,
     RUNTIME_CSV_NAME,
@@ -514,8 +514,15 @@ def _find_loop_edges(
         return LOOP_PROBE_MATCHES
 
     find_loop_edges(frames_meta, database_path, index, config, record_pair)
-    candidate_pairs: list[ImagePair] = sorted(requested)
-    print(f"[colsfm] loop closure: {len(candidate_pairs)} candidate pairs to match")
+    requested_pairs: list[ImagePair] = sorted(requested)
+    # Most requested pairs are the consecutive and stereo pairs stage 4 already matched
+    # (8 400 of 14 443 on RoboCap); matching them again would only cost time.
+    already_matched: dict[ImagePair, int] = raw_match_counts(database_path, requested_pairs)
+    candidate_pairs: list[ImagePair] = [pair for pair in requested_pairs if already_matched[pair] == 0]
+    print(
+        f"[colsfm] loop closure: {len(requested_pairs)} candidate pairs, "
+        f"{len(requested_pairs) - len(candidate_pairs)} already matched, {len(candidate_pairs)} to match"
+    )
     if candidate_pairs:
         match_pairs(database_path, candidate_pairs, matching_options)
 
@@ -536,9 +543,9 @@ def _find_loop_edges(
         f"{result.diagnostics.candidates_retrieved} retrieved, {result.diagnostics.rejected_by_score} below score, "
         f"{result.diagnostics.rejected_by_time} inside the {result.diagnostics.min_time_gap_seconds:.2f}s gap, "
         f"{result.diagnostics.rejected_by_geometry} failed geometry, {result.diagnostics.rejected_by_is_good} not good, "
-        f"{result.diagnostics.verified} verified over {len(candidate_pairs)} matched pairs"
+        f"{result.diagnostics.verified} verified over {len(requested_pairs)} matched pairs"
     )
-    return LoopClosureStageResult(edges=edges, num_pairs_matched=len(candidate_pairs))
+    return LoopClosureStageResult(edges=edges, num_pairs_matched=len(requested_pairs))
 
 
 def run_pipeline(options: PipelineOptions) -> PipelineSummary:
