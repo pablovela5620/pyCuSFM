@@ -546,6 +546,7 @@ shipped configs, and A/B re-runs of the real binaries. `colsfm/` implements the 
 | 9 | **Vocabulary-tree retrieval above 500 images** | `RetrievalConfig.backend` is `auto`: brute-force mutual-nearest-neighbour voting at or below 500 images, a hierarchical k-means vocabulary with TF-IDF and the DBoW2 L1 score above it. Brute force is quadratic in images times descriptors (gotcha 12). The vocab backend builds in 42 s on RoboCap and answers all 4528 queries in 1.5 s, and it recovers every one of the blob's 90 loop pairs. |
 | 10 | **Loop closure off by default** | On Galileo, turning loops on moves camera positions by 5 to 13 mm against a 5 mm ATE budget: a short, low-drift sweep has nothing for a loop to fix. On RoboCap the retrieval is right and `colsfm.loop_pose`'s metric rig-to-rig measurement takes the pose graph from 609.0 mm to **408.1 mm** against the blob's PGO, past the 460.8 mm of the input trajectory alone — but not past the 135.0 mm the blob's own edges reach, and the remaining gap is a 6.5 deg rotation disagreement two independent image-based estimators put on the blob's side (see the deviations below). `LoopClosureConfig.enabled` stays False and the caller decides per dataset. |
 | 11 | **Its own pixi environment and solve group** | `colsfm` is `no-default-feature`, so the fragile CUDA 13 plus TensorRT solve of the default environment is untouched. Verified: the `default`, `raco` and `bench` blocks of `pixi.lock` are byte-identical to `HEAD`, and no package was removed. |
+| 12 | **Extrinsic refinement as block-coordinate descent, not one Ceres problem** | cuSFM's `--optimize_extrinsics` pass minimises reprojection plus an absolute extrinsic prior (8 blocks) and an inter-camera relative extrinsic prior (777 blocks) in a single Ceres problem. pycolmap's `BundleAdjuster` has no prior term and its problem cannot be extended from standalone pyceres (decision 4), while 30 000 Python reprojection residual blocks in pyceres would be minutes per iteration. `colsfm.extrinsic_refinement` therefore alternates: **(A)** extrinsics only in pyceres with poses and points frozen, one *vectorised* block per camera holding all `2 * n_obs` of its residuals with the robust loss applied inside `Evaluate`, plus both priors; **(B)** pycolmap's own bundle adjustment with `sensor_from_rig` fixed. Ceres' `Corrector` reduces to plain scaling whenever `rho'' <= 0`, so the in-block Cauchy is exact rather than approximate; the residual is returned in square-root form `sqrt(rho(s)/s) * r`, which reports Ceres' cost and Ceres' gradient exactly. The price is linear convergence: 19 rounds and 9.9 s on Galileo where one joint solve would take a handful of iterations (deviation 9). |
 
 ### Results: blob against colsfm
 
@@ -683,34 +684,67 @@ revisits, turn it on.
    COLMAP's own default.
 8. **No BoW artifacts.** Nothing downstream reads the word ids, the tree, the IDF values or the
    file formats, so `colsfm.retrieval` keeps only the ranked candidate list.
-9. **Extrinsic refinement is unregularised, and it shows.** cuSFM regularises its second
-   `keypoints_mapper_main` pass with absolute-extrinsic priors (the paper's Eq. 14, 8
-   `absolute_extrinsic` blocks on Galileo) and relative-extrinsic constraints between
-   cameras (Eq. 6, 777 `relative_extrinsic` blocks), so its refined extrinsics stay near the
-   factory calibration. pycolmap's `BundleAdjuster` can express neither, and its Ceres
-   problem cannot be extended from standalone pyceres (the registry split, decision 4), so
-   colsfm optimises reprojection alone. Measured on the 226-keyframe Galileo run, relative
-   extrinsics `cam0_T_cam_i` against `data/r2b_galileo/frames_meta.json`:
+9. **Extrinsic refinement needs the blob's priors; `colsfm.extrinsic_refinement` carries
+   them.** cuSFM regularises its second `keypoints_mapper_main` pass with absolute-extrinsic
+   priors (the paper's Eq. 14, 8 `absolute_extrinsic` blocks on Galileo) and relative-extrinsic
+   constraints between cameras (Eq. 6, 777 `relative_extrinsic` blocks). pycolmap's
+   `BundleAdjuster` can express neither and its Ceres problem cannot be extended from
+   standalone pyceres (the registry split, decision 4), so **optimising reprojection alone
+   overfits**: relative extrinsics `cam0_T_cam_i` walked 9.3 to 234.5 mm against the blob's
+   1.1 to 10.9 mm, with the shift directions mostly *opposed* to the blob's (cosines -0.91,
+   -0.49, +0.12, +0.98), buying 1.334 px -> 0.861 px of reprojection error and costing 4.33 mm
+   -> 5.70 mm of ATE, the one acceptance bound that run failed.
 
-   | | blob | colsfm | cosine of the two shift directions |
-   |---|---|---|---|
-   | worst translation | 10.9 mm | **234.5 mm** | |
-   | worst rotation | 1.40 deg | **2.55 deg** | |
-   | `back_stereo_camera_right` | 1.6 mm | 9.3 mm | -0.91 |
-   | `front_stereo_camera_left` | 10.9 mm | 68.0 mm | -0.49 |
-   | `left_stereo_camera_left` | 1.7 mm | 234.5 mm | +0.12 |
-   | `right_stereo_camera_right` | 1.1 mm | 116.3 mm | +0.98 |
+   `colsfm/extrinsic_refinement.py` replaces that pass with the two priors in pyceres,
+   alternated with pycolmap's bundle adjustment (extrinsics free / poses and points free).
+   Two things had to be measured rather than read:
 
-   The two disagree in direction as well as in size: no camera's shift is both large and
-   aligned. What the free extrinsics buy is reprojection error, 1.331 px down to **0.861 px**;
-   what they cost is trajectory accuracy, ATE against ground truth 4.33 mm up to **5.70 mm**,
-   which is the only acceptance bound the refined run fails. On Galileo's 0.66 m sweep only a
-   stereo pair's own relative extrinsic is well determined — the reference camera's partner
-   moves 4.4 mm, the six cameras facing other directions 64 to 127 mm — and at the 34-keyframe
-   spacing, with a third of the observations, the front pair walks **2.17 m**. The flag stays
-   and stays off by default. The follow-up is a pyceres refinement pass carrying the
-   configuration's own extrinsic priors
-   (`data/cusfm_configs/loop-closure-fixed/vision_mapping_config.pb.txt`, spec §7).
+   * **777 is not `4 stereo pairs x N frames`.** Galileo's 29 rig frames hold 8, 8, ..., 6 and
+     4 cameras, and `sum C(cameras in frame, 2) = 27*28 + 15 + 6 = 777` exactly. The blob adds
+     one constraint per *unordered pair of cameras that fired together*, once per rig frame —
+     every pair, not only the declared stereo ones. Because a rig's extrinsics are shared
+     across frames all of a pair's blocks carry the same residual, so colsfm builds 28 blocks
+     with a multiplicity-scaled Cauchy loss, which is exactly equivalent.
+   * **The sigmas are `extrinsic_error_meters: 0.01` / `extrinsic_error_degrees: 2`**, not
+     `relative_pose_*`. Recomputing the blob's own logged group costs from its exported
+     extrinsics with `CauchyLoss(1.0)` gives `absolute_extrinsic = 0.7230` against its logged
+     **0.722949** and `relative_extrinsic = 77.8` against its logged 87.5; the `relative_pose_*`
+     pair (0.1 m / 5 deg) gives 0.09 and 10.5, eight times too small in both.
+
+   Measured on the same 226-keyframe Galileo run, `cam0_T_cam_i` against
+   `data/r2b_galileo/frames_meta.json`:
+
+   | camera | blob | colsfm regularised | colsfm unregularised | cosine (blob, regularised) |
+   |---|---|---|---|---|
+   | `back_stereo_camera_right` | 1.62 mm / 0.11 deg | 1.16 mm / 0.08 deg | 9.3 mm | -0.88 |
+   | `front_stereo_camera_left` | 10.91 mm / 1.34 deg | 2.77 mm / 0.16 deg | 68.0 mm | +0.62 |
+   | `front_stereo_camera_right` | 10.40 mm / 1.40 deg | 1.50 mm / 0.21 deg | | +0.91 |
+   | `left_stereo_camera_left` | 1.65 mm / 1.07 deg | 1.16 mm / 0.23 deg | 234.5 mm | -0.10 |
+   | `left_stereo_camera_right` | 3.40 mm / 1.10 deg | 1.48 mm / 0.27 deg | | +0.62 |
+   | `right_stereo_camera_left` | 2.26 mm / 1.25 deg | 1.55 mm / 0.11 deg | | +0.57 |
+   | `right_stereo_camera_right` | 1.14 mm / 1.12 deg | 2.09 mm / 0.27 deg | 116.3 mm | -0.94 |
+
+   Four of the seven cosines are now positive (against a mostly-opposed unregularised run) and
+   four of the seven magnitudes are inside 2x of the blob's. **Reprojection 0.898 px, ATE
+   against ground truth 4.281 mm — better than the fixed-extrinsic run's 4.327 mm and far
+   better than the unregularised 5.70 mm — and 4/4 acceptance bounds**
+   (`data/bench/galileo_ext_compare.md`). The stage costs 9.9 s of a 28.5 s run.
+
+   What is *not* matched is the front stereo pair, which the blob moves 10.4-10.9 mm and
+   colsfm moves 1.5-2.8 mm. The priors are not the reason: at colsfm's solution the same
+   whitened cost functions read `absolute_extrinsic = 0.0585` and `relative_extrinsic = 16.4`,
+   8 % and 21 % of the blob's, so there is prior budget left unspent. With 25 363
+   observations against the blob's ~42 600, colsfm's reprojection term simply does not ask
+   for a larger extrinsic — and on Galileo's 0.66 m sweep the front pair is the
+   worst-determined direction, the one the unregularised solve walked 68 mm and, at
+   34-keyframe spacing, 2.17 m. The flag stays off by default, since against a
+   fixed-extrinsic run it now buys 0.4 px and costs nothing.
+
+   The alternation is block-coordinate descent and converges only linearly: per-round motion
+   decays by ~0.88 (0.47, 0.25, 0.18, 0.15, ... mm) and reaches 0.1 mm / 0.005 deg after 19
+   rounds. Three rounds stop at a third of the final move (ATE 4.38 mm, 0.956 px), so the default
+   ceiling is 20 with the tolerance doing the stopping. Folding the rig poses into the pyceres
+   solve — one vectorised block per image rather than per camera — would remove that.
 10. **The LightGlue score threshold is 0.1, not 0.3.** The blob's 0.3 is calibrated for its own
    engine. Against COLMAP's graph, 0.3 makes the low-texture `left_stereo_*` pairs collapse:
    22 of 331 Galileo pairs come back empty (6.6 %) against the blob's 8 (2.4 %).
@@ -792,7 +826,11 @@ revisits, turn it on.
     raises rather than accepting a refinement request it cannot honour. With the rig origin
     on the gauge camera the same 20 mm perturbation comes back to **0.70 mm / 0.0024 deg**.
     The pycolmap probe suite missed this because its synthetic rig already has a camera
-    reference.
+    reference. A second trap sits next to it: a Ceres residual block whose every
+    parameter block is constant is evaluated by `Program::RemoveFixedBlocks` with a **null**
+    residual pointer, and pyceres 2.6's Python trampoline segfaults on it — which is why
+    `colsfm.extrinsic_refinement` gives the pinned camera no absolute-prior block where the
+    blob counts an (inert) eighth.
 14. **Brute-force retrieval collapses at 4528 images.** The cost is
     `(n_images * n_descriptors)^2 * 128` inner products, so `max_total_descriptors` divides a
     fixed budget across the images. Galileo's 226 images get 256 descriptors each and the
@@ -822,6 +860,8 @@ Both tasks call `python -m colsfm run`, which takes the same `--input-dir` as
 --max-matches-per-pair 500     # verified matches kept per pair; None keeps every inlier
 --ba-num-threads 1             # a bit-reproducible Ceres solve
 --optimize-extrinsics          # second mapping pass with sensor_from_rig free (deviation 9)
+--no-regularised-extrinsics    # ... without cuSFM's extrinsic priors, which overfits
+--extrinsic-refinement-rounds  # ceiling on the alternation; 20, stops on its own tolerances
 ```
 
 `python -m colsfm stage --stage pair_selection` runs a metadata-only stage. It needs neither

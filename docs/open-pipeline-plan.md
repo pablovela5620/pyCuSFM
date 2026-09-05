@@ -115,11 +115,16 @@ of the blob's RoboCap loop pairs.
 `--optimize-extrinsics` runs the blob's second `keypoints_mapper_main` pass — the same
 matches and the same pose-graph poses again, with `sensor_from_rig` free — and writes the
 refined `sensor_to_vehicle_transform` into `kpmap/keyframes/frames_meta.json` and into
-`summary.json`. It is measured (`data/bench/galileo_ext_compare.md`) and **off by default**:
-without cuSFM's absolute and relative extrinsic priors, which pycolmap's bundle adjuster
-cannot express, it trades trajectory accuracy for reprojection error — 0.861 px against
-1.334 px, but 5.70 mm ATE against 4.33 mm, and extrinsics moving 234 mm where the blob moves
-11 mm. See NOTES.md, colsfm deviation 9.
+`summary.json`. It is **regularised**: `colsfm.extrinsic_refinement` carries cuSFM's absolute
+(Eq. 14) and inter-camera relative (Eq. 6) extrinsic priors, which pycolmap's bundle adjuster
+cannot express, in a pyceres solve alternated with pycolmap's bundle adjustment. Measured on
+Galileo (`data/bench/galileo_ext_compare.md`, NOTES.md deviation 9): **0.898 px** reprojection
+and **4.28 mm** ATE, against 1.334 px / 4.33 mm with the extrinsics fixed and 0.861 px /
+5.70 mm unregularised — the priors buy back all of the trajectory accuracy the free
+extrinsics were costing, and keep the extrinsics inside 2.8 mm where the unregularised solve
+walked 234 mm. **4/4 acceptance bounds**, 9.9 s for the stage. `--no-regularised-extrinsics`
+keeps the plain pycolmap path for comparison. The flag stays off by default: the gain over a
+fixed-extrinsic run is 0.4 px of reprojection and 0.02 mm of ATE.
 
 **Acceptance, Galileo** (`data/bench/galileo_compare.md`), B relative to A:
 
@@ -147,15 +152,17 @@ blob's 334.10 mm.
 2. **Matching is about 3x the blob.** 3.63x on Galileo (8.15 s against 2.25 s) and 2.89x on
    RoboCap (152.03 s against 52.53 s). It is the only stage that is slower, and it is now the
    largest single term in a colsfm run.
-3. **Extrinsic priors for the refinement pass.** `--optimize-extrinsics` now really moves the
-   rig extrinsics (it was a silent no-op; NOTES.md gotcha 13), but only reprojection
-   constrains them. cuSFM adds absolute-extrinsic residuals (paper Eq. 14) and
-   relative-extrinsic constraints between cameras (Eq. 6), whose sigmas are in
-   `data/cusfm_configs/loop-closure-fixed/vision_mapping_config.pb.txt`. pycolmap's
-   `BundleAdjuster` takes neither and its Ceres problem cannot be extended from standalone
-   pyceres, so this needs a pyceres refinement pass in the shape of `colsfm.pose_graph`:
-   read the adjusted model out of pycolmap, solve extrinsics and rig poses against the
-   reprojection residual plus the two priors, write them back.
+3. **Extrinsic priors: done, with one gap left.** `colsfm.extrinsic_refinement` carries both
+   priors at the config's own sigmas (`extrinsic_error_meters: 0.01`,
+   `extrinsic_error_degrees: 2`, identified by reproducing the blob's logged group costs to
+   four significant figures) and reproduces its 777-block relative-constraint arithmetic. What
+   is left is magnitude parity on the weakest-constrained cameras: the blob moves the front
+   stereo pair 10.4-10.9 mm against camera 0 and colsfm moves it 1.5-2.8 mm. At the solution
+   colsfm sits at 8 % of the blob's absolute-prior cost and 21 % of its relative-prior cost, so
+   the priors are not what holds it back — with 25 363 observations against the blob's ~42 600,
+   colsfm's reprojection term simply does not ask for a larger extrinsic. The block-coordinate
+   alternation is also only linearly convergent (19 rounds to reach 0.1 mm / 0.005 deg on
+   Galileo); folding the rig poses into the pyceres solve would close that half.
 4. **RoboCap with loop closure: measured.** With the rig-resection estimator (74 edges),
    colsfm's disagreement with the input trajectory drops from 461 mm to 313 mm (blob: 334 mm)
    and its rig poses land 146 mm RMSE from the blob's, at 1.52x the blob's runtime. Loop

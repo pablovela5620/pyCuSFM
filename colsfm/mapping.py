@@ -455,7 +455,7 @@ def load_correspondences(
     )
 
 
-def _registered_image_ids(reconstruction: pycolmap.Reconstruction) -> list[int]:
+def registered_image_ids(reconstruction: pycolmap.Reconstruction) -> list[int]:
     """Image ids belonging to a registered frame, ascending.
 
     Args:
@@ -652,7 +652,7 @@ def _filter_points(
     )
 
 
-def _solve(
+def solve_bundle_adjustment(
     reconstruction: pycolmap.Reconstruction,
     ba_options: pycolmap.BundleAdjustmentOptions,
     gauge_frame_id: int,
@@ -678,7 +678,7 @@ def _solve(
         The solver summary and the seconds the solve took.
     """
     config: pycolmap.BundleAdjustmentConfig = pycolmap.BundleAdjustmentConfig()
-    for image_id in _registered_image_ids(reconstruction):
+    for image_id in registered_image_ids(reconstruction):
         config.add_image(image_id)
     config.set_constant_rig_from_world_pose(gauge_frame_id)
     if fixed_camera_params_id is not None:
@@ -814,7 +814,7 @@ def run_mapping(
     """
     resolved_options: MappingOptions = MappingOptions() if options is None else options
     started: float = time.perf_counter()
-    image_ids: list[int] = _registered_image_ids(reconstruction)
+    image_ids: list[int] = registered_image_ids(reconstruction)
     if not image_ids:
         raise ValueError("The reconstruction has no registered frames to map")
     resolved_gauge_frame_id: int = (
@@ -872,7 +872,7 @@ def run_mapping(
             (num_merged + num_completed + filtered.total()) / num_observations if num_observations else 0.0
         )
 
-        summary, solve_seconds = _solve(reconstruction, ba_options, resolved_gauge_frame_id, fixed_camera_params_id)
+        summary, solve_seconds = solve_bundle_adjustment(reconstruction, ba_options, resolved_gauge_frame_id, fixed_camera_params_id)
         bundle_adjustment_seconds += solve_seconds
         # The guards run on both sides of the solve. Before it, so Ceres never linearises a
         # NaN; after it, because a *converged* solve can still walk a weakly-constrained

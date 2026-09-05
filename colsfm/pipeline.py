@@ -52,7 +52,6 @@ Ordering notes worth knowing before reading the code:
 from __future__ import annotations
 
 import contextlib
-import dataclasses
 import subprocess
 import time
 from collections.abc import Iterator, Mapping, Sequence
@@ -80,6 +79,7 @@ from colsfm.export import (
     write_pose_files,
     write_tum_file,
 )
+from colsfm.extrinsic_refinement import ExtrinsicRefinementOptions, ExtrinsicRefinementResult, refine_extrinsics
 from colsfm.features import ExtractionReport, FeatureOptions, extract_features
 from colsfm.frames_meta import CameraParams, FramesMeta, KeyframeMeta, RigFrame, read_frames_meta, write_frames_meta
 from colsfm.geometry import TumPose, relative_rotation_degrees
@@ -189,6 +189,13 @@ class PipelineOptions:
     """Rig grouping window in microseconds; the isaac demo's value, not the gflag default."""
     optimize_extrinsics: bool = False
     """Refine `sensor_from_rig` during bundle adjustment; cuSFM's `--optimize_extrinsics`."""
+    regularised_extrinsics: bool = True
+    """Carry the blob's extrinsic priors through `colsfm.extrinsic_refinement`. False falls
+    back to pycolmap's own rig bundle adjustment, which has no prior terms and on Galileo
+    overfits (NOTES.md deviation 9). Only read when `optimize_extrinsics` is set."""
+    extrinsic_refinement_rounds: int = 20
+    """Ceiling on the extrinsics-then-poses rounds the regularised refinement may take; it
+    stops early on its own tolerances, after 19 rounds and 9.9 s on Galileo."""
     loop_closure: bool = False
     """Run retrieval-based loop closure. Off by default: the plan decides per dataset,
     and on the 0.93 s Galileo sweep loops move poses further than the ATE budget allows."""
@@ -302,6 +309,10 @@ class PipelineSummary:
     """Whether the run made the second, extrinsic-refining mapping pass."""
     extrinsic_changes: tuple[ExtrinsicChange, ...] = ()
     """Per-camera extrinsic movement the refinement produced; empty when the flag is off."""
+    regularised_extrinsics: bool = True
+    """Whether that refinement carried the extrinsic priors."""
+    extrinsic_refinement_rounds_run: int = 0
+    """Rounds the regularised refinement actually took before it converged."""
 
 
 @dataclass(slots=True)
@@ -787,24 +798,39 @@ def run_pipeline(options: PipelineOptions) -> PipelineSummary:
     # sensor owns no images — see `colsfm.reconstruction`.
     mapped_meta: FramesMeta = pose_graph_meta
     changes: tuple[ExtrinsicChange, ...] = ()
+    rounds_run: int = 0
     if options.optimize_extrinsics:
         with timed_stage(clock, EXTRINSIC_REFINEMENT_STAGE):
             reference_camera_params_id: int = gauge_camera_params_id(pose_graph_meta)
             reference: RigReference = rig_reference(pose_graph_meta, reference_camera_params_id)
-            mapping = run_mapping(
+            refinement: ExtrinsicRefinementResult = refine_extrinsics(
                 build_reconstruction(pose_graph_meta, reference_camera_params_id=reference_camera_params_id),
                 options.database_path,
                 config.vision_mapping,
                 config.vision_mapping.bundle_adjustment,
-                dataclasses.replace(mapping_options, optimize_extrinsics=True),
-                rig_reference=reference,
+                mapping_options,
+                reference,
+                {camera_params_id: camera.vehicle_T_cam for camera_params_id, camera in pose_graph_meta.cameras.items()},
+                ExtrinsicRefinementOptions(
+                    regularised=options.regularised_extrinsics,
+                    num_rounds=options.extrinsic_refinement_rounds,
+                    extrinsic_translation_sigma_m=config.vision_mapping.bundle_adjustment.extrinsic_error_meters,
+                    extrinsic_rotation_sigma_deg=config.vision_mapping.bundle_adjustment.extrinsic_error_degrees,
+                    reprojection_sigma_px=config.vision_mapping.bundle_adjustment.reprojection_error_standard_deviation,
+                    use_absolute_prior=config.vision_mapping.use_camera_extrinsic_constraint,
+                    use_relative_prior=config.vision_mapping.use_camera_extrinsic_constraint,
+                    max_num_iterations=config.vision_mapping.bundle_adjustment.max_num_iterations,
+                ),
             )
-            assert mapping.refined_extrinsics is not None, "run_mapping returns them whenever it refines"
-            changes = extrinsic_changes(pose_graph_meta, mapping.refined_extrinsics, reference_camera_params_id)
-            mapped_meta = pose_graph_meta.with_extrinsics(mapping.refined_extrinsics)
+            mapping = refinement.mapping
+            rounds_run = len(refinement.rounds)
+            changes = extrinsic_changes(pose_graph_meta, refinement.refined_extrinsics, reference_camera_params_id)
+            mapped_meta = pose_graph_meta.with_extrinsics(refinement.refined_extrinsics)
             _print_mapping(mapping)
             print(
-                f"[colsfm] extrinsic refinement: rig origin on camera {reference_camera_params_id} "
+                f"[colsfm] extrinsic refinement "
+                f"({'regularised' if refinement.regularised else 'unregularised'}): rig origin on camera "
+                f"{reference_camera_params_id} "
                 f"({pose_graph_meta.cameras[reference_camera_params_id].sensor_name}), moves "
                 + ", ".join(f"{change.camera_params_id}={change.translation_change_mm:.2f} mm" for change in changes)
             )
@@ -846,6 +872,8 @@ def run_pipeline(options: PipelineOptions) -> PipelineSummary:
         stage_seconds=dict(clock.seconds_by_stage),
         total_seconds=time.perf_counter() - started,
         optimize_extrinsics=options.optimize_extrinsics,
+        regularised_extrinsics=options.regularised_extrinsics,
+        extrinsic_refinement_rounds_run=rounds_run,
         extrinsic_changes=changes,
     )
     (options.output_dir / SUMMARY_NAME).write_text(to_json(summary) + "\n")

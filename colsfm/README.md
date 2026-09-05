@@ -28,7 +28,8 @@ results.
 | `loop_pose.py` | The metric rig-to-rig relative pose a loop edge carries: a local triangulated map in the source rig frame, then generalized resection of the target rig. The replacement for `StereoPoseEstimator`. |
 | `pose_graph.py` | Rig-level pose graph optimisation on pyceres with a Python residual. The replacement for `pose_graph_main`. |
 | `reconstruction.py` | A `pycolmap.Reconstruction` built from `frames_meta.json`: the rig, the frames and the images. The rig's reference sensor is the vehicle body by default, or a named camera when `reference_camera_params_id` is given — which is what extrinsic refinement needs, because COLMAP freezes every `sensor_from_rig` of a rig whose reference sensor owns no images. `RigReference` inverts that change of basis. |
-| `mapping.py` | Triangulation and global bundle adjustment. The replacement for `keypoints_mapper_main`. With `optimize_extrinsics` it also refines the rig extrinsics, holding the gauge camera fixed, and returns them as `MappingResult.refined_extrinsics`. |
+| `mapping.py` | Triangulation and global bundle adjustment. The replacement for `keypoints_mapper_main`. With `optimize_extrinsics` it also refines the rig extrinsics through pycolmap's rig BA, holding the gauge camera fixed, and returns them as `MappingResult.refined_extrinsics` — the unregularised path, kept for comparison behind `--no-regularised-extrinsics`. |
+| `extrinsic_refinement.py` | Regularised rig-extrinsic refinement: cuSFM's absolute (Eq. 14) and inter-camera relative (Eq. 6) extrinsic priors in pyceres, alternated with pycolmap's own bundle adjustment. What `--optimize-extrinsics` runs by default, because pycolmap's rig BA carries no prior term. |
 | `export.py` | Writers for the four artifacts a cuSFM run leaves behind: the `sparse/` model, `kpmap/keyframes/frames_meta.json`, the TUM pose files and `runtime.csv`. The replacement for `kpmap_to_colmap`, `extract_pose_from_map_main` and `update_keyframe_pose_main`. |
 | `benchmark.py` | Metrics that compare two runs in the cuSFM output layout, plus the acceptance bounds. It reads both runs the same way and knows nothing about which producer wrote which. |
 | `bench_cli.py` | The tyro CLI over `benchmark`. Writes the markdown report, the JSON report and the Rerun recording. |
@@ -48,7 +49,7 @@ row per stage under these names:
 | 5 | `loop_closure` | `retrieval`, `loop_closure`, `loop_pose` | `generate_bow_*_main` + `generate_association_main` |
 | 6 | `pose_graph` | `pose_graph` | `pose_graph_main` |
 | 7 | `reconstruction` | `reconstruction`, `mapping` | `keypoints_mapper_main` |
-| 7b | `extrinsic_refinement` | `reconstruction`, `mapping` | `keypoints_mapper_main --optimize_extrinsics=True` (only with `--optimize-extrinsics`) |
+| 7b | `extrinsic_refinement` | `reconstruction`, `mapping`, `extrinsic_refinement` | `keypoints_mapper_main --optimize_extrinsics=True` (only with `--optimize-extrinsics`) |
 | 8 | `export` | `export` | `kpmap_to_colmap`, `extract_pose_from_map_main`, `update_keyframe_pose_main` |
 
 Two ordering notes matter when reading the code. Pair selection cannot see loop pairs: stage

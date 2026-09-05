@@ -224,7 +224,7 @@ def gate_loop_edges(edges: Sequence[PoseGraphEdge], max_translation_m: float, ma
 # ======================================================================================
 
 
-def _rotation_matrix(quat_xyzw: QuaternionXYZW, out: Matrix3) -> Matrix3:
+def rotation_matrix_from_quat_xyzw(quat_xyzw: QuaternionXYZW, out: Matrix3) -> Matrix3:
     """Write the rotation matrix of a unit quaternion `(x, y, z, w)` into `out`."""
     x, y, z, w = float(quat_xyzw[0]), float(quat_xyzw[1]), float(quat_xyzw[2]), float(quat_xyzw[3])
     tx, ty, tz = x + x, y + y, z + z
@@ -237,7 +237,7 @@ def _rotation_matrix(quat_xyzw: QuaternionXYZW, out: Matrix3) -> Matrix3:
     return out
 
 
-def _skew(vector: Vector3, out: Matrix3) -> Matrix3:
+def skew_matrix(vector: Vector3, out: Matrix3) -> Matrix3:
     """Write the skew-symmetric matrix of a 3-vector into `out`."""
     out[0, 0], out[0, 1], out[0, 2] = 0.0, -vector[2], vector[1]
     out[1, 0], out[1, 1], out[1, 2] = vector[2], 0.0, -vector[0]
@@ -263,14 +263,14 @@ def _log_so3(rotation: Matrix3, out: Vector3) -> float:
 
 def _inverse_right_jacobian(rotvec: Vector3, angle_rad: float, scratch: Matrix3) -> Matrix3:
     """Inverse right Jacobian of SO(3) at `rotvec`, i.e. `d log(Exp(phi) Exp(dphi)) / d dphi`."""
-    skew: Matrix3 = _skew(rotvec, scratch)
+    skew: Matrix3 = skew_matrix(rotvec, scratch)
     if angle_rad < 1e-6:
         return _IDENTITY_3 + 0.5 * skew
     coefficient: float = 1.0 / angle_rad**2 - (1.0 + np.cos(angle_rad)) / (2.0 * angle_rad * np.sin(angle_rad))
     return _IDENTITY_3 + 0.5 * skew + coefficient * (skew @ skew)
 
 
-def _quaternion_plus_jacobian_transpose(quat_xyzw: QuaternionXYZW, out: Float[np.ndarray, "3 4"]) -> Float[np.ndarray, "3 4"]:
+def quaternion_plus_jacobian_transpose(quat_xyzw: QuaternionXYZW, out: Float[np.ndarray, "3 4"]) -> Float[np.ndarray, "3 4"]:
     """Write `2 * PlusJacobian(q).T` for `EigenQuaternionManifold` into `out`.
 
     Ceres' `EigenQuaternionManifold` uses `Plus(q, d) = q * exp(d)`, whose 4x3 Jacobian is
@@ -358,8 +358,8 @@ class RelativePoseCost(pyceres.CostFunction):
     def Evaluate(self, parameters: list, residuals: np.ndarray, jacobians: list | None) -> bool:
         """Evaluate the whitened residual and, when asked, the ambient Jacobians."""
         quat_source, translation_source, quat_target, translation_target = parameters
-        world_R_source: Matrix3 = _rotation_matrix(quat_source, self._source_R_world)
-        world_R_target: Matrix3 = _rotation_matrix(quat_target, self._world_R_target)
+        world_R_source: Matrix3 = rotation_matrix_from_quat_xyzw(quat_source, self._source_R_world)
+        world_R_target: Matrix3 = rotation_matrix_from_quat_xyzw(quat_target, self._world_R_target)
         source_R_world: Matrix3 = world_R_source.T
         target_R_source: Matrix3 = self._target_R_source
 
@@ -381,13 +381,13 @@ class RelativePoseCost(pyceres.CostFunction):
         if jacobians[0] is not None:
             block: Float[np.ndarray, "6 3"] = self._block_jacobian
             block[:3, :] = -(inverse_right_jacobian.T @ target_R_source)
-            block[3:, :] = target_R_source @ _skew(source_translation, self._scratch)
-            plus_t: Float[np.ndarray, "3 4"] = _quaternion_plus_jacobian_transpose(quat_source, self._plus_jacobian_t)
+            block[3:, :] = target_R_source @ skew_matrix(source_translation, self._scratch)
+            plus_t: Float[np.ndarray, "3 4"] = quaternion_plus_jacobian_transpose(quat_source, self._plus_jacobian_t)
             jacobians[0][:] = ((whitening @ block) @ plus_t).ravel()
         if jacobians[1] is not None:
             jacobians[1][:] = (-translation_jacobian).ravel()
         if jacobians[2] is not None:
-            plus_t = _quaternion_plus_jacobian_transpose(quat_target, self._plus_jacobian_t)
+            plus_t = quaternion_plus_jacobian_transpose(quat_target, self._plus_jacobian_t)
             jacobians[2][:] = ((whitening[:, :3] @ inverse_right_jacobian) @ plus_t).ravel()
         if jacobians[3] is not None:
             jacobians[3][:] = translation_jacobian.ravel()
