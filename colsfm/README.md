@@ -23,9 +23,11 @@ results.
 | `features.py` | ALIKED feature extraction over `pycolmap.extract_features`, and the backend switch. The replacement for `feature_extractor_main`'s per-image half. |
 | `tensorrt_runtime.py` | The TensorRT plumbing both `_trt` backends share: the blob's engine-name cache, the FP16 builder, and one generic execution session with growing device buffers. |
 | `features_trt.py` | The same stage through the blob's own `aliked.onnx` and its FP16 engine, with the blob's preprocessing and pixel mapping. `--features-backend tensorrt`. |
+| `features_raco.py` | The same stage through fabio-sim's RaCo-ALIKED on a batch-dynamic FP16 engine, 8 images per execution; reuses `features_trt`'s preprocessing and pixel mapping unchanged. `--features-backend raco`. |
 | `pairs.py` | Which image pairs get matched. The replacement for `feature_matcher_task_builder_main`. |
 | `matching.py` | LightGlue matching plus COLMAP's geometric verification, then the spatial subsample. The replacement for `feature_matcher_main`. Also owns the blob's real SSC (`select_by_square_covering`) and the cap modes (`resolve_match_cap`). |
 | `matching_trt.py` | The same stage through the blob's own `lightglue_aliked.onnx` and its FP16 engine. The only path with the per-match score, so it runs the real SSC before verification instead of the score-free grid subsample. `--matching-backend tensorrt`. |
+| `matching_raco.py` | The same stage through LightGlue+, the matcher fabio-sim trained against RaCo-ALIKED. `match_pairs_tensorrt` does the work; this module supplies the graph and the normalised keypoint frame it wants. `--matching-backend raco`. |
 | `retrieval.py` | Image retrieval for loop closure, brute force or vocabulary tree. The replacement for `generate_bow_vocabulary_main` and `generate_bow_index_main`. |
 | `loop_closure.py` | Loop-closure candidate selection, gating and rig-edge assembly. The replacement for `generate_association_main`'s `RetrievalLoopAssociations`. |
 | `loop_pose.py` | The metric rig-to-rig relative pose a loop edge carries: a local triangulated map in the source rig frame, then generalized resection of the target rig. The replacement for `StereoPoseEstimator`. |
@@ -50,9 +52,9 @@ row per stage under these names:
 | # | Stage | Module | Blob stage it replaces |
 |---|---|---|---|
 | 1 | `keyframe_selection` | `keyframe_selection`, `frames_meta` | `feature_extractor_main` (selection half) |
-| 2 | `feature_extraction` | `database`, `cameras`, `features`, `features_trt` | `feature_extractor_main` (per-image half) |
+| 2 | `feature_extraction` | `database`, `cameras`, `features`, `features_trt`, `features_raco` | `feature_extractor_main` (per-image half) |
 | 3 | `pair_selection` | `pairs` | `feature_matcher_task_builder_main` |
-| 4 | `matching` | `matching`, `matching_trt` | `feature_matcher_main` |
+| 4 | `matching` | `matching`, `matching_trt`, `matching_raco` | `feature_matcher_main` |
 | 5 | `loop_closure` | `retrieval`, `loop_closure`, `loop_pose` | `generate_bow_*_main` + `generate_association_main` |
 | 6 | `pose_graph` | `pose_graph` | `pose_graph_main` |
 | 7 | `reconstruction` | `reconstruction`, `mapping` | `keypoints_mapper_main` |

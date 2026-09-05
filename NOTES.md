@@ -650,22 +650,22 @@ builds and caches one FP16 engine (minutes, once).
 **Galileo, 226 keyframes, 331 pairs, RTX 5090.** Both colsfm columns are the same run
 except for the two backend flags; the blob column is `data/cusfm_runs/galileo_blobref`.
 
-| Metric | blob | colsfm `pycolmap` | colsfm `tensorrt` |
-|---|---:|---:|---:|
-| feature extraction (s) | 8.64 | 7.19 | **7.01** |
-| feature matching (s) | 2.25 | 8.28 | **2.91** |
-| triangulation + BA (s) | 6.69 | 2.56 | 7.81 |
-| total (s) | 40.07 | 18.48 | 18.16 |
-| keypoints per image | 2048 | 1992-2048 | 2048 |
-| median verified matches per pair | 430 | 161 | **433** |
-| median inlier retention | 0.985 | 0.117 | 0.998 |
-| empty pairs | 8 / 339 | 13 / 331 | 13 / 331 |
-| registered / total images | 224 / 226 | 225 / 226 | 225 / 226 |
-| 3D points | 5065 | 6186 | 14561 |
-| mean reprojection error (px) | 1.550 | 1.332 | 1.414 |
-| ATE vs ground truth (mm RMSE) | 5.00 | **4.35** | 5.19 |
-| rig poses vs the blob (mm / deg RMSE) | — | 0.99 / 1.669 | **0.38 / 0.040** |
-| acceptance bounds | — | 4/4 | 4/4 |
+| Metric | blob | colsfm `pycolmap` | colsfm `tensorrt` | colsfm `raco` |
+|---|---:|---:|---:|---:|
+| feature extraction (s) | 8.64 | 7.19 | **7.01** | 7.52 |
+| feature matching (s) | 2.25 | 8.28 | 2.91 | **2.31** |
+| triangulation + BA (s) | 6.69 | 2.56 | 7.81 | 5.70 |
+| total (s) | 40.07 | 18.48 | 18.16 | **15.90** |
+| keypoints per image | 2048 | 1992-2048 | 2048 | 2048 |
+| median verified matches per pair | 430 | 161 | **433** | 432 |
+| median inlier retention | 0.985 | 0.117 | 0.998 | 0.998 |
+| empty pairs | 8 / 339 | 13 / 331 | 13 / 331 | 12 / 331 |
+| registered / total images | 224 / 226 | 225 / 226 | 225 / 226 | 224 / 226 |
+| 3D points | 5065 | 6186 | 14561 | 15190 |
+| mean reprojection error (px) | 1.550 | 1.332 | 1.414 | 1.500 |
+| ATE vs ground truth (mm RMSE) | 5.00 | **4.35** | 5.19 | 5.19 |
+| rig poses vs the blob (mm / deg RMSE) | — | 0.99 / 1.669 | **0.38 / 0.040** | 0.42 / 0.407 |
+| acceptance bounds | — | 4/4 | 4/4 | 4/4 |
 
 Three things to read out of that table.
 
@@ -719,6 +719,71 @@ only when the source frames are already about 1920x1200.
 
 `tests/colsfm/test_tensorrt_backends.py` covers both backends and skips cleanly when
 `tensorrt`, `cuda-python`, the ONNX graphs or a CUDA device are missing.
+
+### RaCo backend
+
+`--features-backend raco` and `--matching-backend raco` are the third pair, and the only
+one that is not the blob's own graphs. **RaCo-ALIKED** is fabio-sim's rotation- and
+scale-consistent retraining of ALIKED and **LightGlue+** is the matcher trained against it;
+both come from [fabio-sim/LightGlue-ONNX](https://github.com/fabio-sim/LightGlue-ONNX) at
+`d12b4ba`, which the repo's `raco` Pixi environment already pins. `tools/export_cusfm_raco.py`
+exports them in that environment (it needs `torch` and `onnx`, which `colsfm` does not carry)
+and `colsfm` only ever parses the resulting ONNX with TensorRT's own `OnnxParser`:
+
+```bash
+pixi run -e raco raco-export                                   # data/cusfm_models/raco/aliked_lightglue/
+pixi run -e raco raco-export \
+    --batched-extractor-path data/cusfm_models/raco-aliked-b1-16.onnx   # the batch-dynamic extractor
+```
+
+Neither file is committed — `data/cusfm_models` is gitignored — so
+`tests/colsfm/test_raco_backend.py` skips the whole module when they are absent, on top of
+the `tensorrt`, `cuda-python` and CUDA-device skips the TensorRT module already has.
+
+**The extractor is genuinely batched; the stage is not GPU-bound, so it barely matters.**
+The graph declares `image [batch, 3, 1200, 1920]` with `batch` in 1..16, and
+`colsfm.tensorrt_runtime.build_fp16_engine` builds it with a 1 / 8 / 16 optimisation profile
+(one build, 19 min on an RTX 5090, cached afterwards under the blob's own engine name).
+Measured over Galileo's 226 frames on that engine:
+
+| Batch | device only (ms/image) | whole extraction stage (s) |
+|---:|---:|---:|
+| 1 | 12.1 | 8.82 |
+| 4 | 11.9 | — |
+| 8 | 11.0 | 8.30 |
+| 16 | execution fails | — |
+
+So batching buys **10 % of the device time and 6 % of the stage** — the blog's median 3x is
+against a TensorRT-FP16 *baseline of the same model*, and this repo's baseline is not that:
+it is a stage in which 226 JPEG decodes and 1920x1200 resizes cost more than the engine does.
+The engine itself is where the real win sits, and it is against the *blob's* ALIKED, not
+against RaCo at batch 1: 11.0 ms per image against `features_trt`'s 24.3 ms, i.e. the graph
+is 2.2x faster per image before any batching. What eats it is the 8 s stage wall time, of
+which only ~2.5 s is the GPU. Batch 16 is inside the profile but its execution fails on this
+5090 even with 30 GB free, so `DEFAULT_BATCH_SIZE` is 8 and `MAXIMUM_BATCH_SIZE` is the
+profile's ceiling rather than a tested one.
+
+**LightGlue+ is the stage that actually got faster, and quality holds.** 2.31 s against the
+`tensorrt` backend's 2.91 s and the blob's own 2.25 s, at a median of 432 verified matches
+per pair against the blob's published 430 and the `tensorrt` backend's 433 — near parity on
+a completely different extractor, which is the claim worth checking. Registered images,
+reprojection error and ATE all land where the `tensorrt` backend lands (224/226, 1.500 px,
+5.19 mm), rig poses agree with the blob to 0.42 mm, and all four acceptance bounds pass
+(`data/bench/galileo_raco_compare.md`). The rotation agreement is the one metric that is
+worse than `tensorrt`'s — 0.407 deg against 0.040 — which is what a different descriptor on
+the same rig looks like, not a bug.
+
+**Two contracts hold this together, and both are tested directly.** The extractor's `scores`
+output is upstream's *selection priority*, `arange(2048, 0, -1) / 2048`, not a detector
+response: its smallest value is below the blob's 0.005 `detector_threshold`, so
+`colsfm.features.RACO_MIN_SCORE` is 0 and the gate is dropped rather than applied to a
+meaningless number. And the two graphs want keypoints in *different* normalised frames —
+LightGlue+ takes the extractor's own `2 p / (size - 1) - 1` and applies the LightGlue scaling
+internally, where the blob's graph takes `(p - size/2) / (max(size)/2)` already applied. A
+mismatch there raises nothing and just quietly costs matches, so
+`colsfm.matching_trt.KeypointNormalizer` makes it the one thing the two matching backends
+differ by, and two unit tests assert the inverse holds and that the blob's normalisation is
+*not* it.
 
 ### Where colsfm deviates from the blob
 
@@ -949,6 +1014,8 @@ Both tasks call `python -m colsfm run`, which takes the same `--input-dir` as
 --match-cap-mode off           # fixed (default) | image_area | off (decision 14)
 --features-backend tensorrt    # the blob's aliked.onnx on the blob's engine (decision 13)
 --matching-backend tensorrt    # ... and its lightglue_aliked.onnx, with the blob's real SSC
+--features-backend raco        # RaCo-ALIKED, batch-dynamic engine, 8 images at once
+--matching-backend raco        # ... and LightGlue+, the matcher trained against it
 --ba-num-threads 1             # a bit-reproducible Ceres solve
 --optimize-extrinsics          # second mapping pass with sensor_from_rig free (deviation 9)
 --no-regularised-extrinsics    # ... without cuSFM's extrinsic priors, which overfits

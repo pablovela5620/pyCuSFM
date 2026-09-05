@@ -54,13 +54,17 @@ from colsfm.database import image_ids_by_name, keypoint_counts
 AlikedVariant: TypeAlias = Literal["ALIKED_N16ROT", "ALIKED_N32"]
 """The two ALIKED graphs COLMAP 4.2 can download and run."""
 
-FeatureBackend: TypeAlias = Literal["pycolmap", "tensorrt"]
-"""Which ALIKED runs: COLMAP's own ONNX one, or the blob's TensorRT engine.
+FeatureBackend: TypeAlias = Literal["pycolmap", "tensorrt", "raco"]
+"""Which ALIKED runs: COLMAP's own ONNX one, or one of two TensorRT engines.
 
 `tensorrt` is `colsfm.features_trt` — the blob's `aliked.onnx` through the
-engine the blob itself built. It needs `tensorrt` and `cuda-python`, which the
-`colsfm` pixi environment carries, and a GPU whose architecture the cached
-engine was built for. `pycolmap` is the default because it needs neither."""
+engine the blob itself built, at the static batch of 1 its graph declares.
+`raco` is `colsfm.features_raco` — fabio-sim's RaCo-ALIKED through a
+batch-dynamic engine that runs 8 images at once. Both need `tensorrt` and
+`cuda-python`, which the `colsfm` pixi environment carries, and a GPU whose
+architecture the cached engine was built for; `raco` additionally needs the
+graph under `data/cusfm_models/`, which is not committed. `pycolmap` is the
+default because it needs none of that."""
 
 DeviceChoice: TypeAlias = Literal["auto", "cuda", "cpu"]
 """Requested compute device; `auto` picks CUDA when it is actually usable."""
@@ -73,6 +77,15 @@ TensorRTExtraction: TypeAlias = tuple[dict[int, int], float]
 
 BLOB_DETECTOR_THRESHOLD: Final[float] = 0.005
 """`aliked_detector.detector_threshold` in `pycusfm/configs/isaac/keypoint_creation_config.pb.txt`."""
+
+RACO_MIN_SCORE: Final[float] = 0.0
+"""Score gate on the `raco` backend, which is none.
+
+The RaCo graph's `scores` output is upstream's selection *priority*, a strictly
+decreasing `arange(2048, 0, -1) / 2048`, not a detector response — see
+`colsfm.features_raco`. Its smallest value, 0.00049, is below the blob's 0.005
+`detector_threshold`, so reusing `FeatureOptions.min_score` here would drop ten
+points per image on the strength of a number that means nothing."""
 
 BLOB_MAX_KEYPOINTS: Final[int] = 2048
 """Keypoints the blob's ONNX detector head emits per image, which is what actually binds.
@@ -243,23 +256,38 @@ def extract_features(
     if not image_root.is_dir():
         raise FileNotFoundError(f"No image directory at {image_root}")
 
-    if options.backend == "tensorrt":
+    if options.backend in {"tensorrt", "raco"}:
         # Imported here, not at module scope: TensorRT and `cuda-python` are only
-        # needed by this branch, and a machine without a usable engine must still
-        # be able to run the default backend.
-        from colsfm.features_trt import extract_tensorrt
+        # needed by these branches, and a machine without a usable engine must
+        # still be able to run the default backend.
+        extracted: TensorRTExtraction
+        if options.backend == "raco":
+            from colsfm.features_raco import extract_raco
 
-        extracted: TensorRTExtraction = extract_tensorrt(
-            database_path,
-            image_root,
-            image_names,
-            min_score=options.min_score,
-            max_num_features=options.max_num_features,
-        )
+            # The graph's `scores` output is a selection rank, not a detector
+            # response, so the blob's `detector_threshold` is meaningless against
+            # it; `colsfm.features_raco` documents why the gate is dropped.
+            extracted = extract_raco(
+                database_path,
+                image_root,
+                image_names,
+                min_score=RACO_MIN_SCORE,
+                max_num_features=options.max_num_features,
+            )
+        else:
+            from colsfm.features_trt import extract_tensorrt
+
+            extracted = extract_tensorrt(
+                database_path,
+                image_root,
+                image_names,
+                min_score=options.min_score,
+                max_num_features=options.max_num_features,
+            )
         tensorrt_report: ExtractionReport = ExtractionReport(
             keypoint_counts=extracted[0], device="cuda", elapsed_seconds=extracted[1]
         )
-        print(f"colsfm.features[tensorrt]: {tensorrt_report.summary()}")
+        print(f"colsfm.features[{options.backend}]: {tensorrt_report.summary()}")
         return tensorrt_report
 
     device: ResolvedDevice = resolve_device(options.device)

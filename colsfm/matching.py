@@ -103,12 +103,15 @@ from colsfm.pairs import write_pair_list
 MatcherVariant: TypeAlias = Literal["ALIKED_LIGHTGLUE", "ALIKED_BRUTEFORCE"]
 """The ALIKED matchers COLMAP 4.2 offers; the pipeline uses LightGlue."""
 
-MatchingBackend: TypeAlias = Literal["pycolmap", "tensorrt"]
-"""Which LightGlue runs: COLMAP's own ONNX one, or the blob's TensorRT engine.
+MatchingBackend: TypeAlias = Literal["pycolmap", "tensorrt", "raco"]
+"""Which LightGlue runs: COLMAP's own ONNX one, or one of two TensorRT engines.
 
-`tensorrt` is `colsfm.matching_trt`, which has the per-match score COLMAP's
-bindings hide and therefore runs the blob's real SSC spatial NMS rather than
-`subsample_matches_by_coverage`'s score-free stand-in."""
+`tensorrt` is `colsfm.matching_trt`, the blob's own LightGlue graph; `raco` is
+`colsfm.matching_raco`, the LightGlue+ that fabio-sim trained against
+RaCo-ALIKED. Both have the per-match score COLMAP's bindings hide and therefore
+run the blob's real SSC spatial NMS rather than
+`subsample_matches_by_coverage`'s score-free stand-in; they differ only in the
+graph and in the normalised frame its keypoints arrive in."""
 
 MatchCapMode: TypeAlias = Literal["fixed", "image_area", "off"]
 """How `max_matches_per_pair` is turned into a per-pair cap; see `resolve_match_cap`."""
@@ -664,6 +667,11 @@ def match_pairs(
         ImportError: When `options.backend` is `tensorrt` and TensorRT or
             `cuda-python` is not importable.
     """
+    if options.backend == "raco":
+        # Imported here, not at module scope, for the same reason as `tensorrt`.
+        from colsfm.matching_raco import match_pairs_raco
+
+        return match_pairs_raco(database_path, list(pairs), options)
     if options.backend == "tensorrt":
         # Imported here, not at module scope: TensorRT and `cuda-python` are only
         # needed by this branch, and a machine without a usable engine must still

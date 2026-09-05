@@ -46,7 +46,7 @@ from __future__ import annotations
 import tempfile
 import time
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Final, TypeAlias
 
@@ -78,6 +78,13 @@ from colsfm.tensorrt_runtime import MODEL_DIR, ShapeProfile, TensorRTSession, re
 
 ImageFeatures: TypeAlias = tuple[KeypointsXY, Descriptors]
 """One image's keypoint pixels and its float descriptors, as the engine wants them."""
+
+KeypointNormalizer: TypeAlias = Callable[[KeypointsXY, int, int], Float32[ndarray, "1 num_keypoints 2"]]
+"""Pixel keypoints plus the image's width and height, into a graph's `kpts` frame.
+
+The blob's graph and the RaCo one disagree about that frame — see
+`normalize_keypoints` here and `colsfm.matching_raco.normalize_keypoints_raco` —
+and it is the only thing that differs between the two matching backends."""
 
 LIGHTGLUE_ONNX_PATH: Final[Path] = MODEL_DIR / "lightglue_aliked.onnx"
 """The blob's own LightGlue graph; its engine is cached beside it."""
@@ -192,6 +199,7 @@ def match_one_pair(
     sizes: dict[int, tuple[int, int]],
     pair: ImagePair,
     options: MatchingOptions,
+    normalize: KeypointNormalizer = normalize_keypoints,
 ) -> MatchIndices:
     """Run LightGlue over one pair and return the matches the blob would keep.
 
@@ -206,6 +214,8 @@ def match_one_pair(
         pair: The image pair, first image first.
         options: Matching settings; `tensorrt_min_score`, `max_matches_per_pair`,
             `match_cap_mode` and `num_points_tolerance_fraction` are read.
+        normalize: Which normalised keypoint frame the graph's `kpts0`/`kpts1`
+            bindings expect; see `KeypointNormalizer`.
 
     Returns:
         Int64 `[num_matches, 2]` keypoint index pairs, first image first.
@@ -219,8 +229,8 @@ def match_one_pair(
     width1, height1 = sizes[image_id2]
     outputs: dict[str, ndarray] = session.run(
         {
-            "kpts0": normalize_keypoints(keypoints0, width0, height0),
-            "kpts1": normalize_keypoints(keypoints1, width1, height1),
+            "kpts0": normalize(keypoints0, width0, height0),
+            "kpts1": normalize(keypoints1, width1, height1),
             "desc0": np.ascontiguousarray(descriptors0[None], dtype=np.float32),
             "desc1": np.ascontiguousarray(descriptors1[None], dtype=np.float32),
         }
@@ -253,7 +263,16 @@ def match_one_pair(
     return matches[kept]
 
 
-def match_pairs_tensorrt(database_path: Path, pairs: Sequence[ImagePair], options: MatchingOptions) -> MatchReport:
+def match_pairs_tensorrt(
+    database_path: Path,
+    pairs: Sequence[ImagePair],
+    options: MatchingOptions,
+    *,
+    onnx_path: Path = LIGHTGLUE_ONNX_PATH,
+    profile: dict[str, ShapeProfile] | None = None,
+    normalize: KeypointNormalizer = normalize_keypoints,
+    label: str = "tensorrt",
+) -> MatchReport:
     """Match and verify a pair list with the blob's LightGlue engine.
 
     Both images of every pair must already carry keypoints and float descriptors
@@ -266,6 +285,12 @@ def match_pairs_tensorrt(database_path: Path, pairs: Sequence[ImagePair], option
         database_path: An existing COLMAP database.
         pairs: Image-id pairs, normalised and deduplicated by `colsfm.pairs`.
         options: Matching and verification settings.
+        onnx_path: Which LightGlue graph to run. `colsfm.matching_raco` passes
+            the RaCo-trained one; everything else about the pass is identical.
+        profile: Optimisation profile for that graph's dynamic keypoint axis;
+            `None` uses the blob's own `LIGHTGLUE_PROFILE`.
+        normalize: Which normalised keypoint frame the graph expects.
+        label: What the one-line summary calls this backend.
 
     Returns:
         Per-pair raw and inlier counts, the device used and the wall time.
@@ -279,14 +304,14 @@ def match_pairs_tensorrt(database_path: Path, pairs: Sequence[ImagePair], option
     if not pairs:
         return MatchReport(device="cuda")
 
-    engine_path: Path = resolve_engine(LIGHTGLUE_ONNX_PATH, LIGHTGLUE_PROFILE)
+    engine_path: Path = resolve_engine(onnx_path, profile if profile is not None else LIGHTGLUE_PROFILE)
     geometry_options: pycolmap.TwoViewGeometryOptions = verification_options(options)
     started: float = time.perf_counter()
     with TensorRTSession(engine_path) as session, pycolmap.Database.open(database_path) as database:
         sizes: dict[int, tuple[int, int]] = _image_sizes(database)
         features: FeatureCache = FeatureCache(database)
         for pair in pairs:
-            matches: MatchIndices = match_one_pair(session, features, sizes, pair, options)
+            matches: MatchIndices = match_one_pair(session, features, sizes, pair, options, normalize)
             database.write_matches(pair[0], pair[1], matches.astype(np.uint32))
 
     raw: dict[ImagePair, int] = raw_match_counts(database_path, pairs)
@@ -303,5 +328,5 @@ def match_pairs_tensorrt(database_path: Path, pairs: Sequence[ImagePair], option
         device="cuda",
         elapsed_seconds=elapsed_seconds,
     )
-    print(f"colsfm.matching[tensorrt]: {report.summary()}")
+    print(f"colsfm.matching[{label}]: {report.summary()}")
     return report
