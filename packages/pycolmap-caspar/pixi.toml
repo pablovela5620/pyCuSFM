@@ -1,0 +1,9 @@
+[package]
+# Named `pycolmap` so it satisfies colsfm's `import pycolmap` and shadows the
+# conda-forge pycolmap inside the `colsfm-caspar` environment only.  The version
+# matches the upstream COLMAP tag this recipe builds.
+name = "pycolmap"
+version = "4.2.0"
+
+[package.build]
+backend = { name = "pixi-build-rattler-build", version = "*" }

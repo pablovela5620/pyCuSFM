@@ -4,6 +4,10 @@ version = "0.1.8"
 description = "Pixi environment for the CUDA 13 pyCuSFM binaries"
 channels = ["conda-forge"]
 platforms = ["linux-64"]
+# `packages/pycolmap-caspar` is a local pixi-build package (a rattler-build
+# recipe compiled on demand), consumed only by the `colsfm-caspar` environment.
+# Path dependencies on a pixi-build package need this preview flag.
+preview = ["pixi-build"]
 
 [dependencies]
 python = "3.12.*"
@@ -208,10 +212,74 @@ colsfm-lint = { cmd = "ruff check colsfm tests tools", description = "Lint the c
 colsfm-galileo = { cmd = "python -m colsfm run --input-dir data/r2b_galileo --output-dir data/cusfm_runs/galileo_colsfm/cusfm", description = "Run the whole colsfm pipeline on the 226-frame r2b_galileo sample" }
 colsfm-robocap = { cmd = "python -m colsfm run --input-dir data/cusfm_runs/robocap_blobref/input --output-dir data/cusfm_runs/robocap_colsfm/cusfm", description = "Run the whole colsfm pipeline on the 4528-frame RoboCap stride-4 sequence" }
 
+
+# ── colsfm-caspar: the colsfm stack on a CASPAR-enabled pycolmap ─────────────
+# An isolated mirror of `colsfm` that swaps the conda-forge `pycolmap 4.2.0
+# cuda_130*` for a from-source build with `-DCASPAR_ENABLED=ON`
+# (`packages/pycolmap-caspar`), which is the only way to get COLMAP's GPU bundle
+# adjustment: the conda build binds the `BundleAdjustmentBackend.CASPAR` enum but
+# aborts at solve time with "COLMAP was built without CASPAR_ENABLED".  See
+# docs/caspar-build.md.
+#
+# Own solve-group, `no-default-feature`, and a duplicated dependency list rather
+# than a composed feature: composing `colsfm` would put two `pycolmap` specs in
+# one solve, and re-solving `colsfm` itself is exactly what must not happen.
+# Keep this list in sync with `[feature.colsfm.dependencies]` by hand.
+[feature.colsfm-caspar.system-requirements]
+cuda = "13.0"
+
+[feature.colsfm-caspar.dependencies]
+python = "3.12.*"
+# THE ONE DIFFERENCE from `colsfm`: a path dependency on the local rattler-build
+# recipe instead of `pycolmap = { version = "4.2.0.*", build = "cuda_130*" }`.
+# The recipe builds libcolmap 4.2.0 with CASPAR and then the bindings against it,
+# so `colmap` arrives from the recipe's own install, not as a conda dependency.
+pycolmap = { path = "packages/pycolmap-caspar" }
+pyceres = "2.6.*"
+numpy = "*"
+scipy = "*"
+protobuf = "*"
+pyarrow = "*"
+pillow = "*"
+av = "*"
+pyyaml = "*"
+ffmpeg = "8.*"
+pytest = "*"
+ruff = "*"
+beartype = "*"
+jaxtyping = "*"
+tyro = "*"
+pyserde = ">=0.31.2,<0.32"
+einops = "*"
+cuda-version = "13.0.*"
+cuda-cudart = "*"
+cuda-python = "13.0.*"
+libcublas = "*"
+cudnn = "9.*"
+setuptools = "<78"
+typing-extensions = ">=4.1,<4.16"
+
+[feature.colsfm-caspar.pypi-dependencies]
+tensorrt-cu13 = "==10.13.3.9.post1"
+rerun-sdk = { version = "==0.37.1", extras = ["catalog"] }
+simplecv = { git = "https://github.com/rerun-io/examples-monorepo.git", subdirectory = "packages/simplecv" }
+
+[feature.colsfm-caspar.pypi-options.dependency-overrides]
+tensorrt-cu12 = "==10.13.3.9.post1"
+cuda-toolkit = ">=13,<14"
+
+[feature.colsfm-caspar.activation.env]
+LD_LIBRARY_PATH = "${CONDA_PREFIX}/lib:${CONDA_PREFIX}/lib/python3.12/site-packages/tensorrt_libs"
+
+[feature.colsfm-caspar.tasks]
+caspar-probe = { cmd = "python -m tools.caspar_probe", description = "Time CASPAR against Ceres bundle adjustment on the synthetic rig and the Galileo model" }
+caspar-test = { cmd = "python -m pytest tests/colsfm_probes -q", description = "Run the pycolmap capability probe suite against the from-source CASPAR build" }
+
 [environments]
 raco = { features = ["raco"], no-default-feature = true, solve-group = "raco" }
 bench = { features = ["raco", "bench"], no-default-feature = true }
 colsfm = { features = ["colsfm"], no-default-feature = true, solve-group = "colsfm" }
+colsfm-caspar = { features = ["colsfm-caspar"], no-default-feature = true, solve-group = "colsfm-caspar" }
 
 [activation.env]
 LD_LIBRARY_PATH = "${PIXI_PROJECT_ROOT}/pycusfm/x86_cuda13/lib:${CONDA_PREFIX}/lib/python3.12/site-packages/tensorrt_libs:${CONDA_PREFIX}/lib:/usr/lib/x86_64-linux-gnu"
