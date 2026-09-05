@@ -824,6 +824,15 @@ whose observations CASPAR *silently drops*, and `--optimize-extrinsics`, which C
 honour because it holds `sensor_from_rig` fixed. `summary.json` records the backend that
 actually ran (`mapping.ba_backend`), not the one that was asked for.
 
+**A CASPAR run ends on one Ceres bundle adjustment.** CASPAR stops on a damping blow-up
+while a few percent of the cost is still reachable, so `run_mapping` runs the five outer
+rounds on CASPAR and then one Ceres global BA over the final model — the round options with
+the backend swapped, the same gauge frame, and no merge, complete or filter around it.
+Skipped whenever the backend resolved to Ceres, since Ceres' own answer is a fixed point of
+it. `summary.json` names it (`mapping.polish_seconds`, `mapping.polish_iterations`); its
+seconds stay in the `reconstruction` row of `runtime.csv`, because the polish is mapping.
+`--no-caspar-ceres-polish` is the ablation.
+
 **Galileo 226 — nothing to win.** Both runs in `colsfm-caspar`, so the solver is the only
 difference (`data/bench/galileo_caspar_compare.md`):
 
@@ -847,16 +856,16 @@ column is the ablation that explains it — Ceres with `loss_type: TRIVIAL`, i.e
 robust loss CASPAR drops, dropped on purpose. ATE is Sim(3)- and SE(3)-aligned against
 `data/kitti/06/poses_gt_06.txt`, all three rows from one `tools/kitti/evaluate_kitti.py` run:
 
-| Metric | ceres (CAUCHY) | caspar | ceres, loss TRIVIAL |
-|---|---:|---:|---:|
-| mapping stage (s) | 148.5 | **31.5** | (not comparable) |
-| total (s) | 338.0 | 208.6 | (not comparable) |
-| registered images | 2156 | 2156 | 2156 |
-| 3D points | 96 691 | 97 224 | 96 528 |
-| observations | 713 124 | 709 950 | 713 222 |
-| mean reprojection (px) | 0.674 | 0.715 | 0.708 |
-| Sim(3) ATE RMSE (m) | **0.895** | 1.299 | 0.899 |
-| SE(3) ATE RMSE (m) | 1.118 | 1.601 | 1.097 |
+| Metric | ceres (CAUCHY) | caspar | **caspar + polish** | ceres, loss TRIVIAL |
+|---|---:|---:|---:|---:|
+| mapping stage (s) | 148.5 | **31.5** | **41.3** | (not comparable) |
+| total (s) | 338.0 | 208.6 | 212.9 | (not comparable) |
+| registered images | 2156 | 2156 | 2156 | 2156 |
+| 3D points | 96 691 | 97 224 | 97 223 | 96 528 |
+| observations | 713 124 | 709 950 | 710 169 | 713 222 |
+| mean reprojection (px) | 0.674 | 0.715 | 0.692 | 0.708 |
+| Sim(3) ATE RMSE (m) | **0.895** | 1.299 | **0.904** | 0.899 |
+| SE(3) ATE RMSE (m) | 1.118 | 1.601 | 1.128 | 1.097 |
 
 The TRIVIAL run shared the machine with the test suite, so its two runtimes are not
 comparable; every other number in its column is.
@@ -878,9 +887,22 @@ will grow on longer chains". Galileo's 1.96 m of trajectory hides it (0.07 mm); 
 1231 m does not. The reprojection error does *not* show it — 0.715 px against the TRIVIAL
 run's 0.708 px — so the pixels are fine and the pose chain is what drifts.
 
-**Recommendation: CASPAR for iteration, Ceres for the answer.** On KITTI 06 it buys 117 s
-of a 338 s run for 0.4 m of ATE. That is the wrong trade for a benchmark and the right one
-for a debug loop, which is why the flag exists and why it is off by default.
+**The polish takes the 0.4 m back, for 9.8 s.** One Ceres global BA on CASPAR's own
+observation set — 710 169 in, 710 169 out — runs 22 iterations, cuts 3.39 % of the Cauchy
+cost and lands at **0.904 m** Sim(3), 9 mm from the Ceres mapper on a 1231.7 m sequence, for
+a mapping stage of 41.3 s against 148.5 s. So CASPAR was in the right basin all along and
+merely stopped short of it; `docs/caspar-build.md` § Ceres polish experiment proves the
+instrument by polishing the Ceres model too, which moves 25 femtometres. Galileo is
+unaffected either way: 4.30 mm ATE against the Ceres run's 4.32 mm, 4/4 bounds, 0.19 s of
+polish.
+
+**Recommendation: `--ba-backend caspar` on pinhole datasets, polish on.** With the polish on
+by default it is Ceres' accuracy at 3.6x less mapping time (41.3 s against 148.5 s on
+KITTI 06, 9 mm of ATE apart), so the flag is now the recommended setting wherever the
+cameras are PINHOLE or SIMPLE_RADIAL and the extrinsics are fixed; without it — and
+`--no-caspar-ceres-polish` is exactly that ablation — CASPAR alone still costs 0.4 m and
+remains a debug-loop convenience. The default of `MappingOptions.ba_backend` stays `ceres`
+because the stock environment has no CASPAR build to fall back from silently.
 
 ### Where colsfm deviates from the blob
 

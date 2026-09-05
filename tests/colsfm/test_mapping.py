@@ -34,7 +34,7 @@ from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
 
 from colsfm.cameras import colmap_cameras
-from colsfm.config import CusfmConfig, VisionMappingConfig, read_config_directory
+from colsfm.config import BundleAdjustmentConfig, CusfmConfig, VisionMappingConfig, read_config_directory
 from colsfm.export import read_runtime_records
 from colsfm.frames_meta import FramesMeta, KeyframeMeta, parse_message, read_frames_meta, write_rigid_transform
 from colsfm.mapping import (
@@ -45,6 +45,7 @@ from colsfm.mapping import (
     apply_caspar_options,
     backend_name,
     bundle_adjustment_options,
+    ceres_polish_options,
     filter_degenerate_points,
     filter_projection_failures,
     load_correspondences,
@@ -1724,3 +1725,118 @@ def test_the_round_callback_sees_every_round_as_it_finishes(
     assert [entry[0] for entry in seen] == [stats.round_index for stats in result.rounds]
     assert all(reported == live for _index, reported, live in seen)
     assert seen[-1][1] == result.reconstruction.num_points3D()
+
+
+# ---------------------------------------------------------------------------
+# The Ceres polish that finishes a CASPAR mapping run
+# ---------------------------------------------------------------------------
+
+
+def test_the_polish_option_set_is_the_ceres_one_built_from_the_same_config(
+    synthetic_rig: SyntheticRig, isaac_config: CusfmConfig
+) -> None:
+    """`ceres_polish_options` differs from the CASPAR round options in the backend only.
+
+    `docs/caspar-build.md` § Ceres polish experiment measured the recovery with
+    colsfm's own solve — the config's loss and scale, its iteration cap, SPARSE_SCHUR
+    and the same frozen extrinsics — so the polish has to be that solve and not a
+    fresh set of defaults.
+    """
+    reconstruction: pycolmap.Reconstruction = build_reconstruction(synthetic_rig.frames_meta).reconstruction
+    ba_config: BundleAdjustmentConfig = isaac_config.vision_mapping.bundle_adjustment
+    options: MappingOptions = _quiet_options(ba_backend="caspar")
+    rounds: pycolmap.BundleAdjustmentOptions = bundle_adjustment_options(ba_config, options, reconstruction)
+    polish: pycolmap.BundleAdjustmentOptions = ceres_polish_options(ba_config, options, reconstruction)
+
+    assert backend_name(rounds) == "caspar"
+    assert backend_name(polish) == "ceres"
+    assert polish.ceres.loss_function_type == rounds.ceres.loss_function_type
+    assert polish.ceres.loss_function_scale == pytest.approx(
+        ba_config.reprojection_error_standard_deviation * ba_config.loss_function_scale
+    )
+    assert polish.ceres.solver_options.max_num_iterations == ba_config.max_num_iterations
+    assert polish.ceres.solver_options.linear_solver_type == rounds.ceres.solver_options.linear_solver_type
+    assert polish.refine_sensor_from_rig is False
+    assert polish.refine_focal_length is False
+    assert polish.refine_extra_params is False
+
+
+def test_the_polish_is_on_by_default_and_switches_off() -> None:
+    """The ablation switch is a field, and the default is the shipped behaviour."""
+    assert MappingOptions().caspar_ceres_polish is True
+    assert _quiet_options(caspar_ceres_polish=False).caspar_ceres_polish is False
+
+
+def test_the_ceres_backend_never_polishes(
+    synthetic_rig: SyntheticRig, synthetic_database: Path, isaac_config: CusfmConfig
+) -> None:
+    """A Ceres mapping run has already converged, so nothing is appended to it.
+
+    This also covers every CASPAR fallback: they all end with `ba_backend == "ceres"`,
+    which is the condition the polish is keyed on.
+    """
+    result: MappingResult = run_mapping(
+        build_reconstruction(synthetic_rig.frames_meta),
+        synthetic_database,
+        isaac_config.vision_mapping,
+        _quiet_options(),
+    )
+    assert result.ba_backend == "ceres"
+    assert result.polish is None
+
+
+def test_the_caspar_run_finishes_with_one_ceres_bundle_adjustment(
+    synthetic_rig: SyntheticRig,
+    synthetic_database: Path,
+    isaac_config: CusfmConfig,
+    caspar_enabled: bool,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """`--ba-backend caspar` maps on the GPU and ends on one Ceres solve.
+
+    The polish moves the model without touching the observation set, so the point
+    and observation counts are the ones the rounds left behind and only the
+    reprojection error may change.
+    """
+    if not caspar_enabled:
+        pytest.skip("this pycolmap is built without CASPAR_ENABLED; run under `pixi run -e colsfm-caspar`")
+    result: MappingResult = run_mapping(
+        build_reconstruction(synthetic_rig.frames_meta),
+        synthetic_database,
+        isaac_config.vision_mapping,
+        _quiet_options(ba_backend="caspar", verbose=True),
+    )
+    printed: str = capsys.readouterr().out
+
+    assert result.ba_backend == "caspar"
+    assert result.polish is not None
+    assert result.polish.seconds > 0.0
+    assert result.polish.mean_reprojection_error_after_px == pytest.approx(result.mean_reprojection_error_px)
+    assert result.polish.num_observations == result.num_observations
+    assert result.polish.ba_termination in {"CONVERGENCE", "NO_CONVERGENCE"}
+    assert result.bundle_adjustment_seconds >= result.polish.seconds
+    assert "polish" in printed
+    print(
+        f"[colsfm] caspar polish: {result.polish.ba_num_iterations} iterations, "
+        f"{result.polish.mean_reprojection_error_before_px:.4f} px -> "
+        f"{result.polish.mean_reprojection_error_after_px:.4f} px in {result.polish.seconds:.2f} s"
+    )
+
+
+def test_the_polish_can_be_switched_off_for_an_ablation(
+    synthetic_rig: SyntheticRig,
+    synthetic_database: Path,
+    isaac_config: CusfmConfig,
+    caspar_enabled: bool,
+) -> None:
+    """`caspar_ceres_polish=False` leaves a CASPAR run exactly where CASPAR stopped."""
+    if not caspar_enabled:
+        pytest.skip("this pycolmap is built without CASPAR_ENABLED; run under `pixi run -e colsfm-caspar`")
+    result: MappingResult = run_mapping(
+        build_reconstruction(synthetic_rig.frames_meta),
+        synthetic_database,
+        isaac_config.vision_mapping,
+        _quiet_options(ba_backend="caspar", caspar_ceres_polish=False),
+    )
+    assert result.ba_backend == "caspar"
+    assert result.polish is None

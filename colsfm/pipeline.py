@@ -116,7 +116,7 @@ from colsfm.frames_meta import FRAMES_META_NAME, CameraParams, FramesMeta, RigFr
 from colsfm.geometry import MILLIMETRES_PER_METRE, TumPose, relative_rotation_degrees
 from colsfm.keyframe_selection import KeyframeSelection, apply_selection, select_keyframes
 from colsfm.loop_closure import LoopClosureConfig, LoopClosureDiagnostics, LoopClosureResult, find_loop_edges
-from colsfm.mapping import BaBackend, CasparOptions, MappingOptions, MappingResult, run_mapping
+from colsfm.mapping import BaBackend, CasparOptions, MappingOptions, MappingResult, PolishStats, run_mapping
 from colsfm.matching import BLOB_MATCH_TOP_K, MatchCapMode, MatchingBackend, MatchingOptions, MatchReport, match_pairs
 from colsfm.pairs import select_pairs
 from colsfm.pose_graph import PoseGraphEdge, PoseGraphResult, RigNode, sequential_edges, solve_pose_graph
@@ -277,6 +277,14 @@ class PipelineOptions:
     ba_num_threads: int | None = None
     """Ceres threads; None takes `bundle_adjustment_config.num_threads` (8) from the config,
     which is what the blob solves with. Set 1 for a bit-reproducible solve."""
+    caspar_ceres_polish: bool = True
+    """Finish a `--ba-backend caspar` run with one Ceres global bundle adjustment.
+
+    On by default: it is what makes the GPU backend shippable — KITTI 06 goes from
+    1.299 m to 0.904 m Sim(3) ATE for 9.8 s on top of 31.5 s of CASPAR rounds, against
+    the Ceres mapper's 0.895 m in 148.5 s (`docs/caspar-build.md` § Shipped: CASPAR +
+    Ceres polish). `--no-caspar-ceres-polish` is the ablation. Inert on `ceres`,
+    fallbacks included, which have already converged."""
     caspar_option: tuple[str, ...] = ()
     """CASPAR solver overrides as `name=value`, e.g. `--caspar-option solver_iter_max=1000
     pcg_iter_max=80`. Read only when `--ba-backend caspar` actually runs; see
@@ -369,6 +377,13 @@ class MappingStats:
     ba_backend: BaBackend = "ceres"
     """Which backend the bundle adjustments actually ran on, fallbacks applied; the one
     field here that is not a counter, and the only record a finished run keeps of it."""
+    polish_seconds: float | None = None
+    """Seconds the closing Ceres polish of a CASPAR run took, or None when none ran.
+
+    They are already inside the `reconstruction` stage of `runtime.csv` — the polish
+    solves inside `run_mapping` — so this names them rather than adding a row."""
+    polish_iterations: int | None = None
+    """Ceres iterations that polish took; the measure of how far CASPAR stopped short."""
 
     @staticmethod
     def of(mapping: MappingResult) -> MappingStats:
@@ -378,9 +393,10 @@ class MappingStats:
             mapping: What the last mapping pass produced.
 
         Returns:
-            The six counters and the backend that produced them, frozen at this
-            point in the run.
+            The six counters, the backend that produced them and its closing polish,
+            frozen at this point in the run.
         """
+        polish: PolishStats | None = mapping.polish
         return MappingStats(
             num_registered_images=mapping.num_registered_images,
             num_images_with_observations=mapping.num_images_with_observations,
@@ -389,6 +405,8 @@ class MappingStats:
             mean_reprojection_error_px=mapping.mean_reprojection_error_px,
             mean_track_length=mapping.mean_track_length,
             ba_backend=mapping.ba_backend,
+            polish_seconds=None if polish is None else polish.seconds,
+            polish_iterations=None if polish is None else polish.ba_num_iterations,
         )
 
 
@@ -1292,6 +1310,7 @@ def run_pipeline(options: PipelineOptions) -> PipelineSummary:
         num_threads=options.ba_num_threads,
         use_gpu=options.ba_use_gpu,
         ba_backend=options.ba_backend,
+        caspar_ceres_polish=options.caspar_ceres_polish,
         caspar_options=parse_caspar_options(options.caspar_option),
     )
 

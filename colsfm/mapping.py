@@ -146,7 +146,7 @@ from __future__ import annotations
 import re
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Final, Literal, TypeAlias
 
@@ -259,6 +259,33 @@ class RoundStats:
     """Wall-clock seconds the round took, bundle adjustment included."""
 
 
+@dataclass(frozen=True, slots=True)
+class PolishStats:
+    """The one Ceres bundle adjustment that finishes a CASPAR mapping run.
+
+    Nothing is merged, completed or filtered around it, so the observation set that
+    goes in is the one that comes out and every number here is the solve's alone
+    (`docs/caspar-build.md` § Shipped: CASPAR + Ceres polish).
+    """
+
+    num_observations: int
+    """Observations the solve parameterised; unchanged by it, since nothing filters."""
+    ba_num_iterations: int
+    """Ceres iterations, from `brief_report()`. 22 on KITTI 06 from CASPAR's answer."""
+    ba_initial_cost: float
+    """Ceres cost of the model the rounds left behind."""
+    ba_final_cost: float
+    """Ceres cost after the polish; 3.4 % below the initial one on KITTI 06."""
+    ba_termination: str
+    """`CONVERGENCE`, `NO_CONVERGENCE` or `FAILURE`."""
+    mean_reprojection_error_before_px: float
+    """Mean reprojection error as CASPAR left it, in pixels."""
+    mean_reprojection_error_after_px: float
+    """Mean reprojection error after the polish, over the same observations."""
+    seconds: float
+    """Wall-clock seconds inside `BundleAdjuster.solve()`; 9.8 s on KITTI 06's 2156 images."""
+
+
 RoundCallback: TypeAlias = Callable[[RoundStats, pycolmap.Reconstruction], None]
 """What `MappingOptions.round_callback` takes: one round's statistics and the live model."""
 
@@ -291,6 +318,16 @@ class MappingOptions:
     CASPAR would silently drop), `optimize_extrinsics` (which CASPAR cannot honour),
     and a pycolmap built without it. See the module docstring for the robust loss
     CASPAR does not apply."""
+    caspar_ceres_polish: bool = True
+    """Finish a CASPAR run with one Ceres global bundle adjustment over the final model.
+
+    Read only when `ba_backend` actually resolves to `caspar`: every fallback ends on
+    Ceres, which has already converged, so there is nothing to polish. CASPAR's
+    `CONVERGED_DIAG_EXIT` fires while a few percent of the cost is still reachable,
+    and on KITTI 06 that costs 0.4 m of trajectory; one Ceres solve on CASPAR's own
+    observation set gets all of it back — 1.299 m to 0.904 m Sim(3) ATE in 9.8 s, for a
+    41.3 s mapping stage against the Ceres mapper's 0.895 m in 148.5 s
+    (`docs/caspar-build.md` § Shipped: CASPAR + Ceres polish). Set False for the ablation."""
     caspar_options: CasparOptions | None = None
     """Overrides applied to `BundleAdjustmentOptions.caspar` when `ba_backend` is `caspar`.
 
@@ -353,7 +390,7 @@ class MappingResult:
     triangulation_seconds: float
     """Time spent in the initial triangulation passes."""
     bundle_adjustment_seconds: float
-    """Time spent inside `BundleAdjuster.solve`, summed over the rounds."""
+    """Time spent inside `BundleAdjuster.solve`, summed over the rounds and the polish."""
     total_seconds: float
     """Wall-clock seconds for the whole call."""
     extrinsics_refined: bool = False
@@ -363,6 +400,12 @@ class MappingResult:
     """Which backend the solves actually ran on — `ceres` whenever one of the three
     fallbacks of `MappingOptions.ba_backend` fired, so this is evidence rather than a
     request."""
+    polish: PolishStats | None = None
+    """The closing Ceres solve of a CASPAR run, or None when none ran.
+
+    None means either `ba_backend == "ceres"` — a fallback included, since a Ceres
+    run is already at its own fixed point — or `caspar_ceres_polish` switched off.
+    Its seconds are part of `bundle_adjustment_seconds`."""
 
     @property
     def num_registered_images(self) -> int:
@@ -642,6 +685,30 @@ def bundle_adjustment_options(
         if options.caspar_options is not None:
             apply_caspar_options(ba_options.caspar, options.caspar_options)
     return ba_options
+
+
+def ceres_polish_options(
+    ba_config: BundleAdjustmentConfig,
+    options: MappingOptions,
+    reconstruction: pycolmap.Reconstruction | None = None,
+) -> pycolmap.BundleAdjustmentOptions:
+    """The same solve as the rounds, on Ceres: what polishes a finished CASPAR model.
+
+    One config, one builder, one difference — the backend. `docs/caspar-build.md`
+    § Ceres polish experiment measured the recovery with colsfm's own settings (the
+    config's Cauchy loss at scale 4, 200 iterations, SPARSE_SCHUR, extrinsics and
+    intrinsics fixed), so the polish has to be that solve rather than a fresh set of
+    pycolmap defaults.
+
+    Args:
+        ba_config: The Ceres settings from `vision_mapping_config.pb.txt`.
+        options: The run's knobs; only `ba_backend` is overridden.
+        reconstruction: The model about to be adjusted; unread on the Ceres backend.
+
+    Returns:
+        Options selecting Ceres, otherwise identical to `bundle_adjustment_options`.
+    """
+    return bundle_adjustment_options(ba_config, replace(options, ba_backend="ceres"), reconstruction)
 
 
 def load_correspondences(
@@ -1016,6 +1083,57 @@ def _check_extrinsics_are_refinable(model: PosedModel) -> None:
         )
 
 
+def _polish_with_ceres(
+    reconstruction: pycolmap.Reconstruction,
+    ba_config: BundleAdjustmentConfig,
+    options: MappingOptions,
+    gauge_frame_id: int,
+    fixed_camera_params_id: int | None,
+) -> PolishStats:
+    """One Ceres global bundle adjustment over a finished CASPAR model.
+
+    The whole step: the same gauge frame, the same observation set, no
+    re-triangulation, no merge, no complete, no filter — so the reprojection error
+    the round loop reported and the one this returns describe the same points, and
+    every difference between them is the solve's. `docs/caspar-build.md`
+    § Shipped: CASPAR + Ceres polish measured 22 iterations and 9.8 s on KITTI 06's
+    2156 images, which recovers the 0.4 m of trajectory CASPAR left on the table.
+
+    Args:
+        reconstruction: The model the rounds left behind, adjusted in place.
+        ba_config: The Ceres settings from `vision_mapping_config.pb.txt`.
+        options: The run's knobs; the backend is forced to Ceres.
+        gauge_frame_id: The same frame the rounds held constant.
+        fixed_camera_params_id: The same camera the rounds held constant, or None.
+
+    Returns:
+        What the solve cost and how far it moved the reprojection error.
+    """
+    polish_options: pycolmap.BundleAdjustmentOptions = ceres_polish_options(ba_config, options, reconstruction)
+    before_px: float = reconstruction.compute_mean_reprojection_error()
+    summary, solve_seconds = solve_bundle_adjustment(reconstruction, polish_options, gauge_frame_id, fixed_camera_params_id)
+    reconstruction.update_point_3d_errors()
+    num_iterations, initial_cost, final_cost = _parse_brief_report(summary)
+    stats: PolishStats = PolishStats(
+        num_observations=reconstruction.compute_num_observations(),
+        ba_num_iterations=num_iterations,
+        ba_initial_cost=initial_cost,
+        ba_final_cost=final_cost,
+        ba_termination=summary.termination_type.name,
+        mean_reprojection_error_before_px=before_px,
+        mean_reprojection_error_after_px=reconstruction.compute_mean_reprojection_error(),
+        seconds=solve_seconds,
+    )
+    if options.verbose:
+        cost_cut: float = 1.0 - stats.ba_final_cost / stats.ba_initial_cost if stats.ba_initial_cost else 0.0
+        print(
+            f"[colsfm] ceres polish: {stats.ba_num_iterations} iterations, cost {stats.ba_initial_cost:.6g} -> "
+            f"{stats.ba_final_cost:.6g} ({cost_cut:.2%}), reprojection {stats.mean_reprojection_error_before_px:.4f} -> "
+            f"{stats.mean_reprojection_error_after_px:.4f} px in {stats.seconds:.1f} s ({stats.ba_termination})"
+        )
+    return stats
+
+
 def run_mapping(
     model: PosedModel,
     database_path: Path,
@@ -1031,6 +1149,7 @@ def run_mapping(
     for k in 0 .. num_ba_iterations - 1:
         merge -> complete -> filter at gate g_k -> global bundle adjustment -> guards
         stop early when (merged + completed + filtered) / observations < max_observation_change
+    one Ceres global bundle adjustment, when the rounds ran on CASPAR
     ```
 
     The trailing guards are the one step cuSFM has no equivalent of:
@@ -1053,9 +1172,17 @@ def run_mapping(
         gauge_frame_id: Frame held constant for gauge; the frame owning the
             lowest image id when None, which is cuSFM's own choice (§6.3).
 
+    The closing solve is the polish of `docs/caspar-build.md`
+    § Shipped: CASPAR + Ceres polish: CASPAR stops while a few percent of the cost is
+    still reachable, so a CASPAR run ends on one Ceres bundle adjustment over the
+    final model, with no filtering around it. It is skipped whenever the solves ran
+    on Ceres — every fallback included — because Ceres' own answer is a fixed point
+    of it (one iteration, no cost change, 25 femtometres of rig motion, measured).
+
     Returns:
-        The adjusted reconstruction with per-round statistics and timings, plus
-        `refined_extrinsics` when extrinsics were refined.
+        The adjusted reconstruction with per-round statistics and timings, the
+        closing `polish` when one ran, plus `refined_extrinsics` when extrinsics
+        were refined.
 
     Raises:
         FileNotFoundError: When the database does not exist.
@@ -1170,6 +1297,15 @@ def run_mapping(
                 print(f"[colsfm] observation change {observation_change:.6f} below {mapping_config.max_observation_change}")
             break
 
+    # The rounds are done; CASPAR's answer is not yet a stationary point of the
+    # objective, so one Ceres solve finishes it. Nothing filters around it.
+    polish: PolishStats | None = None
+    if resolved_options.caspar_ceres_polish and backend_name(ba_options) == "caspar":
+        polish = _polish_with_ceres(
+            reconstruction, ba_config, resolved_options, resolved_gauge_frame_id, fixed_camera_params_id
+        )
+        bundle_adjustment_seconds += polish.seconds
+
     return MappingResult(
         reconstruction=reconstruction,
         reference=model.reference,
@@ -1177,6 +1313,7 @@ def run_mapping(
         correspondence_seconds=correspondence_seconds,
         triangulation_seconds=triangulation_seconds,
         bundle_adjustment_seconds=bundle_adjustment_seconds,
+        polish=polish,
         total_seconds=time.perf_counter() - started,
         extrinsics_refined=resolved_options.optimize_extrinsics,
         # Read off the options the solves ran with, not off the request: the

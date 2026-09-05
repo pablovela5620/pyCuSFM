@@ -209,6 +209,27 @@ def test_the_caspar_run_reconstructs_what_the_ceres_run_reconstructs(
     assert galileo_caspar_run.mapping.num_registered_images >= MIN_REGISTERED_IMAGES
 
 
+def test_the_caspar_run_records_its_ceres_polish_in_the_summary(
+    galileo_caspar_run: PipelineSummary, galileo_run: PipelineSummary
+) -> None:
+    """`summary.json` carries the polish the CASPAR run finished on; the Ceres run has none.
+
+    The polish solves inside `run_mapping`, so its seconds belong to the
+    `reconstruction` stage of `runtime.csv` and only `MappingStats` names them
+    separately (`docs/caspar-build.md` § Shipped: CASPAR + Ceres polish).
+    """
+    polish_seconds: float | None = galileo_caspar_run.mapping.polish_seconds
+    assert polish_seconds is not None
+    assert galileo_caspar_run.mapping.polish_iterations is not None
+    print(
+        f"[colsfm] galileo smoke caspar polish | {galileo_caspar_run.mapping.polish_iterations} iterations "
+        f"in {polish_seconds:.2f} s of the {galileo_caspar_run.stage_seconds['reconstruction']:.2f} s stage"
+    )
+    assert 0.0 < polish_seconds < galileo_caspar_run.stage_seconds["reconstruction"]
+    assert galileo_run.mapping.polish_seconds is None
+    assert galileo_run.mapping.polish_iterations is None
+
+
 # ── `--optimize-extrinsics`: the blob's second mapping pass ──────────────────────────
 
 

@@ -811,3 +811,92 @@ objective to within 1 %" was never evidence that it lands in the same place.
    instead. The test is one line of instrumentation: log the gradient norm at
    CASPAR's exit on this model, and compare it against the norm at Ceres'
    converged point.
+
+## § Shipped: CASPAR + Ceres polish
+
+The polish of the section above is now the default behaviour of the mapper, not a
+separate tool. When `MappingOptions.ba_backend` **resolves** to `caspar` — every
+fallback ends on Ceres, which is already at its own fixed point —
+`colsfm.mapping.run_mapping` runs the five outer rounds on CASPAR and then one
+Ceres global bundle adjustment over the final model:
+`ceres_polish_options(ba_config, options, reconstruction)` is the round options
+with the backend swapped, so the config's Cauchy loss at scale 4, its 200
+iterations, `SPARSE_SCHUR` and the frozen extrinsics and intrinsics all carry
+over, and the gauge stays the single constant frame the rounds used. Nothing is
+merged, completed or filtered around it. `MappingResult.polish` (a `PolishStats`)
+records the iterations, the costs, the seconds and the reprojection error either
+side; `summary.json` carries `mapping.polish_seconds` and
+`mapping.polish_iterations`. The seconds stay inside the `reconstruction` row of
+`runtime.csv`, because the polish *is* mapping. `--no-caspar-ceres-polish`
+switches it off for an ablation.
+
+Measured on the 5090, one run each, `pixi run -e colsfm-caspar`, one idle Rerun
+viewer on the same GPU:
+
+```bash
+# Galileo 226, three backends into /tmp/colsfm_runs/polish/
+pixi run -e colsfm-caspar python -m colsfm run --input-dir data/r2b_galileo \
+    --output-dir /tmp/colsfm_runs/polish/galileo_caspar_polish/cusfm --ba-backend caspar
+pixi run -e colsfm python -m colsfm.bench_cli --dataset galileo \
+    --run-a data/cusfm_runs/galileo_blobref/cusfm \
+    --run-b /tmp/colsfm_runs/polish/galileo_caspar_polish/cusfm \
+    --input-dir data/r2b_galileo --name-a blob --name-b caspar-polish
+
+# KITTI 06, cap 500 + loops, the § Convergence sweep flags
+pixi run -e colsfm-caspar python -m colsfm run \
+    --input-dir data/kitti/06_colsfm_input_slam --config-dir data/kitti/config \
+    --output-dir /tmp/colsfm_runs/polish/kitti_caspar_polish/cusfm \
+    --min-inter-frame-distance 0.5 --loop-closure --match-cap-mode fixed --ba-backend caspar
+pixi run -e colsfm python -m tools.kitti.evaluate_kitti --sequence-dir data/kitti/06 \
+    --trajectories ceres <...> caspar <...> caspar-polish <...>
+```
+
+**KITTI 06 — the whole gap comes back for 9.8 s.** ATE against
+`data/kitti/06/poses_gt_06.txt`, 1078 of 1078 rig poses matched, from one
+`evaluate_kitti` run. The `ceres` and `caspar` columns are the existing runs of
+NOTES.md § CASPAR backend, re-scored here unchanged.
+
+| Metric | ceres | caspar | **caspar + polish** |
+|---|---:|---:|---:|
+| mapping stage (s) | 148.5 | 31.5 | **41.3**, of which 9.8 is the polish |
+| total (s) | 338.0 | 208.6 | 212.9 |
+| registered images | 2156 | 2156 | 2156 |
+| 3D points | 96 691 | 97 224 | 97 223 |
+| observations | 713 124 | 709 950 | 710 169 |
+| mean reprojection (px) | 0.674 | 0.715 | 0.692 |
+| Sim(3) ATE RMSE (m) | **0.895** | 1.299 | **0.904** |
+| SE(3) ATE RMSE (m) | 1.118 | 1.601 | 1.128 |
+| polish iterations / cost cut | — | — | 22 / 3.39 % |
+
+The polish reproduces `tools/audit/caspar_polish.py` exactly where it should: 22
+Ceres iterations, 3.39 % of Cauchy cost against the offline tool's 3.50 %, and
+0.6923 px against 0.6924 px. It lands 9 mm from the Ceres mapper on a 1231.7 m
+sequence at **3.6x less mapping time** (41.3 s against 148.5 s), and the
+observation set it hands Ceres is CASPAR's own — 710 169 observations in, 710 169
+out. The 9.8 s here is half the audit's 18.2 s because the audit re-reads the
+model off disk and re-derives the point errors first.
+
+**Galileo 226 — nothing to fix, nothing broken.** Three runs, same environment,
+same host; ATE is `colsfm.bench_cli` against the blob reference.
+
+| Metric | ceres | caspar | **caspar + polish** |
+|---|---:|---:|---:|
+| mapping stage (s) | 1.87 | 2.10 | 2.58, of which 0.19 is the polish |
+| total (s) | 16.71 | 16.78 | 17.93 |
+| registered images | 225 / 226 | 225 / 226 | 225 / 226 |
+| 3D points | 6190 | 6283 | 6298 |
+| mean reprojection (px) | 1.334 | 1.423 | 1.390 |
+| ATE vs ground truth (mm) | 4.32 | 4.56 | **4.30** |
+| acceptance bounds | 4/4 | 4/4 | 4/4 |
+| polish iterations | — | — | 20 |
+
+29 rig frames and 6298 points is far too small a problem for the gap CASPAR opens
+on KITTI to exist at all — CASPAR and Ceres agree to 0.28 mm here — so the polish
+has almost nothing to do, does it in 0.19 s, and still ends one hundredth of a
+millimetre ahead of the Ceres run. The cost is 1.2 s of a 17.9 s run.
+
+**Verdict: on by default.** The polish never makes a model worse (Ceres is a
+fixed point of Ceres, measured to 25 femtometres in § Ceres polish experiment),
+it costs a fraction of what the CASPAR rounds save, and it is what turns
+`--ba-backend caspar` from a debug-loop convenience into the default recommendation
+for pinhole datasets.
