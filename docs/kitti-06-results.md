@@ -474,3 +474,99 @@ pose graph and the mapper are the same code section 3 measured, and the 1.552
 baseline reproduces section 3's 1.596 to within the run-to-run spread of a
 threaded Ceres solve.
 
+
+## 9. RaCo backend at scale
+
+Section 8 measured the blob's own TensorRT graphs on KITTI 06. This section runs
+the third backend — RaCo-ALIKED plus LightGlue+, NOTES.md "RaCo backend" — on the
+same 2156 images, from the same cuVSLAM SLAM initialisation, with the flags of
+the `TensorRT + loops` run and nothing else changed:
+
+```bash
+pixi run -e colsfm python -m colsfm run \
+    --input-dir data/kitti/06_colsfm_input_slam --config-dir data/kitti/config \
+    --min-inter-frame-distance 0.5 --output-dir data/kitti/06_colsfm_raco_loops/cusfm \
+    --loop-closure --match-cap-mode fixed \
+    --features-backend raco --matching-backend raco
+```
+
+Stage times from `data/kitti/06_colsfm_raco_loops/cusfm/runtime.csv`, reconstruction
+counts from that run's `summary.json`, ATE from one `evaluate_kitti` invocation
+that re-scores every row (`data/bench/kitti_06_raco_ate.json`), blob columns from
+`data/kitti/06_result_slam/runtime.csv` by way of
+`data/bench/kitti_06_raco_compare.md`. The three earlier `colsfm` rows are their
+own `/tmp/colsfm_runs/kitti/<run>/cusfm/summary.json`.
+
+| Run | extraction (s) | matching (s) | loop stage (s) | mapping (s) | total (s) | registered | points | reprojection (px) | Sim(3) RMSE (m) | SE(3) RMSE (m) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| *paper* CuSfM-View Graph | — | — | — | — | — | — | — | — | 0.783 | — |
+| blob cuSFM, SLAM init | 96.85 | 32.61 | 106.75 BoW + 1200.01 pose graph | 143.14 | 1596.08 | 2154 | 120 097 | 0.454 | 1.328 | 1.605 |
+| colsfm pycolmap + loops (cap 500) | 16.9 | 76.3 | 93.0 | 148.5 | 338.0 | 2156 | 96 691 | 0.674 | 0.895 | 1.118 |
+| colsfm pycolmap + loops (cap off) | 17.5 | 84.2 | 97.6 | 533.8 | 736.8 | 2156 | 174 339 | 0.987 | 0.817 | 1.029 |
+| colsfm TensorRT + loops | 62.2 | 25.2 | 62.3 | 209.9 | 363.5 | 2156 | 174 319 | 0.534 | 0.736 | 1.111 |
+| **colsfm RaCo + loops** | **42.3** | **23.8** | **55.0** | **170.8** | **295.0** | 2156 | 139 976 | 0.507 | 0.902 | 1.419 |
+
+The blob's reprojection error is `colsfm.bench_cli`'s recomputed one; the `colsfm`
+rows are each run's own `mean_reprojection_error_px`, which for this run agrees with
+the harness to 0.001 px (0.5068 against 0.507). The RaCo run is the fastest of every
+loop-closing run here — 295.0 s, 18 % of the blob's 1596.08 s, and below even the
+`cap 500` run that closes no loops at all (268.0 s) once its 55 s loop stage is
+subtracted — and it
+matched 3232 view-graph pairs plus 1376 loop pairs (`summary.json`), against the
+TensorRT run's 3232 + 1320.
+
+**The engine was already built, and that build is not free.** `resolve_engine`
+found `data/cusfm_models/raco-aliked-b1-16_fp16_10_13_3_9_sm_12_0.engine` from an
+earlier session, so the 42.3 s extraction stage is steady state with only the
+engine *load* inside it; the run log contains no build. NOTES.md records the one-time
+cost of producing that file as **19 min on this RTX 5090**, and KITTI does not pay it
+again for a second reason: the graph's spatial dimensions are static, so the same
+engine serves both datasets.
+
+**RaCo is not dynamic in height and width, only in batch.** `raco_profile` builds the
+optimisation profile at `NETWORK_HEIGHT` x `NETWORK_WIDTH` = 1200 x 1920 for all three
+of min/opt/max, and `extract_raco` reads the height and width back out of the built
+engine, so KITTI 06's 1226x370 frames are stretched up to 1920x1200 exactly as
+section 8.3 describes for the blob's `aliked.onnx`. The RaCo win over that backend is
+therefore the engine itself and batch 8, not a smaller network input: extraction falls
+from 62.2 s to 42.3 s (28.8 to **19.6 ms per image**), while COLMAP's own ALIKED at
+the native size still wins at 16.9 s (7.8 ms per image).
+
+**At 19.6 ms per image the stage is roughly half GPU.** Decode, resize to 1920x1200
+and the CHW float conversion of all 2202 images through the same 8-worker pool cost
+**15.73 s, 7.1 ms per image** measured directly on this host, against the 11.0 ms per
+image of device time NOTES.md measured for this engine at batch 8. That is the
+inversion of Galileo: there the stage was 8.30 s over 226 frames, 36.7 ms per image,
+of which only ~11 ms was the GPU, because 1920x1200 JPEGs cost more to decode than the
+engine costs to run. KITTI's frames are a fifth of that area and PNG, so the CPU half
+shrinks to 7.1 ms and the fixed-shape engine — which cannot get cheaper, because the
+input it sees is 1920x1200 either way — becomes the larger term. The remaining ~1.5 ms
+per image is the host-to-device copy, the keypoint rescale and the two database writes.
+
+**Matching scales, and it is the cheapest of the four.** 23.8 s over 3232 pairs is
+**7.4 ms per pair**, against TensorRT's 7.8 (25.2 s) and pycolmap's 23.6 (76.3 s); the
+loop stage, which matches 1376 extra pairs on top of retrieval, is 55.0 s against 62.3
+and 93.0. This reproduces at 14x the pair count what Galileo showed at 2.31 s: LightGlue+
+is the stage the RaCo pair actually makes faster, and it is faster than the blob's own
+LightGlue engine.
+
+**Accuracy held against the pycolmap backend, not against the blob's descriptors.**
+Sim(3) RMSE is **0.902 m**, statistically the `cap 500 + loops` number (0.895) and well
+past the blob's 1.328, but short of the TensorRT run's 0.736. SE(3) is 1.419 m, the worst
+of the three `colsfm` loop runs (1.118, 1.029, 1.111) — a Sim(3) scale of 0.99198 against
+TensorRT's 0.99390 says RaCo's tracks drift slightly more in scale, which SE(3) alignment
+cannot absorb. The reconstruction is otherwise the healthiest of the four: 2156/2156
+registered, 139 976 points, 1 073 575 observations, a mean track length of 7.67 (the
+longest here) and a mean reprojection error of 0.507 px, the best of any `colsfm` run.
+Against the blob, `colsfm.bench_cli` passes three of its four acceptance bounds and misses
+reprojection error by 0.007 px (0.507 against a 0.500 ceiling, `data/bench/kitti_06_raco_compare.md`);
+the TensorRT run's 0.534 would have missed the same bound by more.
+
+**What this means.** RaCo is the right backend when total wall clock matters — it is
+1.15x faster than the pycolmap backend (338.0 s) and 1.23x faster than TensorRT (363.5 s)
+on this sequence, and it beats the blob at both GPU stages by the widest margin of the
+three backends (2.3x on extraction, 1.4x on matching). It is not the
+right backend when the 0.736 matters: on KITTI the blob's own ALIKED descriptors still
+produce the better trajectory, and the honest summary is that RaCo buys the pycolmap
+backend's accuracy at TensorRT's speed, plus 20 s of extraction over the pycolmap backend
+that a dynamic-shape export would remove.
