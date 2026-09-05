@@ -45,6 +45,26 @@ accuracy to the NVIDIA binaries ("fast happy path"); bit-exactness is not a goal
 | 7 | keypoints_mapper_main | docs/spec/keypoints_mapper_main.md | pycolmap triangulation + BA |
 | 8 | kpmap_to_colmap, extract_pose_from_map_main, update_keyframe_pose_main | docs/spec/export.md | pycolmap write + TUM |
 
+## Blob reference runs (2026-09-05, RTX 5090, `demo_rerun.py --run.variant _blobref`)
+
+The demo runs the blob with `data/cusfm_configs/loop-closure-fixed` (isaac with loop closure
+repaired) and `skip_data_association=False`, so all eight stages run. Outputs:
+`data/cusfm_runs/{galileo,robocap}_blobref/cusfm/`, recordings `data/bench/*_blob.rrd`.
+
+| | Galileo (226 frames, 8 cams) | RoboCap stride 4 (4528 frames, 4 cams) |
+|---|---|---|
+| registered / points | 224 / 5065 | 4526 / 168 874 |
+| vs input trajectory | 1.8 mm RMSE over 0.66 m | 334 mm RMSE over 124.6 m |
+| loop closures in pose graph | 0 | 90 |
+| feature_extractor_main | 8.6 s | 183.9 s |
+| bow vocabulary + index | 7.5 + 4.2 s | 162.4 + 81.0 s |
+| generate_association_main | 3.2 s | 75.7 s |
+| pose_graph_main | 3.6 s | 386.6 s |
+| task builder + matcher | 1.9 + 2.2 s | 5.6 + 52.5 s |
+| keypoints_mapper_main | 6.7 s | 178.7 s |
+| kpmap_to_colmap + pose export | 2.1 s | 7.1 s |
+| **total cuSFM** | **40.1 s** | **1133.5 s** |
+
 ## Acceptance (Galileo, `data/r2b_galileo`, ground truth shipped)
 
 Blob reference: 224/226 registered, 4938 points, ATE 3.9 mm vs ground truth, 1.54 px mean
