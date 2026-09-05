@@ -32,7 +32,10 @@ from colsfm.retrieval import (
     Descriptors,
     RetrievalConfig,
     RetrievalIndex,
+    _all_pairs_l1_score,
+    _bow_matrix,
     build_retrieval_index,
+    l1_score,
     read_descriptors_from_database,
 )
 from colsfm.schema import KEYFRAME, load_schema
@@ -258,17 +261,20 @@ def _random_corpus(n_images: int, descriptors_per_image: int, seed: int) -> dict
 
 
 @pytest.mark.parametrize(("n_images", "budget_seconds"), [(226, 20.0), (900, 60.0)])
-def test_build_stays_inside_the_runtime_budget(n_images: int, budget_seconds: float) -> None:
+def test_brute_force_build_stays_inside_the_runtime_budget(n_images: int, budget_seconds: float) -> None:
     """226 x 2048 in a few seconds and 900 x 2048 under a minute, on CPU NumPy.
 
     The full brute force over all 2048 descriptors per image is 5.5e13 FLOP for Galileo
     and 8.7e14 for 900 images, i.e. ~370 s and ~5900 s at this machine's measured 147
     GFLOP/s — so `RetrievalConfig.max_total_descriptors` is what makes the budget
     reachable. See the module docstring of `colsfm.retrieval` for the recall it costs.
+
+    The backend is named rather than left to `auto`, which would send the 900-image case to
+    the vocab index; that one has its own budget test below.
     """
     corpus: dict[int, Descriptors] = _random_corpus(n_images, 2048, seed=n_images)
     started: float = time.perf_counter()
-    index: RetrievalIndex = build_retrieval_index(corpus)
+    index: RetrievalIndex = build_retrieval_index(corpus, RetrievalConfig(backend="brute_force"))
     elapsed: float = time.perf_counter() - started
     index.query(0, top_k=20)
     print(
@@ -276,6 +282,134 @@ def test_build_stays_inside_the_runtime_budget(n_images: int, budget_seconds: fl
         f"{index.descriptors_per_image} kept/image, {elapsed:.1f} s (budget {budget_seconds:.0f} s)"
     )
     assert elapsed < budget_seconds
+
+
+# --------------------------------------------------------------------------------------
+# a. the vocabulary-tree backend
+# --------------------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def synthetic_vocab_index(synthetic_corpus: SyntheticCorpus) -> RetrievalIndex:
+    """A vocabulary-tree index over the same synthetic corpus the brute force uses."""
+    return build_retrieval_index(synthetic_corpus.descriptors, RetrievalConfig(backend="vocab"))
+
+
+def test_auto_takes_brute_force_for_a_short_sequence_and_the_vocabulary_for_a_long_one() -> None:
+    """`auto` switches at `brute_force_max_images`, so Galileo and RoboCap take different paths.
+
+    The switch exists because the brute force's descriptor budget is global: at 4528 images
+    `max_total_descriptors` leaves 22 descriptors each and every score collapses.
+    """
+    config: RetrievalConfig = RetrievalConfig()
+    assert config.backend == "auto"
+    assert config.resolve_backend(226) == "brute_force"
+    assert config.resolve_backend(config.brute_force_max_images) == "brute_force"
+    assert config.resolve_backend(config.brute_force_max_images + 1) == "vocab"
+    assert config.resolve_backend(4528) == "vocab"
+    assert RetrievalConfig(backend="brute_force").resolve_backend(4528) == "brute_force"
+    assert RetrievalConfig(backend="vocab").resolve_backend(2) == "vocab"
+
+
+def test_the_vocabulary_backend_finds_the_revisit_once_neighbours_are_excluded(
+    synthetic_corpus: SyntheticCorpus, synthetic_vocab_index: RetrievalIndex
+) -> None:
+    """The recall test the brute force passes, on the same corpus and the same gate.
+
+    This is the seam that matters: whatever the score means, `i + 50` must outrank every
+    other image once the temporal gate removes `i`'s neighbours.
+    """
+    assert synthetic_vocab_index.backend == "vocab"
+    gate_us: int = 5 * FRAME_PERIOD_US
+    for query_id in range(synthetic_corpus.loop_offset):
+        candidates: list[Candidate] = synthetic_vocab_index.query(
+            query_id, top_k=20, min_time_gap_us=gate_us, timestamps=synthetic_corpus.timestamps_us
+        )
+        assert candidates, f"image {query_id} retrieved nothing"
+        assert candidates[0].image_id == query_id + synthetic_corpus.loop_offset
+        assert candidates[0].score > synthetic_vocab_index.good_score_threshold
+
+
+def test_the_vocabulary_score_ranks_the_revisit_above_the_neighbour_above_the_stranger(
+    synthetic_vocab_index: RetrievalIndex,
+) -> None:
+    """Scores are symmetric, 1.0 on the diagonal, and ordered by the known overlap.
+
+    The DBoW2 L1 score is not the shared-landmark fraction — quantising descriptors into
+    words loses some of the overlap — so the assertions are on the ordering and on the
+    unrelated pair staying under the score gate, not on the exact value.
+    """
+    revisit: float = synthetic_vocab_index.score(10, 60)
+    neighbour: float = synthetic_vocab_index.score(10, 11)
+    stranger: float = synthetic_vocab_index.score(0, 99)
+    assert synthetic_vocab_index.score(10, 10) == 1.0
+    assert synthetic_vocab_index.score(60, 10) == revisit
+    assert revisit > neighbour > stranger
+    assert stranger < synthetic_vocab_index.good_score_threshold
+
+
+def test_the_vocabulary_backend_is_reproducible_and_the_seed_is_what_moves_it(
+    synthetic_corpus: SyntheticCorpus, synthetic_vocab_index: RetrievalIndex
+) -> None:
+    """k-means seeding is drawn from `RetrievalConfig.seed`, so a rebuild is bit-identical.
+
+    The blob's tree is explicitly *not* reproducible — it seeds libc `rand()` with nothing
+    (`docs/spec/bow.md` §6.5) — so this is a property the reimplementation adds.
+    """
+    rebuilt: RetrievalIndex = build_retrieval_index(synthetic_corpus.descriptors, RetrievalConfig(backend="vocab"))
+    np.testing.assert_array_equal(rebuilt.similarity, synthetic_vocab_index.similarity)
+    reseeded: RetrievalIndex = build_retrieval_index(synthetic_corpus.descriptors, RetrievalConfig(backend="vocab", seed=7))
+    assert not np.array_equal(reseeded.similarity, synthetic_vocab_index.similarity)
+    assert reseeded.query(10, top_k=1)[0].score > 0.0
+
+
+def test_the_vectorised_l1_score_agrees_with_the_spec_reference() -> None:
+    """`_all_pairs_l1_score` must equal `docs/spec/bow.md` §9.5's `l1_score`, pair by pair.
+
+    The vectorised path replaces `-0.5 * (|q - d| - |q| - |d|)` with `min(q, d)`, which is
+    the same thing for non-negative weights and is what lets the inverted index score every
+    pair in one pass. The identity is the load-bearing step, so it is checked against the
+    literal expression from the spec.
+    """
+    generator: np.random.Generator = np.random.default_rng(0)
+    n_images: int = 6
+    n_words: int = 40
+    words: Int32[ndarray, "n_descriptors"] = generator.integers(0, n_words, 600).astype(np.int32)
+    images: Int32[ndarray, "n_descriptors"] = np.repeat(np.arange(n_images, dtype=np.int32), 100)
+    bow = _bow_matrix(words, images, n_images, n_words)
+    scores: Float32[ndarray, "n_images n_images"] = _all_pairs_l1_score(bow)
+    dense: Float32[ndarray, "n_images n_words"] = bow.toarray()
+    np.testing.assert_allclose(dense.sum(axis=1), 1.0, atol=1e-6)
+
+    for first in range(n_images):
+        for second in range(n_images):
+            if first == second:
+                continue
+            query: dict[int, float] = {word: float(value) for word, value in enumerate(dense[first]) if value > 0.0}
+            document: dict[int, float] = {word: float(value) for word, value in enumerate(dense[second]) if value > 0.0}
+            assert l1_score(query, document) == pytest.approx(float(scores[first, second]), abs=1e-6)
+
+
+def test_the_vocabulary_backend_builds_and_queries_1000_images_inside_the_budget() -> None:
+    """1000 x 2048 descriptors: build and 1000 queries, both well under the pipeline budget.
+
+    Measured here: 11.1 s to build and 0.07 s for all 1000 queries, because the inverted
+    index scores every pair during the build. The bounds are generous multiples so the test
+    fails on an algorithmic regression rather than on a busy machine. RoboCap's real 4528
+    images take 42 s to build and 1.4 s to query.
+    """
+    corpus: dict[int, Descriptors] = _random_corpus(1000, 2048, seed=1)
+    started: float = time.perf_counter()
+    index: RetrievalIndex = build_retrieval_index(corpus, RetrievalConfig(backend="vocab"))
+    build_seconds: float = time.perf_counter() - started
+    started = time.perf_counter()
+    for image_id in index.image_ids:
+        index.query(image_id, top_k=20)
+    query_seconds: float = time.perf_counter() - started
+    print(f"vocab retrieval: 1000 x 2048 -> {index.n_words} words, build {build_seconds:.1f} s, 1000 queries {query_seconds:.2f} s")
+    assert index.n_words == RetrievalConfig().vocab_branching ** RetrievalConfig().vocab_depth
+    assert build_seconds < 90.0
+    assert query_seconds < 30.0
 
 
 # --------------------------------------------------------------------------------------
@@ -400,6 +534,53 @@ def test_galileo_scores_separate_near_views_from_far_ones(galileo_index: Retriev
     )
     assert float(np.median(best_per_row)) > 0.1
     assert float(np.median(galileo_index.similarity)) < 0.02
+
+
+@pytest.fixture(scope="module")
+def galileo_vocab_index(galileo_descriptors: Mapping[int, Descriptors]) -> RetrievalIndex:
+    """A vocabulary-tree index over the real Galileo descriptors."""
+    return build_retrieval_index(galileo_descriptors, RetrievalConfig(backend="vocab"))
+
+
+def test_galileo_vocabulary_top_candidate_is_a_nearby_view(galileo_vocab_index: RetrievalIndex, galileo_frames_meta: FramesMeta) -> None:
+    """The vocab backend, on real ALIKED descriptors, ranks by geometry rather than by chance.
+
+    Galileo is a 0.66 m sweep over 29 rig frames of 8 cameras, so there is no true revisit;
+    what the data supports is that the best match is a nearby view of the same scene. On
+    the shipped descriptors the vocab backend puts the top candidate within 2 rig frames
+    for 222/226 keyframes and in the same or the stereo-paired camera for 226/226 — better
+    than the brute force's 194/226, which is what the RoboCap measurements predict: the
+    brute force is the one paying for its descriptor budget, not the vocabulary.
+
+    The bar is the 80 % the task fixed, which sits well under the measured 97 %, so the
+    test fails on a real regression rather than on k-means noise.
+    """
+    stereo_partner: dict[int, int] = {}
+    for pair in galileo_frames_meta.stereo_pairs:
+        stereo_partner[pair.left_camera_params_id] = pair.right_camera_params_id
+        stereo_partner[pair.right_camera_params_id] = pair.left_camera_params_id
+    keyframe_by_id = galileo_frames_meta.keyframe_by_id()
+    rig_order: dict[int, int] = {rig.synced_sample_id: position for position, rig in enumerate(galileo_frames_meta.rig_frames())}
+
+    same_camera_family: int = 0
+    top1_within_two_rigs: int = 0
+    for keyframe_id in galileo_vocab_index.image_ids:
+        candidates: list[Candidate] = galileo_vocab_index.query(keyframe_id, top_k=1)
+        assert candidates, f"keyframe {keyframe_id} retrieved nothing"
+        query_camera: int = keyframe_by_id[keyframe_id].camera_params_id
+        query_rig: int = rig_order[keyframe_by_id[keyframe_id].synced_sample_id]
+        best_camera: int = keyframe_by_id[candidates[0].image_id].camera_params_id
+        same_camera_family += best_camera in (query_camera, stereo_partner[query_camera])
+        top1_within_two_rigs += abs(rig_order[keyframe_by_id[candidates[0].image_id].synced_sample_id] - query_rig) <= 2
+
+    n_keyframes: int = len(galileo_vocab_index.image_ids)
+    print(
+        f"galileo vocab retrieval: build {galileo_vocab_index.build_seconds:.1f} s, "
+        f"{galileo_vocab_index.n_words} words, top1 same-or-stereo camera {same_camera_family}/{n_keyframes}, "
+        f"top1 within 2 rigs {top1_within_two_rigs}/{n_keyframes}"
+    )
+    assert top1_within_two_rigs >= 0.80 * n_keyframes
+    assert same_camera_family >= 0.95 * n_keyframes
 
 
 # --------------------------------------------------------------------------------------

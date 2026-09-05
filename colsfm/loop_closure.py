@@ -77,6 +77,90 @@ Galileo result, the identity lands 0.28 mm away and the stored weights 2.17 mm a
 identity is the default and `LoopClosureConfig.use_stored_weights` is the documented
 option, weighting by inlier count (the more standard of the blob's two schemes).
 
+Measured on RoboCap: the retrieval is solved, the estimator is not
+--------------------------------------------------------------------
+
+Once `colsfm.retrieval`'s vocab backend gave this stage real candidates on RoboCap (4528
+keyframes, 1132 rig frames, a 124 m walk), the whole funnel was run end to end against the
+blob's own 90 LOOP edges. Retrieval and selection are **right**; the two-view estimator of
+step 3-5 above is **not good enough**, and these are the numbers that show it.
+
+Funnel, `good_score_threshold` 0.1, temporal gap 12.07 s (0.08 x the 150.8 s session):
+
+| stage | count |
+|---|---|
+| query keyframes (left camera of the one stereo pair) | 1132 |
+| retrieval hits after the temporal gate | 22 640 |
+| dropped by `good_score_threshold` | 4 926 |
+| dropped by `estimate_two_view_geometry` | 782 |
+| dropped by `is_good` | 0 |
+| dropped by the scale range | 5 |
+| verified | 16 927 |
+| after `select_best_candidates` | 1 729 |
+| after one edge per rig pair | 1 585 |
+| after `gate_loop_edges` (3.0 m / 30 deg) | 488 |
+
+All **90** of the blob's LOOP pairs are covered by those 488 edges to within 2 rig frames
+(and by the verified candidates too), so nothing true is being missed.
+
+Pose graph, 1131 sequential edges from the input priors plus the loop edges, against the
+blob's `vehicle_pose.tum` after rigid alignment:
+
+| edges fed to `solve_pose_graph` | RMSE vs the blob's PGO |
+|---|---|
+| sequential only (the input trajectory) | 460.8 mm |
+| sequential + the blob's own 90 LOOP edges | **135.0 mm** |
+| sequential + **oracle** poses on our 488 rig pairs | **39.9 mm** |
+| sequential + our 488 two-view + prior-scale edges | 609.0 mm |
+
+The middle two rows are the controls that localise the fault. Our `sequential_edges`
+reproduce the blob's CONSECUTIVE edges to **0.00 mm**, and feeding the blob's own loop
+edges through `colsfm.pose_graph.solve_pose_graph` lands 135 mm from its result — so the
+solver and the edge conventions are right. Replacing only the *measurement* on our own 488
+rig pairs with the blob's optimised relative poses lands at 39.9 mm — so the **pair
+selection is right too**. What is left is the measurement itself.
+
+Why the measurement is weak, and what would fix it
+--------------------------------------------------
+
+`docs/spec/generate_association_main.md` §7.2 recommends replacing the blob's four-view
+stereo estimator with "a plain 2-view essential-matrix estimate between query and
+candidate; recover metric scale afterwards from the given poses". On RoboCap that
+recommendation is **wrong**, and not for the reason it looks like:
+
+* Taking the magnitude from the prior means the edge can never contradict the prior about
+  distance — which is exactly the drift a loop closure exists to remove. Our edges have a
+  median `||t||` of 0.417 m where the blob's have 0.157 m.
+* The translation *direction* is the harder problem. A revisit baseline here is 0.2-0.4 m
+  against a scene several metres deep, so the essential matrix barely constrains it. Our
+  direction sits 30 deg from the prior's — but the prior and the blob's own PGO sit
+  **44 deg** apart on the same pairs, so a few tens of degrees is simply the noise floor of
+  a 0.3 m vector, not a bug.
+
+Replacing the whole estimate with metric stereo triangulation plus PnP — triangulate the
+query rig's own stereo matches against its **86 mm** known baseline, then
+`pycolmap.estimate_and_refine_absolute_pose` of the candidate camera against those metric
+points — was measured on the same 488 pairs and is the only variant that moves the
+trajectory the way the blob's did:
+
+| loop edge measurement | RMSE vs the blob's PGO |
+|---|---|
+| two-view + prior scale (what this module ships) | 609.0 mm (worse than the input) |
+| stereo triangulation + PnP | **434.5 mm** (better than the input's 460.8 mm) |
+
+It is not implemented here because 434.5 mm is still far from the 39.9 mm the same pairs
+allow: an 86 mm baseline triangulating a scene metres deep leaves depth errors of the same
+order as the loop translation itself. Closing the rest of the gap needs the blob's
+refinement and its selectivity as well — `StereoPoseRefineSolver`, the occupied-area and
+inlier gates of `docs/spec/generate_association_main.md` §6.4, and the ~8 % acceptance rate
+that leaves it with 90 edges where this module keeps 488. That is the next piece of work,
+and it is an estimator problem, not a retrieval one.
+
+**Consequence for callers today:** on a long sequence this stage now produces hundreds of
+loop edges where it used to produce none, and on RoboCap they make the pose graph
+measurably worse. `LoopClosureConfig.enabled` stays **False**, and a caller that turns it
+on must measure the trajectory before and after rather than assume loops help.
+
 Everything is behind `LoopClosureConfig.enabled`, which is **False**. On Galileo, turning
 loops on moves camera positions by 5-13 mm against a 5 mm ATE budget
 (`docs/spec/pose_graph_main.md` §8): on a short, low-drift sequence they can easily hurt.
@@ -128,9 +212,15 @@ class LoopClosureConfig:
     RoboCap. Validate per dataset before turning this on."""
     top_k: int = 20
     """`query_result_number`: retrieval hits considered per query keyframe."""
-    good_score_threshold: float = 0.1
-    """Minimum retrieval score. The blob's value for its BoW L1 score; `colsfm.retrieval`
-    keeps its own score in `[0, 1]` so the number stays meaningful."""
+    good_score_threshold: float | None = None
+    """Minimum retrieval score, or None to take the index's own backend default.
+
+    The two `colsfm.retrieval` backends produce different quantities — a
+    mutual-nearest-neighbour vote ratio and the blob's DBoW2 L1 score — so a single
+    constant would be right for at most one of them. Both were calibrated separately and
+    both landed on 0.1; `colsfm.retrieval.default_good_score_threshold` carries the
+    measurements. Set this to override, for instance to 0.15 on the vocab backend, which
+    halves the pairs handed to the matcher at 95 % rather than 88 % precision."""
     loop_interval_threshold_in_seconds: float = 10.0
     """`association_config.loop_interval_threshold_in_seconds`. Note this exceeds the whole
     0.933 s Galileo session, so it must be lowered to get any candidate there."""
@@ -157,10 +247,20 @@ class LoopClosureConfig:
     a whole session and the candidate is rejected rather than rescaled to the blob's 0.47."""
     max_translation_m: float = 3.0
     """`loop_edge_translation_threshold_meters`, applied by `gate_loop_edges`. The shipped
-    configs leave it at 0.0, which rejects everything."""
+    isaac config leaves it at 0.0, which rejects everything; `data/cusfm_configs/
+    loop-closure-fixed` repairs it to 1.0.
+
+    Measured on the blob's own 90 RoboCap LOOP edges, the relative rig translation runs
+    0.007-0.962 m with a median of 0.157 m — right up against its own 1.0 m gate. 3.0 m is
+    kept as the default so a slightly worse prior pose does not silently drop a true
+    revisit; the geometric verification, not this gate, is what rejects a bad pair."""
     max_rotation_deg: float = 30.0
     """`loop_edge_rotation_threshold_degrees`, applied by `gate_loop_edges`. Also 0.0 in
-    every shipped config."""
+    the shipped isaac config, and 10.0 in `loop-closure-fixed`.
+
+    The blob's 90 RoboCap LOOP edges rotate by 2.5-12.0 deg, median 7.2 — so its own 10 deg
+    gate is already binding on its own output. 30 deg leaves headroom for the same reason
+    as the translation gate."""
     use_stored_weights: bool = False
     """When True the edge information is `loop_edge_information(inliers, loop_residual_weight)`
     instead of the identity. The blob's own solver discards the stored value; measured
@@ -206,6 +306,9 @@ class LoopClosureDiagnostics:
     """`max(timestamp) - min(timestamp)` over the keyframes, in seconds."""
     min_time_gap_seconds: float
     """The temporal gap actually applied: `max(fixed threshold, ratio * session duration)`."""
+    good_score_threshold: float
+    """The retrieval score gate actually applied, after the index's backend default was
+    resolved. Reported because the two backends' scores are not the same quantity."""
     queries: int
     """Query keyframes the stage issued a retrieval for."""
     candidates_retrieved: int
@@ -548,6 +651,7 @@ def find_loop_edges(
     timestamps_us: dict[int, int] = {keyframe_id: keyframe.timestamp_microseconds for keyframe_id, keyframe in keyframe_by_id.items()}
     duration_seconds: float = session_duration_seconds(list(timestamps_us.values()))
     gap_seconds: float = minimum_time_gap_seconds(list(timestamps_us.values()), config)
+    score_threshold: float = index.good_score_threshold if config.good_score_threshold is None else config.good_score_threshold
 
     counters: dict[str, int] = dict.fromkeys(
         (
@@ -573,6 +677,7 @@ def find_loop_edges(
             enabled=config.enabled,
             session_duration_seconds=duration_seconds,
             min_time_gap_seconds=gap_seconds,
+            good_score_threshold=score_threshold,
             edges=edge_count,
             **counters,
         )
@@ -615,6 +720,7 @@ def find_loop_edges(
                     cameras=cameras,
                     frames_meta=frames_meta,
                     config=config,
+                    score_threshold=score_threshold,
                     match_fn=match_fn,
                     counters=counters,
                 )
@@ -662,6 +768,7 @@ def _verify_candidate(
     cameras: Mapping[int, pycolmap.Camera],
     frames_meta: FramesMeta,
     config: LoopClosureConfig,
+    score_threshold: float,
     match_fn: MatchFunction,
     counters: dict[str, int],
 ) -> LoopCandidate | None:
@@ -676,13 +783,14 @@ def _verify_candidate(
         cameras: Calibrated `pycolmap.Camera` per `camera_params_id`.
         frames_meta: The parsed metadata, for the rig extrinsics.
         config: Gates and thresholds.
+        score_threshold: The resolved `good_score_threshold` for the index's backend.
         match_fn: The injected matcher.
         counters: Diagnostic counters, mutated in place.
 
     Returns:
         The verified candidate, or None when any gate rejected it.
     """
-    if candidate.score < config.good_score_threshold:
+    if candidate.score < score_threshold:
         counters["rejected_by_score"] += 1
         return None
     target: KeyframeMeta | None = keyframe_by_id.get(candidate.image_id)

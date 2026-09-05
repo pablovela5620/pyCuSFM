@@ -43,7 +43,13 @@ from colsfm.loop_closure import (
     session_duration_seconds,
 )
 from colsfm.pose_graph import PoseGraphEdge, RigNode, gate_loop_edges, sequential_edges, solve_pose_graph
-from colsfm.retrieval import ALIKED_DESCRIPTOR_DIM, RetrievalConfig, RetrievalIndex, build_retrieval_index
+from colsfm.retrieval import (
+    ALIKED_DESCRIPTOR_DIM,
+    RetrievalConfig,
+    RetrievalIndex,
+    build_retrieval_index,
+    default_good_score_threshold,
+)
 from colsfm.schema import KEYFRAMES_METADATA_COLLECTION, load_schema
 
 REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
@@ -426,6 +432,27 @@ def test_the_stage_is_off_by_default(scene: SquareRigScene, match_fn: MatchFunct
     assert result.edges == []
     assert result.diagnostics.enabled is False
     assert result.diagnostics.queries == 0
+
+
+def test_the_score_gate_falls_back_to_the_index_backend_and_can_be_overridden(
+    scene: SquareRigScene, match_fn: MatchFunction, loop_result: LoopClosureResult
+) -> None:
+    """`good_score_threshold` is None by default and resolves against the index's backend.
+
+    The two `colsfm.retrieval` backends score different quantities, so one hard-coded
+    constant would be right for at most one of them. The diagnostics report the value that
+    was actually applied, exactly as they do for the temporal gap.
+    """
+    assert LoopClosureConfig().good_score_threshold is None
+    assert scene.index.backend == "brute_force"
+    assert loop_result.diagnostics.good_score_threshold == default_good_score_threshold("brute_force")
+
+    strict: LoopClosureResult = find_loop_edges(
+        scene.frames_meta, scene.database_path, scene.index, LoopClosureConfig(enabled=True, good_score_threshold=0.99), match_fn
+    )
+    assert strict.diagnostics.good_score_threshold == 0.99
+    assert strict.diagnostics.rejected_by_score > 0
+    assert strict.edges == []
 
 
 def test_loop_edges_recover_the_ground_truth_relative_rig_pose(scene: SquareRigScene, loop_result: LoopClosureResult) -> None:
