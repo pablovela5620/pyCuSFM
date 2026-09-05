@@ -275,11 +275,47 @@ LD_LIBRARY_PATH = "${CONDA_PREFIX}/lib:${CONDA_PREFIX}/lib/python3.12/site-packa
 caspar-probe = { cmd = "python -m tools.caspar_probe", description = "Time CASPAR against Ceres bundle adjustment on the synthetic rig and the Galileo model" }
 caspar-test = { cmd = "python -m pytest tests/colsfm_probes -q", description = "Run the pycolmap capability probe suite against the from-source CASPAR build" }
 
+
+# ── decode-bench: GPU JPEG decode (nvJPEG via torchcodec) benchmarking ───────
+# Isolated audit-only environment for docs/gpu-jpeg-decode.md.  It is
+# `no-default-feature` with its own solve group for the same reason `colsfm`
+# is: it pulls CUDA PyTorch (~3 GB with libtorch + magma + nccl), and nothing
+# about that solve may perturb the frozen cuSFM / TensorRT environments.
+# torchcodec 0.16.0 is on conda-forge with a `cuda130_py312*` build that
+# depends on `pytorch * cuda130*` and `libnvjpeg` — no PyPI wheels needed.
+[feature.decode-bench.system-requirements]
+cuda = "13.0"
+
+[feature.decode-bench.dependencies]
+python = "3.12.*"
+# The build string is what selects the CUDA variant; a bare `pytorch` spec
+# resolves to the cpu_* build even with `cuda-version = "13.0.*"` present
+# (same trap as `pycolmap` in `[feature.colsfm.dependencies]`).
+pytorch = { version = "2.13.*", build = "cuda130*" }
+torchcodec = { version = "0.16.*", build = "cuda130*" }
+numpy = "*"
+# `colsfm.features_trt.preprocess_image` decodes with OpenCV, not PIL, so the
+# baseline path (a) has to be OpenCV or it is not the baseline.
+libopencv = "*"
+py-opencv = "*"
+pillow = "*"
+tyro = "*"
+jaxtyping = "*"
+beartype = "*"
+cuda-version = "13.0.*"
+cuda-cudart = "*"
+# nvJPEG itself: torchcodec's CUDA `decode_image` links it.
+libnvjpeg = "*"
+
+[feature.decode-bench.tasks]
+decode-bench = { cmd = "python -m tools.audit.decode_bench", description = "Benchmark GPU (nvJPEG) against CPU JPEG decode for the feature-extraction stage" }
+
 [environments]
 raco = { features = ["raco"], no-default-feature = true, solve-group = "raco" }
 bench = { features = ["raco", "bench"], no-default-feature = true }
 colsfm = { features = ["colsfm"], no-default-feature = true, solve-group = "colsfm" }
 colsfm-caspar = { features = ["colsfm-caspar"], no-default-feature = true, solve-group = "colsfm-caspar" }
+decode-bench = { features = ["decode-bench"], no-default-feature = true, solve-group = "decode-bench" }
 
 [activation.env]
 LD_LIBRARY_PATH = "${PIXI_PROJECT_ROOT}/pycusfm/x86_cuda13/lib:${CONDA_PREFIX}/lib/python3.12/site-packages/tensorrt_libs:${CONDA_PREFIX}/lib:/usr/lib/x86_64-linux-gnu"
