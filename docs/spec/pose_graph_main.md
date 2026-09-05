@@ -714,7 +714,13 @@ translation. The node is fully fixed; there is no soft prior. Logged as
 3. **One fully-fixed anchor** (the source node of the first edge). No soft prior.
 4. **Sequential edges from the input odometry**, `connected_keyframe_num` links forward.
 5. **Residual** `[log(R_err); t_err]` whitened by `chol(Λ)ᵀ`, **no robust loss**.
-6. **Loop edge weighting** `Λ = I₆ · score · loop_residual_weight` with `score = 1/‖t_rel‖`.
+6. **Loop edge weighting: the solver uses `Λ = I₆` for every edge, loop edges included.**
+   `relative_constraint_use_pose_covariance` is false in every shipped config, so the stored
+   `I₆ · score · loop_residual_weight` (§7) is *written* to `vehicle_pose_graph.pb.txt` but
+   overwritten by `Λ_default` at solve time. Measured in `tests/colsfm/test_pose_graph.py`:
+   solving with the stored weights lands 2.17 mm / 0.087° from the blob's archived 8-loop
+   result, solving with `I₆` lands 0.28 mm / 0.0098°. Keep the stored value only if the
+   file must be byte-comparable.
 7. **Export all five files** — `feature_matcher_task_builder_main` reads
    `pose_graph/frames_meta.json` (`cusfm_runner.py:655-657`), and the pose exporters read the
    vehicle files.
