@@ -270,10 +270,13 @@ class PipelineOptions:
     costs 4.4x on Galileo (33.9 s against 7.6 s, measured)."""
     ba_backend: BaBackend = "ceres"
     """Which implementation solves the bundle adjustments — Ceres on the CPU, or COLMAP's
-    CASPAR on the GPU. `caspar` needs the `colsfm-caspar` environment's CASPAR-enabled
-    pycolmap and falls back to `ceres`, loudly, when it is missing, when a camera model is
-    outside PINHOLE / SIMPLE_RADIAL, or when `--optimize-extrinsics` is set. It also drops
-    the robust loss; see `colsfm.mapping`'s module docstring."""
+    CASPAR on the GPU. `caspar` needs a CASPAR-enabled pycolmap and falls back to `ceres`,
+    loudly, when it is missing, when `--optimize-extrinsics` is set, or when a camera model
+    is one this build's CASPAR has no adapter for. Which models those are is measured at
+    run time (`colsfm.mapping.caspar_supported_camera_models`): PINHOLE and SIMPLE_RADIAL
+    in `colsfm-caspar` and `colsfm-caspar64`, plus OPENCV_FISHEYE in
+    `colsfm-caspar-fisheye` (`docs/caspar-fisheye-adapter.md`). It also drops the robust
+    loss; see `colsfm.mapping`'s module docstring."""
     ba_num_threads: int | None = None
     """Ceres threads; None takes `bundle_adjustment_config.num_threads` (8) from the config,
     which is what the blob solves with. Set 1 for a bit-reproducible solve."""

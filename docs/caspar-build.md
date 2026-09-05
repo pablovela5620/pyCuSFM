@@ -248,7 +248,11 @@ class MappingOptions:
     """
 ```
 
-At the point where the options object is built:
+At the point where the options object is built (this was the original design sketch;
+the shipped implementation in `colsfm/mapping.py` replaces the constant with a cached
+runtime probe, `caspar_supported_camera_models()`, that solves a tiny reconstruction per
+candidate model and reads `num_residuals`, so a build with the fisheye adapter is detected
+automatically — see docs/caspar-fisheye-adapter.md §9):
 
 ```python
 CASPAR_CAMERA_MODELS: frozenset[pycolmap.CameraModelId] = frozenset(

@@ -334,12 +334,15 @@ backend — the cameras must be `OPENCV_FISHEYE` in the model, which stock CASPA
 would skip and this build solves natively:
 
 ```bash
-pixi run -e colsfm-caspar-fisheye python -m colsfm.pipeline \
-    --dataset robocap \
-    --input data/robocap/<segment> \
-    --output data/cusfm_runs/robocap_caspar_fisheye \
+pixi run -e colsfm-caspar-fisheye python -m colsfm run \
+    --input-dir data/cusfm_runs/robocap_blobref/input \
+    --output-dir data/cusfm_runs/robocap_colsfm_caspar/cusfm \
     --ba-backend caspar
 ```
+
+(§9.3 has this command with the short-slice variant the user prefers for quick
+iteration; the pipeline has no frame-limit flag, so the slice is a filtered
+`frames_meta.json` plus symlinked images.)
 
 Two constraints CASPAR imposes on any such run, fisheye or not:
 `refine_focal_length` must equal `refine_extra_params` (the merged
@@ -410,3 +413,158 @@ question is plausibly what stalls all three. Do not schedule around a merge.
   cost of an 84-file scheduling churn) or pin the exact Caspar revision used.
   A PR that quietly changed those 84 files would look like unexplained noise;
   raising it as its own issue first is the cheaper path.
+
+---
+
+## 9. Wiring it into colsfm: the capability probe
+
+§6's `--dataset robocap` snippet is a placeholder; the commands that actually
+run are in §9.3 below.
+
+`--ba-backend caspar` has always had a pre-flight check that falls back to Ceres
+when the model carries a camera CASPAR would skip. Until this adapter existed
+that check was a constant, `{PINHOLE, SIMPLE_RADIAL}`, so this environment's
+fisheye build would have been refused the very rigs it was made for. The set is
+now a property of the build, measured at run time.
+
+### 9.1 How the probe knows
+
+`colsfm.mapping.caspar_supported_camera_models()` builds a minimal two-frame,
+sixteen-point reconstruction per candidate model — PINHOLE, SIMPLE_RADIAL,
+OPENCV_FISHEYE, OPENCV, FULL_OPENCV — solves each on CASPAR, and reads
+`BundleAdjustmentSummary.num_residuals`:
+
+| | supported model | unsupported model |
+|---|---|---|
+| COLMAP log | — | `Skipping image N with unsupported camera model` |
+| `num_residuals` | `2 x observations` | `0` |
+| `termination_type` | `CONVERGENCE` | `USER_FAILURE` |
+
+`num_residuals` is the signal rather than the termination type or a
+did-the-poses-move test: it is bound by pycolmap, it is exactly zero when every
+image was skipped, and it does not confuse "CASPAR refused this model" with
+"CASPAR failed for some other reason". A build without `CASPAR_ENABLED` throws
+on the first `create_default_bundle_adjuster`, which the probe reports as the
+empty set — and an empty set disables the camera check, because there is no
+half-problem to protect against and the existing solve-time fallback already
+names the missing build.
+
+Measured on the 5090, one process each:
+
+| environment | probe answers | probe cost |
+|---|---|---|
+| `colsfm` (stock pycolmap) | `{}` | 0.001 s |
+| `colsfm-caspar` | `{PINHOLE, SIMPLE_RADIAL}` | 0.194 s |
+| `colsfm-caspar-fisheye` | `{OPENCV_FISHEYE, PINHOLE, SIMPLE_RADIAL}` | 0.244 s |
+
+The probe is `functools.cache`d, so a run pays for it once, and it is reached
+only when `--ba-backend caspar` was asked for.
+`MappingOptions.caspar_supported_models` overrides it with a stated set — that
+is what the unit tests use, so the rule "model not in the set means Ceres" is
+asserted identically on every environment, and it is also how to force a model
+through a build whose adapter is not yet trusted.
+
+### 9.2 What it changes
+
+A synthetic two-camera OPENCV_FISHEYE rig, 30 frames, 1495 recovered points,
+mapped end to end through `run_mapping` with the isaac config, `--ba-backend
+caspar` in both environments:
+
+| | `colsfm-caspar` | `colsfm-caspar-fisheye` |
+|---|---|---|
+| backend that ran | `ceres` (fallback) | **`caspar`** |
+| bundle adjustment (s) | 0.061 | 0.135 (0.045 of it polish, 2 iterations) |
+| total mapping (s) | 0.249 | 0.331 |
+| points / reprojection | 1495 / 0.3570 px | 1495 / 0.3570 px |
+
+Against a plain `--ba-backend ceres` run of the same rig in
+`colsfm-caspar-fisheye` (0.063 s of BA, same 1495 points, same 0.3570 px), the
+CASPAR-plus-polish poses agree to **0.037 mm / 0.0000 deg worst case, 0.020 mm
+median** over the 30 rig frames. The GPU is *slower* here, as on Galileo, and
+for the same reason: a fifteen-hundred-point problem does not pay for the kernel
+launches. What the measurement establishes is agreement, not speed; the speed
+case is KITTI-scale (NOTES.md "CASPAR backend": 148.5 s to 41.3 s on 2156
+images).
+
+Galileo, 226 pinhole images, `--ba-backend caspar` in `colsfm-caspar-fisheye`,
+benched against the blob reference: **225/226 images, 6301 points, 1.389 px,
+4.313 mm ATE, 4/4 acceptance bounds**, mapping 2.61 s of a 16.91 s total, polish
+21 iterations in 0.198 s, `mapping.ba_backend == "caspar"` in `summary.json`.
+That is `colsfm-caspar`'s 4.30 mm / 4-of-4 to within the run-to-run noise, so
+the extra adapters cost the pinhole path nothing.
+
+### 9.3 The RoboCap run, for when the data is back
+
+RoboCap is the fisheye rig this whole adapter is for, and it was off disk while
+this was written; nothing below has been executed against it.
+
+```bash
+# Full segment, GPU bundle adjustment, Ceres polish on (the default):
+pixi run -e colsfm-caspar-fisheye python -m colsfm run \
+    --input-dir data/cusfm_runs/robocap_blobref/input \
+    --output-dir data/cusfm_runs/robocap_colsfm_caspar/cusfm \
+    --ba-backend caspar
+```
+
+Confirm it really went to the GPU rather than falling back — the run prints
+`this CASPAR build projects [...] and this model has [...]` when it did not, and
+`summary.json` records what actually ran:
+
+```bash
+python -c "import json;print(json.load(open('data/cusfm_runs/robocap_colsfm_caspar/cusfm/summary.json'))['mapping'])"
+# expect: 'ba_backend': 'caspar', with 'polish_seconds' and 'polish_iterations' set
+```
+
+**A short slice, for quick iteration.** The pipeline has no frame-limit flag —
+`--min-inter-frame-distance` and `--min-inter-frame-rotation-degrees` thin the
+keyframes but never truncate the sequence — so trim `frames_meta.json` and leave
+the imagery where it is. `FramesMeta.filtered` keeps a subset of keyframe ids,
+and `rig_frames()` groups them by synchronised sample, so N rig frames is N
+synchronised samples of every camera:
+
+```bash
+cat > /tmp/robocap_slice.py <<'PY'
+"""Write a short-slice input directory: the first N rig frames, images symlinked."""
+from __future__ import annotations
+from pathlib import Path
+import tyro
+from colsfm.frames_meta import FRAMES_META_NAME, FramesMeta, read_frames_meta, write_frames_meta
+
+
+def main(input_dir: Path, output_dir: Path, num_rig_frames: int = 40) -> None:
+    """Link the imagery of `input_dir` into `output_dir` under a trimmed `frames_meta.json`."""
+    meta: FramesMeta = read_frames_meta(input_dir / FRAMES_META_NAME)
+    keep: list[int] = [kid for rig_frame in meta.rig_frames()[:num_rig_frames] for kid in rig_frame.keyframe_ids]
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for entry in sorted(input_dir.iterdir()):
+        if entry.name == FRAMES_META_NAME:
+            continue
+        link: Path = output_dir / entry.name
+        if not link.exists():
+            link.symlink_to(entry.resolve())
+    write_frames_meta(output_dir / FRAMES_META_NAME, meta.filtered(keep))
+    print(f"[slice] {len(keep)} of {len(meta.keyframes)} keyframes, {num_rig_frames} rig frames -> {output_dir}")
+
+
+if __name__ == "__main__":
+    tyro.cli(main)
+PY
+
+pixi run -e colsfm-caspar-fisheye python /tmp/robocap_slice.py \
+    --input-dir data/cusfm_runs/robocap_blobref/input \
+    --output-dir /tmp/robocap_slice --num-rig-frames 40
+
+pixi run -e colsfm-caspar-fisheye python -m colsfm run \
+    --input-dir /tmp/robocap_slice \
+    --output-dir /tmp/colsfm_runs/robocap_slice_caspar/cusfm \
+    --ba-backend caspar
+```
+
+The recipe was validated on Galileo, which stands in for RoboCap's directory
+layout: 10 rig frames of 226 keyframes gave a 78-image input that mapped in
+6.98 s against the full run's 16.91 s.
+
+The comparison worth making once the full run exists is the same one §5 makes on
+the synthetic rig — `--ba-backend caspar` against `--ba-backend ceres` on
+identical input — because on a real fisheye rig the fallback is no longer
+available as a control: in `colsfm-caspar` the caspar run *is* the ceres run.

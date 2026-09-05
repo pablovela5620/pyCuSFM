@@ -826,10 +826,20 @@ pycolmap (`docs/caspar-build.md`, `packages/pycolmap-caspar`). The flag is safe 
 anywhere: the `BundleAdjustmentBackend.CASPAR` enum is bound unconditionally and proves
 nothing, the missing capability surfaces only when the adjuster is *built*, and
 `colsfm.mapping.solve_bundle_adjustment` catches that `ValueError` once and finishes the run
-on Ceres. Two pre-flight fallbacks join it: a camera model outside PINHOLE / SIMPLE_RADIAL,
-whose observations CASPAR *silently drops*, and `--optimize-extrinsics`, which CASPAR cannot
+on Ceres. Two pre-flight fallbacks join it: a camera model this build's CASPAR has no adapter
+for, whose observations it *silently drops*, and `--optimize-extrinsics`, which CASPAR cannot
 honour because it holds `sensor_from_rig` fixed. `summary.json` records the backend that
 actually ran (`mapping.ba_backend`), not the one that was asked for.
+
+**The camera-model check reads the build, not a list.** Which models CASPAR projects is a
+property of the binary and no pycolmap call reports it, so
+`colsfm.mapping.caspar_supported_camera_models` measures it: one sixteen-point CASPAR solve
+per candidate model, and `summary.num_residuals == 0` means the images were skipped. The
+whole sweep is ~0.2 s, cached per process and reached only on `--ba-backend caspar`. It
+answers `{PINHOLE, SIMPLE_RADIAL}` in `colsfm-caspar` and `colsfm-caspar64`, and adds
+OPENCV_FISHEYE in `colsfm-caspar-fisheye` (`docs/caspar-fisheye-adapter.md`), so a fisheye
+rig keeps the GPU there and falls back to Ceres — naming the supported set — everywhere else.
+Galileo is unmoved by the change: 4.31 mm ATE, 4/4 bounds, CASPAR in either environment.
 
 **A CASPAR run ends on one Ceres bundle adjustment.** CASPAR stops on a damping blow-up
 while a few percent of the cost is still reachable, so `run_mapping` runs the five outer
@@ -906,7 +916,7 @@ polish.
 **Recommendation: `--ba-backend caspar` on pinhole datasets, polish on.** With the polish on
 by default it is Ceres' accuracy at 3.6x less mapping time (41.3 s against 148.5 s on
 KITTI 06, 9 mm of ATE apart), so the flag is now the recommended setting wherever the
-cameras are PINHOLE or SIMPLE_RADIAL and the extrinsics are fixed; without it — and
+cameras are ones the build projects and the extrinsics are fixed; without it — and
 `--no-caspar-ceres-polish` is exactly that ablation — CASPAR alone still costs 0.4 m and
 remains a debug-loop convenience. The default of `MappingOptions.ba_backend` stays `ceres`
 because the stock environment has no CASPAR build to fall back from silently.

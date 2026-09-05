@@ -13,6 +13,7 @@ through pytest's own injection.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
@@ -97,6 +98,18 @@ def caspar_enabled() -> bool:
     except ValueError:
         return False
     return True
+
+
+@pytest.fixture(scope="session")
+def pixi_environment_name() -> str:
+    """Which pixi environment this run is in, e.g. `colsfm-caspar-fisheye`.
+
+    The three CASPAR environments differ only in the pycolmap they carry, and the
+    thing that tells them apart — which camera models CASPAR projects — is exactly
+    what the probe under test measures. Asking pixi instead keeps the expectation
+    independent of the code that produces it. Empty outside a pixi shell.
+    """
+    return os.environ.get("PIXI_ENVIRONMENT_NAME", "")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

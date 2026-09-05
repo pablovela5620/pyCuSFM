@@ -38,6 +38,7 @@ from colsfm.config import BundleAdjustmentConfig, CusfmConfig, VisionMappingConf
 from colsfm.export import read_runtime_records
 from colsfm.frames_meta import FramesMeta, KeyframeMeta, parse_message, read_frames_meta, write_rigid_transform
 from colsfm.mapping import (
+    CASPAR_STOCK_CAMERA_MODELS,
     Correspondences,
     MappingOptions,
     MappingResult,
@@ -45,6 +46,7 @@ from colsfm.mapping import (
     apply_caspar_options,
     backend_name,
     bundle_adjustment_options,
+    caspar_supported_camera_models,
     ceres_polish_options,
     filter_degenerate_points,
     filter_projection_failures,
@@ -404,6 +406,20 @@ def synthetic_database(synthetic_rig: SyntheticRig, tmp_path_factory: pytest.Tem
     _write_database(
         database_path, synthetic_rig.frames_meta, synthetic_rig.keypoints_px, _synthetic_matches(synthetic_rig)
     )
+    return database_path
+
+
+@pytest.fixture(scope="module")
+def fisheye_rig() -> SyntheticRig:
+    """A 6-frame, two-camera OPENCV_FISHEYE rig: the model stock CASPAR cannot project."""
+    return build_synthetic_rig(num_frames=6, num_points=200, fisheye=True, seed=3)
+
+
+@pytest.fixture(scope="module")
+def fisheye_database(fisheye_rig: SyntheticRig, tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The fisheye rig's observations as a COLMAP database."""
+    database_path: Path = tmp_path_factory.mktemp("fisheye") / "database.db"
+    _write_database(database_path, fisheye_rig.frames_meta, fisheye_rig.keypoints_px, _synthetic_matches(fisheye_rig))
     return database_path
 
 
@@ -847,23 +863,97 @@ def test_the_default_backend_is_ceres_and_leaves_caspar_alone(
     assert ba_options.caspar.gpu_index == "-1"
 
 
-def test_a_camera_model_caspar_would_silently_drop_falls_back_to_ceres(
+def test_a_camera_model_this_caspar_build_cannot_project_falls_back_to_ceres(
     isaac_config: CusfmConfig, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """An OPENCV_FISHEYE rig goes to Ceres, and the warning names the model.
+    """An OPENCV_FISHEYE rig goes to Ceres on a build whose adapters stop at SIMPLE_RADIAL.
 
-    CASPAR skips the observations of every model but PINHOLE and SIMPLE_RADIAL with
-    a log line and still reports success, so a silent half-problem is what the
-    fallback exists to prevent.
+    CASPAR skips the observations of a model it has no adapter for with a log line
+    and still reports success, so a silent half-problem is what the fallback exists
+    to prevent. The supported set is injected rather than probed, so the test states
+    one rule — model not in the set means Ceres — on every environment.
     """
     rig: SyntheticRig = build_synthetic_rig(num_frames=4, num_points=50, fisheye=True, seed=3)
     reconstruction: pycolmap.Reconstruction = build_reconstruction(rig.frames_meta).reconstruction
 
     ba_options: pycolmap.BundleAdjustmentOptions = bundle_adjustment_options(
-        isaac_config.vision_mapping.bundle_adjustment, _quiet_options(ba_backend="caspar"), reconstruction
+        isaac_config.vision_mapping.bundle_adjustment,
+        _quiet_options(ba_backend="caspar", caspar_supported_models=CASPAR_STOCK_CAMERA_MODELS),
+        reconstruction,
     )
     assert backend_name(ba_options) == "ceres"
-    assert "OPENCV_FISHEYE" in capsys.readouterr().out
+    printed: str = capsys.readouterr().out
+    assert "OPENCV_FISHEYE" in printed
+    # The warning has to say what this build *can* do, or the reader cannot tell a
+    # missing adapter from a missing build.
+    assert "SIMPLE_RADIAL" in printed
+
+
+def test_a_fisheye_rig_stays_on_caspar_when_the_build_has_the_adapter(
+    isaac_config: CusfmConfig, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The same rig keeps CASPAR once OPENCV_FISHEYE is in the supported set.
+
+    This is the whole point of making the pre-flight capability-aware: the
+    `colsfm-caspar-fisheye` build projects OPENCV_FISHEYE, so a fisheye rig must
+    not be sent to Ceres there.
+    """
+    rig: SyntheticRig = build_synthetic_rig(num_frames=4, num_points=50, fisheye=True, seed=3)
+    reconstruction: pycolmap.Reconstruction = build_reconstruction(rig.frames_meta).reconstruction
+
+    ba_options: pycolmap.BundleAdjustmentOptions = bundle_adjustment_options(
+        isaac_config.vision_mapping.bundle_adjustment,
+        _quiet_options(
+            ba_backend="caspar", caspar_supported_models=CASPAR_STOCK_CAMERA_MODELS | {"OPENCV_FISHEYE"}
+        ),
+        reconstruction,
+    )
+    assert backend_name(ba_options) == "caspar"
+    assert "OPENCV_FISHEYE" not in capsys.readouterr().out
+
+
+def test_the_probe_reports_the_camera_models_this_caspar_build_projects(
+    caspar_enabled: bool, pixi_environment_name: str
+) -> None:
+    """`caspar_supported_camera_models` reads the build, not a hard-coded list.
+
+    Stock CASPAR (COLMAP 4.2.0) ships adapters for PINHOLE and SIMPLE_RADIAL only;
+    `colsfm-caspar-fisheye` adds OPENCV_FISHEYE (`docs/caspar-fisheye-adapter.md`).
+    The expectation comes from the environment name, so it is independent of the
+    solve the probe runs to find out.
+    """
+    if not caspar_enabled:
+        pytest.skip("this pycolmap is built without CASPAR_ENABLED; run under `pixi run -e colsfm-caspar`")
+    supported: frozenset[str] = caspar_supported_camera_models()
+    print(f"[colsfm] {pixi_environment_name or 'unknown env'} CASPAR projects {sorted(supported)}")
+
+    assert CASPAR_STOCK_CAMERA_MODELS <= supported
+    if pixi_environment_name == "colsfm-caspar-fisheye":
+        assert "OPENCV_FISHEYE" in supported
+    else:
+        assert supported == CASPAR_STOCK_CAMERA_MODELS
+
+
+def test_the_probe_answers_once_and_quickly(caspar_enabled: bool) -> None:
+    """The probe is cached, so the mapper pays for it once per process.
+
+    It runs a real CASPAR solve per candidate model, which is only acceptable
+    because it happens once and takes well under a second.
+    """
+    if not caspar_enabled:
+        pytest.skip("this pycolmap is built without CASPAR_ENABLED; run under `pixi run -e colsfm-caspar`")
+    caspar_supported_camera_models()
+    started: float = time.perf_counter()
+    cached: frozenset[str] = caspar_supported_camera_models()
+    assert time.perf_counter() - started < 0.01
+    assert cached is caspar_supported_camera_models()
+
+
+def test_the_probe_reports_nothing_without_a_caspar_build(caspar_enabled: bool) -> None:
+    """A pycolmap without CASPAR_ENABLED supports no model, so every rig falls back."""
+    if caspar_enabled:
+        pytest.skip("this pycolmap has CASPAR; the empty answer only exists on the stock build")
+    assert caspar_supported_camera_models() == frozenset()
 
 
 def test_refining_extrinsics_falls_back_to_ceres(
@@ -931,6 +1021,52 @@ def test_the_mapper_runs_on_caspar_or_reports_the_build_that_cannot(
     assert caspar.num_registered_images == ceres.num_registered_images
     assert caspar.num_points3D == pytest.approx(ceres.num_points3D, rel=0.05)
     assert caspar.mean_reprojection_error_px == pytest.approx(ceres.mean_reprojection_error_px, abs=0.05)
+
+
+
+def test_a_fisheye_rig_maps_on_caspar_only_where_the_adapter_exists(
+    fisheye_rig: SyntheticRig,
+    fisheye_database: Path,
+    isaac_config: CusfmConfig,
+    caspar_enabled: bool,
+    pixi_environment_name: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """End to end on an OPENCV_FISHEYE rig, the run the capability probe exists for.
+
+    `colsfm-caspar-fisheye` carries the adapter, so the rounds run on the GPU and the
+    Ceres polish finishes them; `colsfm-caspar` does not, so the pre-flight names the
+    model and the whole run is Ceres, which has already converged and needs no polish.
+    Either way the map is checked against the rig's own points, not against the solver.
+    """
+    if not caspar_enabled:
+        pytest.skip("this pycolmap is built without CASPAR_ENABLED; run under `pixi run -e colsfm-caspar`")
+    result: MappingResult = run_mapping(
+        build_reconstruction(fisheye_rig.frames_meta),
+        fisheye_database,
+        isaac_config.vision_mapping,
+        _quiet_options(ba_backend="caspar"),
+    )
+    printed: str = capsys.readouterr().out
+    recovered, mixed_tracks, relative_errors = _match_tracks_to_truth(result.reconstruction, fisheye_rig)
+    print(
+        f"[colsfm] fisheye rig on {pixi_environment_name or 'unknown env'}: backend {result.ba_backend}, "
+        f"{result.num_points3D} points, {result.mean_reprojection_error_px:.4f} px"
+    )
+    assert mixed_tracks == 0
+    assert len(recovered) / len(fisheye_rig.points_xyz) >= 0.95
+    assert float(np.median(relative_errors)) < 0.01
+
+    if pixi_environment_name == "colsfm-caspar-fisheye":
+        assert result.ba_backend == "caspar"
+        assert "OPENCV_FISHEYE" not in printed
+        assert result.polish is not None
+        assert result.polish.num_observations > 0
+        assert result.polish.mean_reprojection_error_after_px <= result.polish.mean_reprojection_error_before_px
+    else:
+        assert result.ba_backend == "ceres"
+        assert "OPENCV_FISHEYE" in printed
+        assert result.polish is None
 
 
 
