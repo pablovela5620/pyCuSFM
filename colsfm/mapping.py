@@ -1,0 +1,715 @@
+"""Triangulation and global bundle adjustment: the `keypoints_mapper_main` replacement.
+
+Implements `docs/spec/keypoints_mapper_main.md` §5.3-§5.6 (the triangulate /
+merge / complete / filter / BA outer loop) and §6 (the bundle adjustment) on
+pycolmap's `IncrementalTriangulator`, `ObservationManager` and
+`create_default_bundle_adjuster`, against a reconstruction built by
+`colsfm.reconstruction.build_reconstruction` and a COLMAP database written by
+the feature and matching stages.
+
+```
+frames_meta.json ──> build_reconstruction ──┐
+                                            ├──> run_mapping ──> MappingResult
+database.db (keypoints + two-view geoms) ───┘
+```
+
+Poses are a **prior, not an initialisation**: every rig frame is registered
+before the first triangulation, and only bundle adjustment moves them.
+
+## What is deliberately not reproduced
+
+Two cuSFM behaviours are known defects and are left out (§9.5):
+
+1. **Unweighted constant-frame residuals.** cuSFM whitens every reprojection
+   residual by `1/sigma` except the ones observing the gauge keyframe, whose
+   functor has no weight member — 13 of 6276 blocks in Galileo. COLMAP applies
+   one weighting uniformly and there is no way to ask for the inconsistency.
+2. **The 3-D depth residual** (`VehicleCameraReprojectionCost3D`) for keypoints
+   carrying depth. pycolmap's bundle adjuster is 2-D only, and Galileo sets
+   `keypoint_feature_has_depth: false`.
+
+## Overrides forced on pycolmap, and why
+
+| Setting | pycolmap default | Here | Reason |
+|---|---|---|---|
+| `IncrementalTriangulatorOptions.min_angle` | 1.5 | `min_triangulation_deg` (2.0) | config §3.1 |
+| `merge_max_reproj_error`, `complete_max_reproj_error` | 4.0 | the round's gate `g_k` | cuSFM merges and completes under the same decaying gate (§5.4, §5.6) |
+| `ignore_two_view_tracks` | True | `min_correspondences > 2` | `min_correspondences: 3` drops two-view tracks |
+| `random_seed` | -1 | `random_seed` (1) | determinism |
+| `refine_focal_length` | True | False | `--optimize_intrinsics=false` |
+| `refine_extra_params` | True | False | same |
+| `refine_principal_point` | False | False | same; already off |
+| `refine_sensor_from_rig` | True | `MappingOptions.optimize_extrinsics` (False) | `--optimize_extrinsics=false` |
+| `ceres.loss_function_type` | TRIVIAL | `loss_type` (CAUCHY) | config §3.2 |
+| `ceres.loss_function_scale` | 1.0 | `sigma * loss_function_scale` (4.0) | see below |
+| `ceres.auto_select_solver_type` | True | False | otherwise the explicit solver choice is ignored |
+| `solver_options.linear_solver_type` | SPARSE_NORMAL_CHOLESKY | `MappingOptions.linear_solver` | cuSFM: SPARSE_SCHUR on CPU, SPARSE_NORMAL_CHOLESKY on the cuDSS path (§6.5) |
+| `solver_options.max_num_iterations` | 100 | 200 | config §3.2 |
+| `solver_options.max_linear_solver_iterations` | 200 | 100 | config §3.2 |
+| `solver_options.num_threads` | -1 | `num_threads` (8) | config §3.2 |
+| `solver_options.function_tolerance` | **0.0** | 1e-6 | cuSFM leaves Ceres' defaults; pycolmap overrides them |
+| `solver_options.gradient_tolerance` | **1e-4** | 1e-10 | same |
+| `solver_options.parameter_tolerance` | **0.0** | 1e-8 | same |
+
+**The loss scale carries the whitening.** cuSFM divides the 2-vector
+reprojection residual by `reprojection_error_standard_deviation = 4.0 px` and
+then applies `CauchyLoss(1.0)`. COLMAP does not whiten. `CauchyLoss(a)` is
+`a^2 log(1 + s/a^2)` in the squared residual `s`, so evaluating it at `s/sigma^2`
+with `a = 1` equals evaluating it at `s` with `a = sigma`, up to the constant
+factor `sigma^2` that cannot move the minimum. The port therefore sets
+`loss_function_scale = sigma * loss_function_scale = 4.0` (§9.2).
+
+## What §9.3 promises that pycolmap cannot deliver
+
+`IncrementalTriangulatorOptions` has **no** RANSAC block and no residual-type
+switch: `ransac.max_error`, `confidence`, `max_num_trials`, `min_inlier_ratio`
+and `TriangulationResidualType.REPROJECTION_ERROR` live on
+`EstimateTriangulationOptions`, which only the standalone
+`pycolmap.estimate_triangulation` takes. Driving the triangulator therefore
+means accepting COLMAP's own angular create/continue thresholds (2.0 deg) and
+enforcing the pixel gate `g_k` where it is reachable: on merging, on completion
+and on the per-round filter. Deriving the create threshold from the gate through
+the focal length (`atan(g_k / f)`) was tried and moves nothing: 2035 points
+against 2035, 1.6706 px against 1.6706.
+
+## Measured against the blob, on the blob's own matches
+
+| | Galileo 32 keyframes | Galileo 226 keyframes |
+|---|---|---|
+| images with observations | 28 vs 28 | 224 vs 224 |
+| points | 2035 vs 1275 | 14 496 vs 5065 |
+| mean reprojection | 1.671 vs 1.699 px | 1.415 vs 1.550 px |
+| worst rig-pose difference | 1.26 mm / 0.118 deg | 2.55 mm / 0.092 deg |
+| the blob's own pose correction | 11.27 mm / 0.569 deg | 12.66 mm / 0.364 deg |
+| runtime | 0.9 vs 1.1 s | 8.0 vs 6.7 s |
+
+The point count is the one figure that does not match. cuSFM grows **one**
+disjoint track per connected component of the match graph and triangulates it
+with plain MSAC — no local optimisation, no final refit — so it rejects roughly
+half its candidate tracks. COLMAP's LO-RANSAC keeps them. The result is a
+superset at a lower reprojection error: 98-99 % of the blob's points have one of
+ours within 5 cm, and merging is already at a fixed point (a second
+`merge_all_tracks` pass returns 0), so the difference is structural rather than
+a missing merge.
+"""
+
+from __future__ import annotations
+
+import re
+import time
+from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Final, Literal, TypeAlias
+
+import pycolmap
+import pycolmap.pyceres as colmap_ceres
+
+from colsfm.config import BundleAdjustmentConfig, LossFunctionType, VisionMappingConfig
+
+LinearSolver: TypeAlias = Literal["SPARSE_SCHUR", "SPARSE_NORMAL_CHOLESKY"]
+"""The two linear solvers cuSFM uses: SPARSE_SCHUR on the CPU, the other on the cuDSS path."""
+
+CERES_FUNCTION_TOLERANCE: Final[float] = 1e-6
+"""Ceres' own default, which cuSFM keeps and pycolmap overrides to 0.0."""
+
+CERES_GRADIENT_TOLERANCE: Final[float] = 1e-10
+"""Ceres' own default, which cuSFM keeps and pycolmap overrides to 1e-4."""
+
+CERES_PARAMETER_TOLERANCE: Final[float] = 1e-8
+"""Ceres' own default, which cuSFM keeps and pycolmap overrides to 0.0."""
+
+LOSS_FUNCTION_BY_NAME: Final[dict[LossFunctionType, pycolmap.LossFunctionType]] = {
+    "TRIVIAL": pycolmap.LossFunctionType.TRIVIAL,
+    "SOFT_L1": pycolmap.LossFunctionType.SOFT_L1,
+    "CAUCHY": pycolmap.LossFunctionType.CAUCHY,
+    "HUBER": pycolmap.LossFunctionType.HUBER,
+}
+"""cuSFM's `loss_type` enum to pycolmap's; the two sets coincide exactly."""
+
+BRIEF_REPORT_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"Iterations:\s*(\d+),\s*Initial cost:\s*([0-9.eE+-]+),\s*Final cost:\s*([0-9.eE+-]+)"
+)
+"""`BundleAdjustmentSummary` exposes iterations and cost only inside `brief_report()`."""
+
+
+@dataclass(frozen=True, slots=True)
+class MappingOptions:
+    """Knobs the mapper takes from the command line rather than from a config file."""
+
+    optimize_extrinsics: bool = False
+    """Refine `sensor_from_rig`; cuSFM's `--optimize_extrinsics`, off by default."""
+    fixed_camera_params_id: int | None = None
+    """Camera whose extrinsic stays fixed while the others are refined; cuSFM's `--fixed_camera_name`."""
+    num_threads: int | None = None
+    """Ceres threads; the config's `num_threads` when None. Use 1 for a reproducible solve.
+    Triangulation is single-threaded in COLMAP either way, so it does not carry cuSFM's
+    threaded-triangulation non-determinism (§5.3)."""
+    use_gpu: bool = False
+    """Hand the Ceres solve to the GPU; COLMAP still needs 50+ images before it switches."""
+    gpu_index: str = "-1"
+    """GPU to solve on when `use_gpu`; `-1` lets Ceres choose."""
+    linear_solver: LinearSolver = "SPARSE_SCHUR"
+    """Linear solver; cuSFM's CPU default. The cuDSS path uses SPARSE_NORMAL_CHOLESKY."""
+    stop_on_observation_change: bool = True
+    """Leave the outer loop when `(merged + completed + filtered) / observations` falls
+    below `max_observation_change`. cuSFM logs `use num_ba_iterations to stop BA`, so
+    its two stopping rules are exclusive; set this False to always run every round."""
+    print_ba_summary: bool = False
+    """Print COLMAP's own solver summary per round."""
+    verbose: bool = True
+    """Print one line per triangulation pass and per outer round, as cuSFM does."""
+
+
+@dataclass(slots=True)
+class Correspondences:
+    """The correspondence graph a triangulator needs, kept alive alongside its owner.
+
+    `IncrementalTriangulator` holds raw references to the graph and the
+    reconstruction, so the `DatabaseCache` that owns the graph has to outlive
+    both. Keeping all three in one object is what guarantees that.
+    """
+
+    database_cache: pycolmap.DatabaseCache
+    """Owns the correspondence graph; must outlive every triangulator built on it."""
+    graph: pycolmap.CorrespondenceGraph
+    """Keypoint correspondences from the database's verified two-view geometries."""
+    observation_manager: pycolmap.ObservationManager
+    """Bookkeeping for observations and the filters, bound to the reconstruction."""
+    num_images: int
+    """Images the database contributed correspondences for."""
+    num_image_pairs: int
+    """Verified image pairs that survived `min_num_matches`."""
+
+
+@dataclass(frozen=True, slots=True)
+class RoundStats:
+    """One outer triangulate / filter / bundle-adjust round (§5.4)."""
+
+    round_index: int
+    """Zero-based round number, `k` in the gate schedule."""
+    max_pixel_error: float
+    """The round's reprojection gate `g_k`, in pixels."""
+    num_merged: int
+    """Observations merged by `merge_all_tracks`."""
+    num_completed: int
+    """Observations added by `complete_all_tracks`."""
+    num_filtered: int
+    """Observations dropped by the reprojection, angle, depth and track-length filters."""
+    num_observations: int
+    """Observations left in the reconstruction after filtering; cuSFM's `num observed`."""
+    observation_change: float
+    """`(merged + completed + filtered) / observations`, the early-exit statistic."""
+    num_points3D: int
+    """Points left after this round's bundle adjustment."""
+    mean_reprojection_error_px: float
+    """Mean reprojection error after this round, in pixels."""
+    ba_num_iterations: int
+    """Ceres iterations the solver reported."""
+    ba_initial_cost: float
+    """Ceres cost before the solve. Not cuSFM's logged `Initial cost`, which is a normalised RMS."""
+    ba_final_cost: float
+    """Ceres cost after the solve."""
+    ba_termination: str
+    """`CONVERGENCE`, `NO_CONVERGENCE` or `FAILURE`."""
+    seconds: float
+    """Wall-clock seconds the round took, bundle adjustment included."""
+
+
+@dataclass(frozen=True, slots=True)
+class MappingResult:
+    """What `run_mapping` produced, and how long each phase took."""
+
+    reconstruction: pycolmap.Reconstruction
+    """The adjusted reconstruction; the same object that was passed in."""
+    num_registered_images: int
+    """Images belonging to a registered frame, whether or not they see a point."""
+    num_images_with_observations: int
+    """Images that observe at least one point; what a COLMAP export writes out."""
+    num_points3D: int
+    """Triangulated points that survived every filter."""
+    num_observations: int
+    """Point-to-image observations in the final map."""
+    mean_reprojection_error_px: float
+    """Mean reprojection error over all observations, in pixels."""
+    mean_track_length: float
+    """Mean observations per point; cuSFM's `Mean length`."""
+    rounds: tuple[RoundStats, ...]
+    """Per-round statistics, in order."""
+    correspondence_seconds: float
+    """Time spent loading keypoints and two-view geometries from the database."""
+    triangulation_seconds: float
+    """Time spent in the initial triangulation passes."""
+    bundle_adjustment_seconds: float
+    """Time spent inside `BundleAdjuster.solve`, summed over the rounds."""
+    total_seconds: float
+    """Wall-clock seconds for the whole call."""
+
+
+@dataclass(frozen=True, slots=True)
+class _FilterCounts:
+    """Observations removed by one round's filters, split by cause."""
+
+    reprojection_and_angle: int = 0
+    """Dropped by `filter_all_points3D` (reprojection, negative depth, triangulation angle)."""
+    negative_depth: int = 0
+    """Dropped by the explicit cheirality pass."""
+    short_track: int = 0
+    """Dropped for having fewer than `min_correspondences` observations."""
+    world_z: int = 0
+    """Dropped because the point sits beyond `depth_threshold` on the world Z axis."""
+
+    def total(self) -> int:
+        """Total observations removed.
+
+        Returns:
+            The sum of every cause.
+        """
+        return self.reprojection_and_angle + self.negative_depth + self.short_track + self.world_z
+
+
+def pixel_error_schedule(mapping_config: VisionMappingConfig) -> tuple[float, ...]:
+    """The linear per-round reprojection gate, `initial` to `final` (§5.6).
+
+    `g_k = initial + (final - initial) * k / (N - 1)`, which is 25, 20, 15, 10, 5
+    for the isaac profile and 40, 32, 24, 16, 8 for AV. A single-round
+    configuration stays at `initial`.
+
+    Args:
+        mapping_config: The mapping configuration.
+
+    Returns:
+        One gate per outer round, in pixels.
+    """
+    num_rounds: int = max(mapping_config.num_ba_iterations, 1)
+    if num_rounds == 1:
+        return (mapping_config.initial_max_pixel_error,)
+    span: float = mapping_config.final_max_pixel_error - mapping_config.initial_max_pixel_error
+    return tuple(mapping_config.initial_max_pixel_error + span * index / (num_rounds - 1) for index in range(num_rounds))
+
+
+def triangulator_options(mapping_config: VisionMappingConfig, max_pixel_error: float) -> pycolmap.IncrementalTriangulatorOptions:
+    """Triangulator options for one round's gate.
+
+    Args:
+        mapping_config: The mapping configuration.
+        max_pixel_error: The round's reprojection gate, in pixels.
+
+    Returns:
+        Options with the module docstring's overrides applied.
+    """
+    options: pycolmap.IncrementalTriangulatorOptions = pycolmap.IncrementalTriangulatorOptions()
+    options.min_angle = mapping_config.min_triangulation_deg
+    options.merge_max_reproj_error = max_pixel_error
+    options.complete_max_reproj_error = max_pixel_error
+    options.ignore_two_view_tracks = mapping_config.min_correspondences > 2
+    options.random_seed = mapping_config.random_seed
+    return options
+
+
+def bundle_adjustment_options(
+    ba_config: BundleAdjustmentConfig, options: MappingOptions
+) -> pycolmap.BundleAdjustmentOptions:
+    """Bundle adjustment options mirroring cuSFM's `BundleAdjustmentConfig` (§9.2).
+
+    Args:
+        ba_config: The Ceres settings from `vision_mapping_config.pb.txt`.
+        options: Command-line style knobs.
+
+    Returns:
+        Options with every override of the module docstring applied.
+
+    Raises:
+        KeyError: When the configuration names a loss pycolmap does not have.
+    """
+    ba_options: pycolmap.BundleAdjustmentOptions = pycolmap.BundleAdjustmentOptions()
+    ba_options.refine_focal_length = False
+    ba_options.refine_principal_point = False
+    ba_options.refine_extra_params = False
+    ba_options.refine_rig_from_world = True
+    ba_options.refine_sensor_from_rig = options.optimize_extrinsics
+    ba_options.refine_points3D = True
+    ba_options.print_summary = options.print_ba_summary
+
+    num_threads: int = ba_config.num_threads if options.num_threads is None else options.num_threads
+    ba_options.ceres.loss_function_type = LOSS_FUNCTION_BY_NAME[ba_config.loss_type]
+    ba_options.ceres.loss_function_scale = ba_config.reprojection_error_standard_deviation * ba_config.loss_function_scale
+    ba_options.ceres.use_gpu = options.use_gpu
+    ba_options.ceres.gpu_index = options.gpu_index
+    ba_options.ceres.auto_select_solver_type = False
+    solver_options = ba_options.ceres.solver_options
+    solver_options.linear_solver_type = getattr(colmap_ceres.LinearSolverType, options.linear_solver)
+    solver_options.num_threads = num_threads
+    solver_options.max_num_iterations = ba_config.max_num_iterations
+    solver_options.max_num_consecutive_invalid_steps = ba_config.max_invalid_steps
+    solver_options.max_linear_solver_iterations = ba_config.max_linear_solver_iterations
+    solver_options.function_tolerance = CERES_FUNCTION_TOLERANCE
+    solver_options.gradient_tolerance = CERES_GRADIENT_TOLERANCE
+    solver_options.parameter_tolerance = CERES_PARAMETER_TOLERANCE
+    solver_options.minimizer_progress_to_stdout = False
+    return ba_options
+
+
+def load_correspondences(
+    reconstruction: pycolmap.Reconstruction,
+    database_path: Path,
+    min_num_matches: int = 0,
+) -> Correspondences:
+    """Load keypoints and verified two-view geometries into the reconstruction.
+
+    The database's keypoints become each image's `points2D` and its verified
+    two-view geometries become the correspondence graph the triangulator walks.
+    Nothing is re-estimated: the images already carry poses, and COLMAP's
+    `DatabaseCache` is used only for the keypoints and the graph.
+
+    Database image ids must equal the reconstruction's, because the graph is
+    keyed by them. Both come from cuSFM's keyframe ids, so they agree by
+    construction; a mismatch is a bug in whoever wrote the database and is
+    reported rather than silently mis-triangulated.
+
+    Args:
+        reconstruction: A reconstruction with registered, pose-carrying frames.
+        database_path: COLMAP database written by the feature and matching stages.
+        min_num_matches: Drop image pairs with fewer inlier matches; cuSFM's
+            `min_num_matches_per_pair`.
+
+    Returns:
+        The graph, the observation manager and the cache that owns them.
+
+    Raises:
+        FileNotFoundError: When the database does not exist.
+        ValueError: When a database image name maps to a different id than the
+            reconstruction's, or when the database holds none of its images.
+    """
+    if not database_path.is_file():
+        raise FileNotFoundError(f"No COLMAP database at {database_path}")
+    cache_options: pycolmap.DatabaseCacheOptions = pycolmap.DatabaseCacheOptions()
+    cache_options.min_num_matches = min_num_matches
+    cache_options.ignore_watermarks = False
+    cache_options.image_names = {image.name for image in reconstruction.images.values()}
+    with pycolmap.Database.open(database_path) as database:
+        database_cache: pycolmap.DatabaseCache = pycolmap.DatabaseCache.create(database, cache_options)
+
+    image_id_by_name: dict[str, int] = {image.name: image_id for image_id, image in reconstruction.images.items()}
+    mismatched: list[str] = []
+    num_loaded: int = 0
+    for image_id, cached_image in database_cache.images.items():
+        expected_image_id: int | None = image_id_by_name.get(cached_image.name)
+        if expected_image_id is None:
+            continue
+        if expected_image_id != image_id:
+            mismatched.append(f"{cached_image.name}: database id {image_id}, reconstruction id {expected_image_id}")
+            continue
+        reconstruction.image(image_id).points2D = cached_image.points2D
+        num_loaded += 1
+    if mismatched:
+        raise ValueError(f"Database and reconstruction disagree on image ids: {mismatched[:5]}")
+    if num_loaded == 0:
+        raise ValueError(f"{database_path} holds none of the reconstruction's {reconstruction.num_images()} images")
+
+    graph: pycolmap.CorrespondenceGraph = database_cache.correspondence_graph
+    observation_manager: pycolmap.ObservationManager = pycolmap.ObservationManager(reconstruction, graph)
+    return Correspondences(
+        database_cache=database_cache,
+        graph=graph,
+        observation_manager=observation_manager,
+        num_images=num_loaded,
+        num_image_pairs=graph.num_image_pairs(),
+    )
+
+
+def _registered_image_ids(reconstruction: pycolmap.Reconstruction) -> list[int]:
+    """Image ids belonging to a registered frame, ascending.
+
+    Args:
+        reconstruction: The model.
+
+    Returns:
+        Sorted image ids.
+    """
+    image_ids: list[int] = []
+    for frame_id in reconstruction.reg_frame_ids():
+        for data_id in reconstruction.frame(frame_id).data_ids:
+            if data_id.sensor_id.type == pycolmap.SensorType.CAMERA:
+                image_ids.append(data_id.id)
+    return sorted(image_ids)
+
+
+def _triangulate(
+    triangulator: pycolmap.IncrementalTriangulator,
+    image_ids: Sequence[int],
+    mapping_config: VisionMappingConfig,
+    max_pixel_error: float,
+    verbose: bool,
+) -> int:
+    """Run the inner triangulation loop until a pass adds nothing (§5.3).
+
+    cuSFM repeats up to `iterative_triangulation_times` passes and exits early
+    when a pass adds no point; observed 1 to 8 passes on Galileo.
+
+    Args:
+        triangulator: The triangulator, already bound to the reconstruction.
+        image_ids: Registered images to triangulate, in ascending id order.
+        mapping_config: The mapping configuration.
+        max_pixel_error: The first round's gate, in pixels.
+        verbose: Print one line per pass.
+
+    Returns:
+        Total observations triangulated.
+    """
+    options: pycolmap.IncrementalTriangulatorOptions = triangulator_options(mapping_config, max_pixel_error)
+    total: int = 0
+    for pass_index in range(max(mapping_config.iterative_triangulation_times, 1)):
+        added: int = sum(triangulator.triangulate_image(options, image_id) for image_id in image_ids)
+        total += added
+        if verbose:
+            print(f"[colsfm] triangulation pass {pass_index}: {added} observations")
+        if added == 0:
+            break
+    return total
+
+
+def _filter_points(
+    observation_manager: pycolmap.ObservationManager,
+    reconstruction: pycolmap.Reconstruction,
+    mapping_config: VisionMappingConfig,
+    max_pixel_error: float,
+) -> _FilterCounts:
+    """Apply cuSFM's four point filters for one round (§5.5).
+
+    The reprojection gate decays per round; the triangulation angle is the max
+    over observing pairs, matching cuSFM's `HasLargeEnoughTriangulateAngle`; the
+    depth test is a **world Z** cap, one axis and one-sided, not a camera depth.
+
+    Args:
+        observation_manager: Bookkeeping bound to the reconstruction.
+        reconstruction: The model to filter.
+        mapping_config: The mapping configuration.
+        max_pixel_error: The round's gate, in pixels.
+
+    Returns:
+        Observations removed, split by cause.
+    """
+    reprojection_and_angle: int = observation_manager.filter_all_points3D(
+        max_pixel_error, mapping_config.min_triangulation_deg
+    )
+    negative_depth: int = observation_manager.filter_observations_with_negative_depth()
+    short_track: int = observation_manager.filter_points3D_with_short_tracks(mapping_config.min_correspondences)
+    world_z: int = 0
+    beyond_depth: list[int] = [
+        point3D_id
+        for point3D_id, point in reconstruction.points3D.items()
+        if float(point.xyz[2]) > mapping_config.depth_threshold
+    ]
+    for point3D_id in beyond_depth:
+        world_z += reconstruction.point3D(point3D_id).track.length()
+        observation_manager.delete_point3D(point3D_id)
+    return _FilterCounts(
+        reprojection_and_angle=reprojection_and_angle,
+        negative_depth=negative_depth,
+        short_track=short_track,
+        world_z=world_z,
+    )
+
+
+def _solve(
+    reconstruction: pycolmap.Reconstruction,
+    ba_options: pycolmap.BundleAdjustmentOptions,
+    gauge_frame_id: int,
+    options: MappingOptions,
+) -> tuple[pycolmap.BundleAdjustmentSummary, float]:
+    """Run one global bundle adjustment over every registered image.
+
+    The gauge is one constant rig frame — cuSFM fixes a single keyframe, which
+    through the shared rig fixes its whole rig pose (§6.3). COLMAP's own
+    `fix_gauge` is deliberately not used: it would pick its own two frames and
+    the resulting trajectory would no longer be anchored where cuSFM anchors it.
+
+    Args:
+        reconstruction: The model to adjust, in place.
+        ba_options: Solver and refinement options.
+        gauge_frame_id: Frame whose `rig_from_world` stays constant.
+        options: Command-line style knobs.
+
+    Returns:
+        The solver summary and the seconds the solve took.
+    """
+    config: pycolmap.BundleAdjustmentConfig = pycolmap.BundleAdjustmentConfig()
+    for image_id in _registered_image_ids(reconstruction):
+        config.add_image(image_id)
+    config.set_constant_rig_from_world_pose(gauge_frame_id)
+    if options.optimize_extrinsics and options.fixed_camera_params_id is not None:
+        config.set_constant_sensor_from_rig_pose(
+            pycolmap.sensor_t(pycolmap.SensorType.CAMERA, options.fixed_camera_params_id)
+        )
+    adjuster: pycolmap.BundleAdjuster = pycolmap.create_default_bundle_adjuster(ba_options, config, reconstruction)
+    started: float = time.perf_counter()
+    summary: pycolmap.BundleAdjustmentSummary = adjuster.solve()
+    return summary, time.perf_counter() - started
+
+
+def _parse_brief_report(summary: pycolmap.BundleAdjustmentSummary) -> tuple[int, float, float]:
+    """Read iterations and costs out of Ceres' one-line report.
+
+    `BundleAdjustmentSummary` exposes `termination_type`, `num_residuals` and
+    `is_solution_usable`, but the iteration count and the costs only appear in
+    `brief_report()`.
+
+    Args:
+        summary: The solver summary.
+
+    Returns:
+        Iterations, initial cost and final cost; zeros when the report does not parse.
+    """
+    match: re.Match[str] | None = BRIEF_REPORT_PATTERN.search(summary.brief_report())
+    if match is None:
+        return 0, 0.0, 0.0
+    return int(match.group(1)), float(match.group(2)), float(match.group(3))
+
+
+def _images_with_observations(reconstruction: pycolmap.Reconstruction) -> int:
+    """Count images that observe at least one point.
+
+    Args:
+        reconstruction: The model.
+
+    Returns:
+        The number of images a COLMAP export would write with a non-empty track list.
+
+    Note:
+        `Image.num_points2D` is a method while `Image.num_points3D` is a
+        property — one of pycolmap 4.2's several method/property splits.
+    """
+    return sum(1 for image in reconstruction.images.values() if image.num_points3D > 0)
+
+
+def run_mapping(
+    reconstruction: pycolmap.Reconstruction,
+    database_path: Path,
+    mapping_config: VisionMappingConfig,
+    ba_config: BundleAdjustmentConfig,
+    options: MappingOptions | None = None,
+    gauge_frame_id: int | None = None,
+) -> MappingResult:
+    """Triangulate and bundle-adjust, cuSFM's `keypoints_mapper_main` §5.3-§5.6.
+
+    ```
+    load correspondences
+    triangulate every registered image, repeating until a pass adds nothing
+    for k in 0 .. num_ba_iterations - 1:
+        merge -> complete -> filter at gate g_k -> global bundle adjustment
+        stop early when (merged + completed + filtered) / observations < max_observation_change
+    ```
+
+    Args:
+        reconstruction: A reconstruction with registered, pose-carrying frames,
+            adjusted in place.
+        database_path: COLMAP database with keypoints and verified two-view geometries.
+        mapping_config: `vision_mapping_config.pb.txt`.
+        ba_config: The `BundleAdjustmentConfig` inside it.
+        options: Command-line style knobs; the defaults when None.
+        gauge_frame_id: Frame held constant for gauge; the frame owning the
+            lowest image id when None, which is cuSFM's own choice (§6.3).
+
+    Returns:
+        The adjusted reconstruction with per-round statistics and timings.
+
+    Raises:
+        FileNotFoundError: When the database does not exist.
+        ValueError: When the database and the reconstruction disagree on image
+            ids, or when no frame is registered.
+    """
+    resolved_options: MappingOptions = MappingOptions() if options is None else options
+    started: float = time.perf_counter()
+    image_ids: list[int] = _registered_image_ids(reconstruction)
+    if not image_ids:
+        raise ValueError("The reconstruction has no registered frames to map")
+    resolved_gauge_frame_id: int = (
+        reconstruction.image(min(image_ids)).frame_id if gauge_frame_id is None else gauge_frame_id
+    )
+
+    correspondence_started: float = time.perf_counter()
+    correspondences: Correspondences = load_correspondences(
+        reconstruction, database_path, mapping_config.min_num_matches_per_pair
+    )
+    correspondence_seconds: float = time.perf_counter() - correspondence_started
+
+    triangulator: pycolmap.IncrementalTriangulator = pycolmap.IncrementalTriangulator(
+        correspondences.graph, reconstruction, correspondences.observation_manager
+    )
+    schedule: tuple[float, ...] = pixel_error_schedule(mapping_config)
+    triangulation_started: float = time.perf_counter()
+    _triangulate(triangulator, image_ids, mapping_config, schedule[0], resolved_options.verbose)
+    triangulation_seconds: float = time.perf_counter() - triangulation_started
+    reconstruction.update_point_3d_errors()
+    if resolved_options.verbose:
+        print(
+            f"[colsfm] triangulation finished: {reconstruction.num_points3D()} points, "
+            f"reprojection {reconstruction.compute_mean_reprojection_error():.4f} px, "
+            f"mean length {reconstruction.compute_mean_track_length():.4f}"
+        )
+
+    ba_options: pycolmap.BundleAdjustmentOptions = bundle_adjustment_options(ba_config, resolved_options)
+    rounds: list[RoundStats] = []
+    bundle_adjustment_seconds: float = 0.0
+    for round_index, max_pixel_error in enumerate(schedule):
+        round_started: float = time.perf_counter()
+        round_options: pycolmap.IncrementalTriangulatorOptions = triangulator_options(mapping_config, max_pixel_error)
+        num_merged: int = triangulator.merge_all_tracks(round_options)
+        num_completed: int = triangulator.complete_all_tracks(round_options)
+        filtered: _FilterCounts = _filter_points(
+            correspondences.observation_manager, reconstruction, mapping_config, max_pixel_error
+        )
+        num_observations: int = reconstruction.compute_num_observations()
+        observation_change: float = (
+            (num_merged + num_completed + filtered.total()) / num_observations if num_observations else 0.0
+        )
+
+        summary, solve_seconds = _solve(reconstruction, ba_options, resolved_gauge_frame_id, resolved_options)
+        bundle_adjustment_seconds += solve_seconds
+        reconstruction.update_point_3d_errors()
+        num_iterations, initial_cost, final_cost = _parse_brief_report(summary)
+        rounds.append(
+            RoundStats(
+                round_index=round_index,
+                max_pixel_error=max_pixel_error,
+                num_merged=num_merged,
+                num_completed=num_completed,
+                num_filtered=filtered.total(),
+                num_observations=num_observations,
+                observation_change=observation_change,
+                num_points3D=reconstruction.num_points3D(),
+                mean_reprojection_error_px=reconstruction.compute_mean_reprojection_error(),
+                ba_num_iterations=num_iterations,
+                ba_initial_cost=initial_cost,
+                ba_final_cost=final_cost,
+                ba_termination=summary.termination_type.name,
+                seconds=time.perf_counter() - round_started,
+            )
+        )
+        if resolved_options.verbose:
+            latest: RoundStats = rounds[-1]
+            print(
+                f"[colsfm] round {round_index} gate {max_pixel_error:.1f} px: merged {num_merged}, "
+                f"completed {num_completed}, filtered {filtered.total()}, change {observation_change:.6f}, "
+                f"points {latest.num_points3D}, reprojection {latest.mean_reprojection_error_px:.4f} px"
+            )
+        if resolved_options.stop_on_observation_change and observation_change < mapping_config.max_observation_change:
+            if resolved_options.verbose:
+                print(f"[colsfm] observation change {observation_change:.6f} below {mapping_config.max_observation_change}")
+            break
+
+    return MappingResult(
+        reconstruction=reconstruction,
+        num_registered_images=len(image_ids),
+        num_images_with_observations=_images_with_observations(reconstruction),
+        num_points3D=reconstruction.num_points3D(),
+        num_observations=reconstruction.compute_num_observations(),
+        mean_reprojection_error_px=reconstruction.compute_mean_reprojection_error(),
+        mean_track_length=reconstruction.compute_mean_track_length(),
+        rounds=tuple(rounds),
+        correspondence_seconds=correspondence_seconds,
+        triangulation_seconds=triangulation_seconds,
+        bundle_adjustment_seconds=bundle_adjustment_seconds,
+        total_seconds=time.perf_counter() - started,
+    )
