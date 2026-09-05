@@ -4,10 +4,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pycolmap
 import pytest
+from jaxtyping import Float32
+from numpy import ndarray
 
-from colsfm.database import ImagePair, create_database, read_two_view_geometry
+from colsfm.database import ImagePair, KeypointsXY, MatchIndices, create_database, read_two_view_geometry
 from colsfm.features import FeatureOptions, extract_features
 from colsfm.frames_meta import FramesMeta, read_frames_meta
 from colsfm.matching import (
@@ -18,6 +21,7 @@ from colsfm.matching import (
     MatchReport,
     PairMatchStats,
     match_pairs,
+    subsample_matches_by_coverage,
     verification_options,
 )
 from colsfm.pairs import select_pairs, stereo_pairs
@@ -228,3 +232,112 @@ def test_pair_stats_retention_is_safe_on_an_empty_pair() -> None:
     """A pair with no raw matches reports zero retention rather than dividing by zero."""
     assert PairMatchStats(raw_matches=0, inlier_matches=0).retention == 0.0
     assert PairMatchStats(raw_matches=200, inlier_matches=190).retention == pytest.approx(0.95)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Spatial-coverage subsampling (the score-free stand-in for the blob's SSC NMS)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _dense_grid_keypoints(num_columns: int, num_rows: int, width: int, height: int) -> KeypointsXY:
+    """Keypoints on a regular lattice covering the image.
+
+    Args:
+        num_columns: Lattice columns.
+        num_rows: Lattice rows.
+        width: Image width in pixels.
+        height: Image height in pixels.
+
+    Returns:
+        Float32 `[num_columns * num_rows, 2]` xy pixel coordinates, row-major.
+    """
+    xs: Float32[ndarray, "num_columns"] = np.linspace(0.0, width - 1.0, num_columns, dtype=np.float32)
+    ys: Float32[ndarray, "num_rows"] = np.linspace(0.0, height - 1.0, num_rows, dtype=np.float32)
+    grid_x, grid_y = np.meshgrid(xs, ys)
+    return np.stack([grid_x.ravel(), grid_y.ravel()], axis=1).astype(np.float32)
+
+
+def test_subsample_keeps_everything_below_the_cap() -> None:
+    """Fewer matches than the cap is a no-op, so a sparse pair is never thinned."""
+    keypoints_xy: KeypointsXY = _dense_grid_keypoints(10, 10, 1920, 1200)
+    matches: MatchIndices = np.stack([np.arange(100), np.arange(100)], axis=1).astype(np.int64)
+    kept: MatchIndices = subsample_matches_by_coverage(keypoints_xy, matches, 1920, 1200, max_matches=500)
+    assert np.array_equal(kept, matches)
+
+
+def test_subsample_thins_a_dense_pair_towards_the_cap() -> None:
+    """A dense pair comes back at most one match per grid cell, near the cap."""
+    keypoints_xy: KeypointsXY = _dense_grid_keypoints(80, 50, 1920, 1200)
+    matches: MatchIndices = np.stack([np.arange(4000), np.arange(4000)], axis=1).astype(np.int64)
+    kept: MatchIndices = subsample_matches_by_coverage(keypoints_xy, matches, 1920, 1200, max_matches=500)
+    assert 300 <= len(kept) <= 500
+    assert len(kept) < len(matches)
+
+
+def test_subsample_spreads_the_survivors_over_the_image() -> None:
+    """The survivors cover the image: no quadrant is emptied by the thinning.
+
+    The blob's SSC NMS exists to keep the matches spatially uniform; a filter that
+    kept the first 500 rows would pass the cap test and fail this one.
+    """
+    width: int = 1920
+    height: int = 1200
+    keypoints_xy: KeypointsXY = _dense_grid_keypoints(80, 50, width, height)
+    matches: MatchIndices = np.stack([np.arange(4000), np.arange(4000)], axis=1).astype(np.int64)
+    kept: MatchIndices = subsample_matches_by_coverage(keypoints_xy, matches, width, height, max_matches=500)
+    kept_xy: KeypointsXY = keypoints_xy[kept[:, 0]]
+    in_right_half: int = int((kept_xy[:, 0] >= width / 2).sum())
+    in_bottom_half: int = int((kept_xy[:, 1] >= height / 2).sum())
+    assert in_right_half >= len(kept) // 4
+    assert in_bottom_half >= len(kept) // 4
+
+
+def test_subsample_is_deterministic_and_keeps_the_lowest_index_per_cell() -> None:
+    """Two keypoints in one cell collapse to the one with the lower keypoint index.
+
+    A 100x100 image at `max_matches=4` is a 2x2 grid of 50 px cells, so keypoints
+    0 and 1 share the top-left cell and the other three sit alone.
+    """
+    keypoints_xy: KeypointsXY = np.array(
+        [[10.0, 10.0], [11.0, 11.0], [60.0, 60.0], [70.0, 10.0], [10.0, 70.0]], dtype=np.float32
+    )
+    matches: MatchIndices = np.array([[1, 7], [0, 3], [2, 9], [3, 1], [4, 5]], dtype=np.int64)
+    kept: MatchIndices = subsample_matches_by_coverage(keypoints_xy, matches, 100, 100, max_matches=4)
+    assert np.array_equal(kept, np.array([[0, 3], [2, 9], [3, 1], [4, 5]], dtype=np.int64))
+    again: MatchIndices = subsample_matches_by_coverage(keypoints_xy, matches, 100, 100, max_matches=4)
+    assert np.array_equal(kept, again)
+
+
+def test_subsample_survives_an_empty_match_list() -> None:
+    """An emptied pair subsamples to an empty array rather than raising."""
+    keypoints_xy: KeypointsXY = _dense_grid_keypoints(4, 4, 640, 480)
+    matches: MatchIndices = np.zeros((0, 2), dtype=np.int64)
+    kept: MatchIndices = subsample_matches_by_coverage(keypoints_xy, matches, 640, 480, max_matches=500)
+    assert kept.shape == (0, 2)
+
+
+def test_matching_caps_the_verified_matches_written_to_the_database(
+    galileo: FramesMeta, repo_root: Path, tmp_path: Path
+) -> None:
+    """`max_matches_per_pair` reduces what the database stores, and None leaves it alone."""
+    keyframe_ids: list[int] = [keyframe_id for rig_frame in galileo.rig_frames()[:2] for keyframe_id in rig_frame.keyframe_ids][:4]
+    image_root: Path = repo_root / "data" / "r2b_galileo"
+
+    uncapped_db: Path = tmp_path / "uncapped.db"
+    subset: FramesMeta = _prepare(uncapped_db, galileo, image_root, keyframe_ids)
+    pairs: list[ImagePair] = select_pairs(subset, connected_keyframe_num=1)
+    uncapped: MatchReport = match_pairs(uncapped_db, pairs, MatchingOptions(max_matches_per_pair=None))
+
+    capped_db: Path = tmp_path / "capped.db"
+    _prepare(capped_db, galileo, image_root, keyframe_ids)
+    cap: int = 40
+    capped: MatchReport = match_pairs(capped_db, pairs, MatchingOptions(max_matches_per_pair=cap))
+
+    for pair in pairs:
+        stored: int = len(read_two_view_geometry(capped_db, pair[0], pair[1]).inlier_matches)
+        assert stored <= max(cap, 0) or stored == 0
+        assert capped.pair_stats[pair].inlier_matches == stored
+        assert stored <= uncapped.pair_stats[pair].inlier_matches
+    assert sum(stats.inlier_matches for stats in capped.pair_stats.values()) < sum(
+        stats.inlier_matches for stats in uncapped.pair_stats.values()
+    )

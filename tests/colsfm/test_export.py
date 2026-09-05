@@ -7,10 +7,13 @@ from pathlib import Path
 import numpy as np
 import pycolmap
 import pytest
+from jaxtyping import UInt8
+from numpy import ndarray
 
 from colsfm.export import (
     RuntimeRecord,
     append_runtime_record,
+    colour_points_from_images,
     read_runtime_records,
     write_colmap_model,
     write_optimised_frames_meta,
@@ -191,3 +194,38 @@ def test_the_blob_runtime_log_reads_back(galileo_run_dir: Path) -> None:
     assert records[0].command.startswith("feature_extractor_main ")
     assert records[-1].command.startswith("extract_pose_from_map_main ")
     assert records[0].runtime_seconds == pytest.approx(207.74518609046936)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Point colour
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_points_get_their_colour_from_the_imagery(galileo_run_dir: Path, repo_root: Path) -> None:
+    """A blob model reconstructed from black points comes back coloured.
+
+    The blob's own colours come from `feature_extractor_main --output_rgb`; ours
+    are sampled from the same JPEGs at export time, so the test is that almost
+    every point stops being `(0, 0, 0)` and the colours are not all one shade.
+    """
+    reconstruction: pycolmap.Reconstruction = pycolmap.Reconstruction(str(galileo_run_dir / "sparse"))
+    for point in reconstruction.points3D.values():
+        point.color = np.zeros(3, dtype=np.uint8)
+
+    num_coloured: int = colour_points_from_images(reconstruction, repo_root / "data" / "r2b_galileo")
+
+    colours: UInt8[ndarray, "num_points 3"] = np.array(
+        [point.color for point in reconstruction.points3D.values()], dtype=np.uint8
+    )
+    assert num_coloured == int(colours.any(axis=1).sum())
+    assert num_coloured >= int(0.9 * reconstruction.num_points3D())
+    assert len(np.unique(colours, axis=0)) > 10
+
+
+def test_colouring_a_model_without_its_images_leaves_the_points_alone(
+    galileo_run_dir: Path, tmp_path: Path
+) -> None:
+    """A missing image root is reported, not a half-coloured model or a crash."""
+    reconstruction: pycolmap.Reconstruction = pycolmap.Reconstruction(str(galileo_run_dir / "sparse"))
+    with pytest.raises(FileNotFoundError):
+        colour_points_from_images(reconstruction, tmp_path / "not-a-directory")

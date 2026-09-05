@@ -102,8 +102,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Literal, TypeAlias
 
+import numpy as np
 import pycolmap
 import pycolmap.pyceres as colmap_ceres
+from jaxtyping import Bool, Float64
+from numpy import ndarray
 
 from colsfm.config import BundleAdjustmentConfig, LossFunctionType, VisionMappingConfig
 
@@ -146,7 +149,11 @@ class MappingOptions:
     Triangulation is single-threaded in COLMAP either way, so it does not carry cuSFM's
     threaded-triangulation non-determinism (§5.3)."""
     use_gpu: bool = False
-    """Hand the Ceres solve to the GPU; COLMAP still needs 50+ images before it switches."""
+    """Hand the Ceres solve to the GPU; COLMAP still needs 50+ images before it switches
+    (`min_num_images_gpu_solver`, pycolmap-capabilities.md §11). Off by default because the
+    measured gain does not exist: 1.68 s against 1.60 s on Galileo's 226 images, and 19.2 s
+    against 20.9 s on 800 RoboCap images — 5 % the wrong way, then 8 % the right way. The
+    blob's own mapper is Ceres on the CPU, so that is where the default stays."""
     gpu_index: str = "-1"
     """GPU to solve on when `use_gpu`; `-1` lets Ceres choose."""
     linear_solver: LinearSolver = "SPARSE_SCHUR"
@@ -196,6 +203,9 @@ class RoundStats:
     """Observations added by `complete_all_tracks`."""
     num_filtered: int
     """Observations dropped by the reprojection, angle, depth and track-length filters."""
+    num_diverged: int
+    """Observations dropped by the degeneracy guard *after* the solve, i.e. points bundle
+    adjustment itself pushed out of bounds. Normally 0; see `filter_degenerate_points`."""
     num_observations: int
     """Observations left in the reconstruction after filtering; cuSFM's `num observed`."""
     observation_change: float
@@ -256,8 +266,9 @@ class _FilterCounts:
     """Dropped by the explicit cheirality pass."""
     short_track: int = 0
     """Dropped for having fewer than `min_correspondences` observations."""
-    world_z: int = 0
-    """Dropped because the point sits beyond `depth_threshold` on the world Z axis."""
+    degenerate: int = 0
+    """Dropped by the pre-solve guard: the world-Z cap, a non-finite coordinate or a
+    coordinate whose magnitude exceeds `depth_threshold`."""
 
     def total(self) -> int:
         """Total observations removed.
@@ -265,7 +276,7 @@ class _FilterCounts:
         Returns:
             The sum of every cause.
         """
-        return self.reprojection_and_angle + self.negative_depth + self.short_track + self.world_z
+        return self.reprojection_and_angle + self.negative_depth + self.short_track + self.degenerate
 
 
 def pixel_error_schedule(mapping_config: VisionMappingConfig) -> tuple[float, ...]:
@@ -469,17 +480,128 @@ def _triangulate(
     return total
 
 
+def filter_degenerate_points(
+    observation_manager: pycolmap.ObservationManager,
+    reconstruction: pycolmap.Reconstruction,
+    depth_threshold: float,
+) -> int:
+    """Delete every point whose world position is non-finite or out of bounds.
+
+    A point goes when any coordinate is NaN or infinite, or when the largest
+    coordinate magnitude exceeds `depth_threshold`. That is deliberately stricter
+    than cuSFM, whose only spatial filter is a one-sided cap on the world Z axis
+    (keypoints_mapper_main.md §5.5); a bound on all three axes and both signs
+    subsumes it, and cuSFM's asymmetry looks like an oversight rather than a
+    design. On Galileo the difference is nothing — the guard removes 0 points in
+    all five rounds.
+
+    Two things make the guard necessary, and neither is caught by COLMAP's own
+    filters:
+
+    1. **NaN is invisible to every threshold test.** They all ask
+       `error > threshold`, and any comparison against NaN is false, so a NaN
+       point survives filtering and then poisons the whole normal equation.
+    2. **A converged solve can still throw a point to infinity.** Measured on 200
+       RoboCap rig frames: round 0's bundle adjustment reports CONVERGENCE and
+       halves its cost while pushing 5 of 31 017 points out to 4941 m. Under the
+       fisheye model those points project next to the projection singularity, so
+       their reprojection error comes out at 4.5e153 px — which is where the
+       round's reported mean of 1.4e149 px came from. The pre-solve filter alone
+       cannot help: the model going *into* that solve was clean (max error
+       22.4 px). The guard therefore runs after the solve as well as before it.
+
+    Args:
+        observation_manager: Bookkeeping bound to the reconstruction.
+        reconstruction: The model to filter, edited in place.
+        depth_threshold: `vision_mapping_config.depth_threshold`, in metres.
+
+    Returns:
+        Observations removed, i.e. the summed track length of the deleted points.
+    """
+    point3D_ids: list[int] = list(reconstruction.points3D)
+    if not point3D_ids:
+        return 0
+    points_xyz: Float64[ndarray, "num_points 3"] = np.array(
+        [reconstruction.point3D(point3D_id).xyz for point3D_id in point3D_ids], dtype=np.float64
+    )
+    # `np.abs(nan) > threshold` is False, so the finiteness term has to carry the NaNs.
+    out_of_bounds: Bool[ndarray, "num_points"] = ~np.isfinite(points_xyz).all(axis=1) | (
+        np.abs(points_xyz).max(axis=1) > depth_threshold
+    )
+    removed: int = 0
+    for point3D_id in np.asarray(point3D_ids)[out_of_bounds].tolist():
+        removed += reconstruction.point3D(point3D_id).track.length()
+        observation_manager.delete_point3D(point3D_id)
+    return removed
+
+
+def projection_sanity_bound_px(reconstruction: pycolmap.Reconstruction) -> float:
+    """The largest reprojection error that can still be a measurement.
+
+    Args:
+        reconstruction: The model, for its cameras' pixel dimensions.
+
+    Returns:
+        The longest image side over every camera, or 0.0 for a model without
+        cameras. An observation further than a whole image from its point is not
+        a bad measurement, it is a failed projection.
+    """
+    sides: list[float] = [float(max(camera.width, camera.height)) for camera in reconstruction.cameras.values()]
+    return max(sides) if sides else 0.0
+
+
+def filter_projection_failures(
+    observation_manager: pycolmap.ObservationManager, reconstruction: pycolmap.Reconstruction
+) -> int:
+    """Drop observations a solve has made unprojectable, at a numeric-sanity bound.
+
+    Not a quality filter — the round's own gate (25 down to 5 px) is far tighter
+    and owns that job. This only catches projection *failures*, at
+    `projection_sanity_bound_px`, and it exists because bundle adjustment can
+    produce them out of a clean model:
+
+    On RoboCap's 4528 fisheye images, 4 points of 209 905 end up within
+    5-90 mm of a camera centre — one of them at **negative** depth. At that
+    distance `OPENCV_FISHEYE` projects them thousands of image widths away and
+    their reprojection error comes out at 4.5e153 px, which is where the
+    `1e152 px` mean and the CHOLMOD "not positive definite" warnings in the first
+    three rounds came from. The model going *into* each of those solves was clean
+    (max 23.5 px), so no pre-solve filter can prevent it.
+
+    Deleting them now rather than in the next round changes no result — the next
+    gate is at most 25 px, so anything above a whole image width was already
+    doomed — but it keeps the round's reported metric meaningful and keeps the
+    next solve from linearising the same singularity.
+
+    Args:
+        observation_manager: Bookkeeping bound to the reconstruction.
+        reconstruction: The model to filter, edited in place.
+
+    Returns:
+        Observations removed.
+    """
+    bound_px: float = projection_sanity_bound_px(reconstruction)
+    if bound_px <= 0.0:
+        return 0
+    # `filter_points3D` covers reprojection error, cheirality and triangulation angle;
+    # a zero angle threshold switches the last of the three off, leaving the two that
+    # describe a failed projection.
+    return observation_manager.filter_points3D(bound_px, 0.0, set(reconstruction.points3D))
+
+
 def _filter_points(
     observation_manager: pycolmap.ObservationManager,
     reconstruction: pycolmap.Reconstruction,
     mapping_config: VisionMappingConfig,
     max_pixel_error: float,
 ) -> _FilterCounts:
-    """Apply cuSFM's four point filters for one round (§5.5).
+    """Apply cuSFM's point filters for one round, before its bundle adjustment (§5.4-§5.5).
 
     The reprojection gate decays per round; the triangulation angle is the max
     over observing pairs, matching cuSFM's `HasLargeEnoughTriangulateAngle`; the
     depth test is a **world Z** cap, one axis and one-sided, not a camera depth.
+    `filter_degenerate_points` adds the non-finite and absurd-coordinate guard
+    cuSFM has no equivalent of; see its docstring.
 
     Args:
         observation_manager: Bookkeeping bound to the reconstruction.
@@ -495,20 +617,12 @@ def _filter_points(
     )
     negative_depth: int = observation_manager.filter_observations_with_negative_depth()
     short_track: int = observation_manager.filter_points3D_with_short_tracks(mapping_config.min_correspondences)
-    world_z: int = 0
-    beyond_depth: list[int] = [
-        point3D_id
-        for point3D_id, point in reconstruction.points3D.items()
-        if float(point.xyz[2]) > mapping_config.depth_threshold
-    ]
-    for point3D_id in beyond_depth:
-        world_z += reconstruction.point3D(point3D_id).track.length()
-        observation_manager.delete_point3D(point3D_id)
+    degenerate: int = filter_degenerate_points(observation_manager, reconstruction, mapping_config.depth_threshold)
     return _FilterCounts(
         reprojection_and_angle=reprojection_and_angle,
         negative_depth=negative_depth,
         short_track=short_track,
-        world_z=world_z,
+        degenerate=degenerate,
     )
 
 
@@ -597,9 +711,14 @@ def run_mapping(
     load correspondences
     triangulate every registered image, repeating until a pass adds nothing
     for k in 0 .. num_ba_iterations - 1:
-        merge -> complete -> filter at gate g_k -> global bundle adjustment
+        merge -> complete -> filter at gate g_k -> global bundle adjustment -> guards
         stop early when (merged + completed + filtered) / observations < max_observation_change
     ```
+
+    The trailing guards are the one step cuSFM has no equivalent of:
+    `filter_degenerate_points` and `filter_projection_failures` between them
+    remove what a converged solve can still leave behind — a point outside the
+    world, or one inside a camera. Both docstrings carry the measurements.
 
     Args:
         reconstruction: A reconstruction with registered, pose-carrying frames,
@@ -641,6 +760,10 @@ def run_mapping(
     triangulation_started: float = time.perf_counter()
     _triangulate(triangulator, image_ids, mapping_config, schedule[0], resolved_options.verbose)
     triangulation_seconds: float = time.perf_counter() - triangulation_started
+    # Round 0's gate would drop these anyway; doing it here only makes the line below
+    # mean something. Without it RoboCap's triangulation reports 8.9e152 px, because a
+    # handful of tracks resolve to a point sitting inside one of their own cameras.
+    filter_projection_failures(correspondences.observation_manager, reconstruction)
     reconstruction.update_point_3d_errors()
     if resolved_options.verbose:
         print(
@@ -667,6 +790,13 @@ def run_mapping(
 
         summary, solve_seconds = _solve(reconstruction, ba_options, resolved_gauge_frame_id, resolved_options)
         bundle_adjustment_seconds += solve_seconds
+        # The guards run on both sides of the solve. Before it, so Ceres never linearises a
+        # NaN; after it, because a *converged* solve can still walk a weakly-constrained
+        # point out of the world (`filter_degenerate_points`) or into a camera centre
+        # (`filter_projection_failures`), and the next round would otherwise inherit both.
+        num_diverged: int = filter_degenerate_points(
+            correspondences.observation_manager, reconstruction, mapping_config.depth_threshold
+        ) + filter_projection_failures(correspondences.observation_manager, reconstruction)
         reconstruction.update_point_3d_errors()
         num_iterations, initial_cost, final_cost = _parse_brief_report(summary)
         rounds.append(
@@ -676,6 +806,7 @@ def run_mapping(
                 num_merged=num_merged,
                 num_completed=num_completed,
                 num_filtered=filtered.total(),
+                num_diverged=num_diverged,
                 num_observations=num_observations,
                 observation_change=observation_change,
                 num_points3D=reconstruction.num_points3D(),
@@ -691,8 +822,9 @@ def run_mapping(
             latest: RoundStats = rounds[-1]
             print(
                 f"[colsfm] round {round_index} gate {max_pixel_error:.1f} px: merged {num_merged}, "
-                f"completed {num_completed}, filtered {filtered.total()}, change {observation_change:.6f}, "
-                f"points {latest.num_points3D}, reprojection {latest.mean_reprojection_error_px:.4f} px"
+                f"completed {num_completed}, filtered {filtered.total()}, diverged {num_diverged}, "
+                f"change {observation_change:.6f}, points {latest.num_points3D}, "
+                f"reprojection {latest.mean_reprojection_error_px:.4f} px"
             )
         if resolved_options.stop_on_observation_change and observation_change < mapping_config.max_observation_change:
             if resolved_options.verbose:

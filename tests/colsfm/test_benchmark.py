@@ -14,6 +14,7 @@ the real-data test — the numbers `demo_rerun.py` printed for the same blob run
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import numpy as np
@@ -24,13 +25,16 @@ from numpy import ndarray
 from serde.json import from_json, to_json
 
 from colsfm.benchmark import (
+    AcceptanceBounds,
     Comparison,
     RigidAlignment,
     RigTrack,
     RunArtifacts,
+    RunMetrics,
     RuntimeRecord,
     Stage,
     align_rigid,
+    check_acceptance,
     classify_stage,
     compare_runs,
     latest_run_records,
@@ -673,8 +677,31 @@ def test_the_runtime_table_maps_both_vocabularies_onto_one_set_of_rows(
     assert mapping_row.ratio_b_over_a == pytest.approx(5.0)
 
 
-def test_acceptance_flags_the_bounds_the_candidate_misses(three_samples: FramesMeta, tmp_path: Path, repo_root: Path) -> None:
-    """Only 24 of 226 images register here, so the registered-image bound must fail."""
+def _synthetic_metrics(run_dir: Path, frames_meta: FramesMeta, repo_root: Path) -> RunMetrics:
+    """Metrics of one synthetic run, for tests that drive `check_acceptance` directly.
+
+    Args:
+        run_dir: Where to write the run.
+        frames_meta: Poses and calibration for it.
+        repo_root: Repository root, for the Galileo input directory.
+
+    Returns:
+        The run's metrics, as `compare_runs` would compute them.
+    """
+    run: RunArtifacts = read_run(
+        write_synthetic_run(run_dir, frames_meta, error_px=SYNTHETIC_ERROR_PX, runtimes=BLOB_RUNTIMES), "blob"
+    )
+    return compare_runs(run, run, repo_root / "data" / "r2b_galileo", "galileo").run_a
+
+
+def test_a_run_that_matches_the_reference_meets_every_bound(
+    three_samples: FramesMeta, tmp_path: Path, repo_root: Path
+) -> None:
+    """The bounds are relative, so reproducing run A exactly passes all four.
+
+    Under the plan's old absolute figures this same pair failed: 24 registered
+    images is far below 220, however faithfully B reproduces A.
+    """
     run_a: RunArtifacts = read_run(
         write_synthetic_run(tmp_path / "a", three_samples, error_px=SYNTHETIC_ERROR_PX, runtimes=BLOB_RUNTIMES), "blob"
     )
@@ -685,10 +712,55 @@ def test_acceptance_flags_the_bounds_the_candidate_misses(three_samples: FramesM
     comparison: Comparison = compare_runs(run_a, run_b, repo_root / "data" / "r2b_galileo", "galileo")
 
     results: dict[str, bool] = {check.name: check.passed for check in comparison.acceptance}
-    assert results["registered images"] is False
-    assert results["mean reprojection error (px)"] is True
-    assert results["total runtime ratio"] is True
-    assert "ATE vs ground truth (mm)" in results
+    assert set(results) == {
+        "registered images",
+        "mean reprojection error (px)",
+        "ATE vs ground truth (mm)",
+        "total runtime ratio",
+    }
+    assert all(results.values())
+
+
+def test_acceptance_flags_a_candidate_that_falls_behind_the_reference(
+    three_samples: FramesMeta, tmp_path: Path, repo_root: Path
+) -> None:
+    """Twice A's reprojection error and twice A's runtime budget both fail."""
+    slow_runtimes: dict[str, float] = {
+        command: 3.0 * seconds for command, seconds in COLSFM_RUNTIMES.items()
+    }
+    run_a: RunArtifacts = read_run(
+        write_synthetic_run(tmp_path / "a", three_samples, error_px=SYNTHETIC_ERROR_PX, runtimes=BLOB_RUNTIMES), "blob"
+    )
+    run_b: RunArtifacts = read_run(
+        write_synthetic_run(
+            tmp_path / "b", three_samples, error_px=2.0 * SYNTHETIC_ERROR_PX, runtimes=slow_runtimes
+        ),
+        "colsfm",
+    )
+
+    comparison: Comparison = compare_runs(run_a, run_b, repo_root / "data" / "r2b_galileo", "galileo")
+
+    results: dict[str, bool] = {check.name: check.passed for check in comparison.acceptance}
+    assert results["mean reprojection error (px)"] is False
+    assert results["total runtime ratio"] is False
+    assert results["registered images"] is True
+
+
+def test_the_registered_image_bound_allows_a_small_shortfall(
+    three_samples: FramesMeta, tmp_path: Path, repo_root: Path
+) -> None:
+    """B may register up to four fewer images than A, and no more."""
+    metrics_a: RunMetrics = _synthetic_metrics(tmp_path / "a", three_samples, repo_root)
+    bounds: AcceptanceBounds = AcceptanceBounds()
+
+    for shortfall, expected in ((bounds.registered_images_allowance, True), (bounds.registered_images_allowance + 1, False)):
+        metrics_b: RunMetrics = dataclasses.replace(
+            metrics_a, name="colsfm", registered_images=metrics_a.registered_images - shortfall
+        )
+        checks: dict[str, bool] = {
+            check.name: check.passed for check in check_acceptance(metrics_a, metrics_b, 1.0, bounds)
+        }
+        assert checks["registered images"] is expected
 
 
 def test_robocap_gets_no_acceptance_bounds(three_samples: FramesMeta, tmp_path: Path, repo_root: Path) -> None:

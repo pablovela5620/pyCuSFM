@@ -36,8 +36,16 @@ Ordering notes worth knowing before reading the code:
   `colsfm.matching.match_pairs` over those pairs, then the real search reading
   matches back from the database.
 * **`--use-gpu` governs the ONNX stages only.** ALIKED and LightGlue run on the
-  GPU; the Ceres solves stay on the CPU, as the blob's own `keypoints_mapper_main`
-  and `pose_graph_main` do (docs/open-pipeline-plan.md, "Facts that shape the design").
+  GPU; the Ceres solves stay on the CPU by default, as the blob's own
+  `keypoints_mapper_main` and `pose_graph_main` do (docs/open-pipeline-plan.md,
+  "Facts that shape the design"). `--ba-use-gpu` moves the bundle-adjustment
+  linear solve onto the GPU; measured it buys nothing on Galileo (1.68 s against
+  1.60 s) and about 8 % on 800 RoboCap images (19.2 s against 20.9 s), so the
+  default stays where the blob is.
+* **Threads are not the blob's `--num_thread 1`.** That flag counts worker
+  *processes*, and the runner starts one per camera; COLMAP is one process, so
+  `--num-threads` defaults to -1 (every core) for extraction and matching, and
+  Ceres takes the config's 8 unless `--ba-num-threads` says otherwise.
 """
 
 from __future__ import annotations
@@ -65,6 +73,7 @@ from colsfm.export import (
     RUNTIME_CSV_NAME,
     RuntimeRecord,
     append_runtime_record,
+    colour_points_from_images,
     write_colmap_model,
     write_pose_files,
     write_tum_file,
@@ -74,7 +83,7 @@ from colsfm.frames_meta import FramesMeta, KeyframeMeta, RigFrame, read_frames_m
 from colsfm.geometry import TumPose
 from colsfm.keyframe_selection import KeyframeSelection, apply_selection, select_keyframes
 from colsfm.mapping import MappingOptions, MappingResult, run_mapping
-from colsfm.matching import MatchingOptions, MatchReport, match_pairs
+from colsfm.matching import BLOB_MATCH_TOP_K, MatchingOptions, MatchReport, match_pairs
 from colsfm.pairs import select_pairs
 from colsfm.pose_graph import PoseGraphEdge, PoseGraphResult, RigNode, sequential_edges, solve_pose_graph
 from colsfm.reconstruction import build_reconstruction
@@ -156,9 +165,24 @@ class PipelineOptions:
     """Run retrieval-based loop closure. Off by default: the plan decides per dataset,
     and on the 0.93 s Galileo sweep loops move poses further than the ATE budget allows."""
     use_gpu: bool = True
-    """Run ALIKED and LightGlue on the GPU when one is usable; the Ceres solves stay on CPU."""
-    num_threads: int = 1
-    """Threads for extraction, matching and Ceres. 1 keeps triangulation reproducible."""
+    """Run ALIKED and LightGlue on the GPU when one is usable."""
+    ba_use_gpu: bool = False
+    """Hand the bundle-adjustment linear solve to the GPU. Off by default: the measured
+    difference is under 10 % and changes sign with the problem size, so the default follows
+    the blob, which solves on the CPU. See `colsfm.mapping.MappingOptions.use_gpu`."""
+    num_threads: int = -1
+    """Threads for feature extraction and matching; -1 lets COLMAP use every core.
+
+    The blob runs `feature_extractor_main --num_thread 1`, but that flag counts *its own*
+    worker processes, not the threads inside one: the runner launches one process per
+    camera. COLMAP has a single process, so 1 serialises JPEG decode against the GPU and
+    costs 4.4x on Galileo (33.9 s against 7.6 s, measured)."""
+    ba_num_threads: int | None = None
+    """Ceres threads; None takes `bundle_adjustment_config.num_threads` (8) from the config,
+    which is what the blob solves with. Set 1 for a bit-reproducible solve."""
+    max_matches_per_pair: int | None = BLOB_MATCH_TOP_K
+    """Verified matches kept per pair after the spatial subsample; None keeps every inlier.
+    The blob's `match_top_k`; see `colsfm.matching.subsample_matches_by_coverage`."""
     stop_on_observation_change: bool = True
     """Leave the mapper's outer loop once the observation change falls below the config's
     `max_observation_change`, instead of always running every round."""
@@ -595,6 +619,7 @@ def run_pipeline(options: PipelineOptions) -> PipelineSummary:
         confidence=config.matching_task_worker.verification.min_ransac_confidence,
         num_threads=options.num_threads,
         device="auto" if options.use_gpu else "cpu",
+        max_matches_per_pair=options.max_matches_per_pair,
     )
     with timed_stage(clock, "matching"):
         match_report: MatchReport = match_pairs(options.database_path, pairs, matching_options)
@@ -642,7 +667,8 @@ def run_pipeline(options: PipelineOptions) -> PipelineSummary:
             config.vision_mapping.bundle_adjustment,
             MappingOptions(
                 optimize_extrinsics=options.optimize_extrinsics,
-                num_threads=options.num_threads,
+                num_threads=options.ba_num_threads,
+                use_gpu=options.ba_use_gpu,
                 stop_on_observation_change=options.stop_on_observation_change,
             ),
         )
@@ -654,6 +680,8 @@ def run_pipeline(options: PipelineOptions) -> PipelineSummary:
 
     # ── 8. export ────────────────────────────────────────────────────────────────────
     with timed_stage(clock, "export"):
+        num_coloured: int = colour_points_from_images(mapping.reconstruction, options.input_dir, options.num_threads)
+        print(f"[colsfm] export: coloured {num_coloured}/{mapping.num_points3D} points from the source imagery")
         write_colmap_model(options.output_dir, mapping.reconstruction)
         optimised: FramesMeta = pose_graph_meta.with_camera_to_world(
             optimised_camera_poses(mapping.reconstruction), "ALIGNMENT"

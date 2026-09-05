@@ -33,7 +33,7 @@ from typing import TypeAlias
 
 import numpy as np
 import pycolmap
-from jaxtyping import Float32
+from jaxtyping import Float32, Int64
 from numpy import ndarray
 
 from colsfm.cameras import colmap_cameras
@@ -45,6 +45,9 @@ ImagePair: TypeAlias = tuple[int, int]
 
 KeypointsXY: TypeAlias = Float32[ndarray, "num_keypoints 2"]
 """Keypoint pixel coordinates in the original image, COLMAP's float32 storage type."""
+
+MatchIndices: TypeAlias = Int64[ndarray, "num_matches 2"]
+"""One row per match: the keypoint index in the pair's first image, then in its second."""
 
 
 def create_database(
