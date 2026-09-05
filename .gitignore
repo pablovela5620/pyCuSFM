@@ -47,3 +47,6 @@ data/lfs_datasets/
 
 # MegaDepth-1500 benchmark data (1.4 GB, downloaded from cvg-data.inf.ethz.ch + LoFTR assets).
 data/megadepth_test_1500/
+
+# Reverse-engineering scratch (help dumps, disassembly, ghidra projects)
+data/cusfm_re/
