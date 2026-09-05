@@ -34,7 +34,8 @@ pycusfm = { path = ".", editable = true }
 tensorrt-cu13 = "==10.13.3.9.post1"
 # Pinned exact: conda-forge lags PyPI for rerun (0.37.0 vs 0.37.1 at pin time), and the
 # viewer that validates must be >= the SDK that wrote the data, so the pin is deliberate.
-rerun-sdk = "==0.37.1"
+# The `catalog` extra adds datafusion, needed by rerun.catalog.CatalogClient.
+rerun-sdk = { version = "==0.37.1", extras = ["catalog"] }
 # simplecv supplies RerunTyroConfig, the camera dataclasses, and the exoego:v2
 # rig logger. It is taken from the monorepo (public) rather than the standalone
 # pablovela5620/simplecv, which predates rerun_rig_logger.py / rig.py.
@@ -84,8 +85,22 @@ raco-export = { cmd = "python -m tools.export_cusfm_raco", description = "Export
 raco-extract = { cmd = "python -m tools.raco_extract", description = "Write cuSFM keyframes with the batched RaCo extractor" }
 raco-benchmark = { cmd = "python -m tools.benchmark_cusfm_extractors", description = "Benchmark stock ALIKED against RaCo-ALIKED" }
 
+# MegaDepth-1500 benchmarking against the cuSFM paper's feature table.  This
+# layers a GPU ONNX Runtime (CUDA 13 wheels) and Polygraphy on top of `raco`,
+# which already carries OpenCV, typer, and fabio-sim's `lightglue_dynamo`.
+# `raco` itself stays CPU-only on purpose, so the GPU runtime lives here.
+[feature.bench.pypi-dependencies]
+onnxruntime-gpu = { version = "==1.29.0", extras = ["cuda", "cudnn"] }
+polygraphy = "*"
+# The catalog-side MegaDepth benchmark ingests and queries through the same
+# process that runs ONNX Runtime, so the Rerun SDK (with its `catalog` extra,
+# which pulls datafusion) has to live in this environment too.
+rerun-sdk = { version = "==0.37.1", extras = ["catalog"] }
+
+
 [environments]
 raco = { features = ["raco"], no-default-feature = true, solve-group = "raco" }
+bench = { features = ["raco", "bench"], no-default-feature = true }
 
 [activation.env]
 LD_LIBRARY_PATH = "${PIXI_PROJECT_ROOT}/pycusfm/x86_cuda13/lib:${CONDA_PREFIX}/lib/python3.12/site-packages/tensorrt_libs:${CONDA_PREFIX}/lib:/usr/lib/x86_64-linux-gnu"

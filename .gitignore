@@ -44,3 +44,6 @@ data/cusfm_configs/epipolar-1e-4/
 data/cusfm_configs/pose-edge-gates-only/
 data/cusfm_configs/pose-graph-fixed-1e-4/
 data/lfs_datasets/
+
+# MegaDepth-1500 benchmark data (1.4 GB, downloaded from cvg-data.inf.ethz.ch + LoFTR assets).
+data/megadepth_test_1500/
