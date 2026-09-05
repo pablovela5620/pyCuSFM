@@ -100,3 +100,43 @@ rerun-viewer-validation skill (pixel evidence).
   dataclass field docstrings, TypeAlias).
 - Branch: `feat/pycolmap-open-pipeline`. Specs in `docs/spec/`, scratch in `data/cusfm_re/`.
 - Workers: Opus 5 for reverse engineering, specs, implementation, and review (user decision).
+
+## Status (2026-09-05)
+
+**Done.** All eight stages run end to end from `python -m colsfm run`, over the same
+`--input-dir` and into the same output layout as `cusfm_cli`, with `runtime.csv`,
+`summary.json` and TUM poses. The benchmark harness (`colsfm.bench_cli`) reads two runs in
+that layout, recomputes every metric, checks the acceptance bounds and writes one two-rig
+Rerun recording. Specs for the eight stages are in `docs/spec/`. The pose graph is
+reimplemented on pyceres with a Python residual and matches the blob's archived 8-loop
+Galileo run to 0.28 mm. Retrieval has two backends and the vocabulary tree recovers all 90
+of the blob's RoboCap loop pairs.
+
+**Acceptance, Galileo** (`data/bench/galileo_compare.md`), B relative to A:
+
+| Check | Bound | Value | Result |
+|---|---|---|---|
+| registered images | >= A - 4 = 220 | 225.000 | PASS |
+| mean reprojection error (px) | <= 1.10 x A = 1.704 | 1.334 | PASS |
+| ATE vs ground truth (mm) | <= 1.10 x A = 5.495 | 4.327 | PASS |
+| total runtime ratio | <= 2.0 x A | 0.483 | PASS |
+
+**4/4 bounds met.** RoboCap stride 4 (`data/bench/robocap_compare.md`) has no ground truth
+and therefore no acceptance table: 4528/4528 registered, 1.501 px against the blob's 1.486,
+421.79 s against 1133.53 s (0.37x), disagreement with the basalt input 461.25 mm against the
+blob's 334.10 mm.
+
+**Remaining.**
+
+1. **The loop-edge estimator.** Retrieval and pair selection are solved: our 488 RoboCap
+   edges cover all 90 of the blob's LOOP pairs, the blob's own edges through
+   `solve_pose_graph` land 135.0 mm from its result, and oracle poses on our pairs land at
+   39.9 mm. The measurement is the fault: a two-view essential matrix plus prior-pose scale
+   gives 609.0 mm, worse than the 460.8 mm of the input trajectory alone. Stereo
+   triangulation plus PnP was measured at 434.5 mm. Closing the rest needs the blob's
+   `StereoPoseRefineSolver` and its occupied-area and inlier gates.
+2. **Matching is about 3x the blob.** 3.63x on Galileo (8.15 s against 2.25 s) and 2.89x on
+   RoboCap (152.03 s against 52.53 s). It is the only stage that is slower, and it is now the
+   largest single term in a colsfm run.
+3. **RoboCap with loop closure.** Blocked on item 1; loop closure stays off by default until
+   the estimator lands.

@@ -128,6 +128,40 @@ sudo apt install libgoogle-glog0v6t64 libopencv-core406t64 libopencv-calib3d406t
 
 `pixi run check-libs` verifies every binary dependency resolves before you run anything.
 
+## Run the open pipeline (colsfm)
+
+> Also specific to the pixified fork. `colsfm/` is a Python and pycolmap pipeline that
+> replaces the NVIDIA cuSFM binaries. It reads the same `frames_meta.json` and writes the
+> same outputs, so a colsfm run and a blob run compare directly.
+
+```bash
+pixi run -e colsfm colsfm-galileo   # r2b_galileo, 226 frames, 8 pinhole cameras
+pixi run -e colsfm colsfm-robocap   # RoboCap stride 4 (input dir written by `pixi run demo-robocap`), 4528 frames, 4 fisheye cameras
+pixi run -e colsfm python -m colsfm.bench_cli \
+    --dataset galileo \
+    --run-a data/cusfm_runs/galileo_blobref/cusfm \
+    --run-b data/cusfm_runs/galileo_colsfm/cusfm \
+    --input-dir data/r2b_galileo \
+    --save data/bench/galileo_compare.rrd \
+    --report data/bench/galileo_compare.md
+```
+
+Galileo, blob against colsfm, measured by the benchmark in
+[data/bench/galileo_compare.md](data/bench/galileo_compare.md):
+
+| Metric | blob | colsfm |
+|---|---|---|
+| registered / total images | 224 / 226 | 225 / 226 |
+| 3D points | 5065 | 6195 |
+| mean reprojection error (px) | 1.550 | 1.334 |
+| ATE vs ground truth (mm RMSE) | 5.00 | 4.33 |
+| total runtime (s) | 40.07 | 19.35 |
+
+Loop closure is off by default. Decisions, deviations from the blob and gotchas are in
+[NOTES.md](NOTES.md); the plan of record is
+[docs/open-pipeline-plan.md](docs/open-pipeline-plan.md); the reverse-engineered contract
+for each of the eight stages is in [docs/spec/](docs/spec/).
+
 
 ## Installation
 

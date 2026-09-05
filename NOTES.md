@@ -514,3 +514,289 @@ identical (SHA-256 over all 27 906 samples matches) and:
 | RoboCap prepare (4 cams: read rrd, remux, extract 932 JPEGs) | 76 s |
 | First TensorRT engine build (`sm_120`, fp16) | ~4 min (cached afterwards) |
 | galileo `demo-upstream` (upstream defaults, incl. engine build) | 267 s |
+
+## colsfm: the open pipeline on pycolmap
+
+`colsfm/` is a Python and pycolmap pipeline that replaces the 21 NVIDIA cuSFM binaries in
+`pycusfm/x86_cuda13/bin`. It reads the same `frames_meta.json`, writes the same outputs
+(`sparse/` COLMAP model, `kpmap/keyframes/frames_meta.json` with optimised poses, TUM pose
+files, `runtime.csv`), and runs the same eight stages.
+
+**Why.** The blob hides every algorithm setting. A protobuf text config exposes a few
+numbers, but the schedule, the gates, the loss and the solver options live inside an ELF
+file. None of that could be read, measured, or changed. Two things were needed: a
+pipeline that can be benchmarked against the binary it replaces, and a pipeline whose
+settings can be edited. `docs/spec/*.md` is the contract between the two. Those eight specs
+are reverse-engineered from the unstripped binaries, the embedded protobuf descriptors, the
+shipped configs, and A/B re-runs of the real binaries. `colsfm/` implements the specs;
+`colsfm/benchmark.py` measures the difference.
+
+### Decisions
+
+| # | Decision | Why |
+|---|---|---|
+| 1 | **Opus 5 for every worker** (reverse engineering, specs, implementation, review) | User decision, recorded in `docs/open-pipeline-plan.md` "Engineering rules". The work is one long chain of inference over disassembly; a cheaper tier drops the chain. |
+| 2 | **No clean room** | The repo is Apache 2.0 and the binaries carry no separate EULA. Reading the disassembly directly is allowed, so one worker both reads the blob and writes the port. A clean-room split would double the cost and buy nothing. |
+| 3 | **pycolmap-native `ALIKED_N16ROT` + LightGlue, not the TensorRT engines** | COLMAP 4.2 ships `FeatureExtractorType.ALIKED_N16ROT` and `FeatureMatcherType.ALIKED_LIGHTGLUE` as ONNX and downloads the graphs itself into `~/.cache/colmap/`. The blob's `aliked.onnx` carries a 32-channel SDDH offset convolution, so `M = 16`, the ALIKED-n16 architecture; `ALIKED_N16ROT` is the closest COLMAP variant. A thin typed driver replaces a TensorRT runner and its engine cache. The weights are trained with rotation augmentation, so descriptors are not the blob's bit for bit. The plan never asked for that. |
+| 4 | **Pose graph on pyceres with a Python cost** | pycolmap has no pose-graph optimiser: `pycolmap.PoseGraph` is a container with no `optimize`, and `PoseGraphEdge` carries no information matrix. `pycolmap.cost_functions` advertises `RelativePosePriorCost` and friends, but every factory raises `TypeError: Unregistered type` against the standalone `pyceres`, because conda-forge's pycolmap embeds a cut-down pyceres in its own pybind11 registry. The cost functions cannot cross into pyceres, so the residual is written in Python. Measured on 1000 nodes: pyceres converges in 24.6 s (cost 9.563 to 4.704e-06), scipy `least_squares` does not converge and was killed after 40 minutes. The sparse Cholesky solve is 40 ms of that 24.6 s, so all the headroom sits in the residual. |
+| 5 | **One pose per rig frame, vehicle body as reference sensor** | cuSFM's `VEHICLE_RIG` mode carries one pose per `synced_sample_id` in the vehicle FLU frame. COLMAP forces a rig's reference sensor to identity (`rig.h:200 Check failed: sensor_id != ref_sensor_id_`), so no camera can be the reference without moving the rig origin onto it. The vehicle body is registered as `sensor_t(SensorType.IMU, 0)` and owns no images. Triangulation, `ObservationManager` and `create_default_bundle_adjuster` all accept that. The two models then compare pose to pose with no change of basis. |
+| 6 | **`loss_function_scale = 4.0`** | cuSFM divides the reprojection residual by `reprojection_error_standard_deviation = 4.0 px` and then applies `CauchyLoss(1.0)`. COLMAP does not whiten. `CauchyLoss(a)` is `a^2 log(1 + s/a^2)`, so evaluating it at `s/sigma^2` with `a = 1` equals evaluating it at `s` with `a = sigma`, up to a constant that cannot move the minimum. Setting the scale to sigma reproduces the blob's robustifier without touching the residual. |
+| 7 | **A 500-match spatial cap in place of the blob's SSC NMS** | The blob thins each pair to a spatially uniform top 500 using the LightGlue score as the keypoint response. pycolmap exposes no per-match score: `Database.read_matches` and `FeatureMatcher.match` both return bare `uint32[m, 2]` index pairs. `subsample_matches_by_coverage` lays a grid of about `match_top_k` cells over image 0 and keeps one match per occupied cell, after verification, so every survivor is an inlier of the same RANSAC. Measured over the 331 Galileo pairs: uncapped 1300 matches per pair, 1.80 px, 5.39 mm ATE; capped 156 matches per pair, 1.33 px, 4.32 mm; the blob 430 matches, 1.55 px, 5.00 mm. The cap also takes bundle adjustment from 27.7 s to 2.8 s. |
+| 8 | **Relative acceptance bounds, not absolute ones** | The first bounds were absolute: registered >= 220, ATE <= 5 mm, reprojection <= 1.7 px. The ATE and reprojection figures came from the older NOTES table above (3.9 mm, 1.54 px), measured by the demo. When `colsfm.benchmark` measures the blob itself it gets **5.00 mm** and **1.550 px**. So the absolute 5 mm bound told the port to beat the binary it reproduces, and would have failed a bit-perfect clone. Absolute figures also break on a new machine or a re-run of A. Every bound is now a ratio against run A as this harness measures it. |
+| 9 | **Vocabulary-tree retrieval above 500 images** | `RetrievalConfig.backend` is `auto`: brute-force mutual-nearest-neighbour voting at or below 500 images, a hierarchical k-means vocabulary with TF-IDF and the DBoW2 L1 score above it. Brute force is quadratic in images times descriptors (gotcha 12). The vocab backend builds in 42 s on RoboCap and answers all 4528 queries in 1.5 s, and it recovers every one of the blob's 90 loop pairs. |
+| 10 | **Loop closure off by default** | On Galileo, turning loops on moves camera positions by 5 to 13 mm against a 5 mm ATE budget: a short, low-drift sweep has nothing for a loop to fix. On RoboCap the retrieval is right but the loop-edge measurement is not (see the deviations below), and the 488 edges make the pose graph worse: 609.0 mm against 460.8 mm for the input trajectory alone. `LoopClosureConfig.enabled` stays False and the caller decides per dataset. |
+| 11 | **Its own pixi environment and solve group** | `colsfm` is `no-default-feature`, so the fragile CUDA 13 plus TensorRT solve of the default environment is untouched. Verified: the `default`, `raco` and `bench` blocks of `pixi.lock` are byte-identical to `HEAD`, and no package was removed. |
+
+### Results: blob against colsfm
+
+Both runs measured by `colsfm.benchmark` on the same host (Ubuntu 24.04, RTX 5090, driver
+580.173). A is the blob with `data/cusfm_configs/loop-closure-fixed` and all eight stages;
+B is `colsfm` with loop closure off. Reprojection error is recomputed from the tracks,
+because `kpmap_to_colmap` hardcodes `ERROR = 2.0` on every point.
+
+**Galileo** (226 keyframes, 29 rig frames, 8 pinhole cameras, 0.66 m sweep), measured in
+`data/bench/galileo_compare.md`:
+
+| Metric | A blob | B colsfm |
+|---|---|---|
+| registered / total images | 224 / 226 | 225 / 226 |
+| 3D points | 5065 | 6195 |
+| observations | 37 820 | 30 910 |
+| mean reprojection error (px) | 1.550 | 1.334 |
+| track length mean / median | 7.47 / 5.00 | 4.99 / 4.00 |
+| rig rigidity spread (mm) | 0.000 | 0.000 |
+| ATE vs input trajectory (mm RMSE) | 1.82 | 1.26 |
+| ATE vs ground truth (mm RMSE) | 5.00 | 4.33 |
+
+| Stage | A (s) | B (s) | B/A |
+|---|---|---|---|
+| 1 feature extraction + keyframe selection | 8.64 | 8.01 | 0.93 |
+| 2 BoW vocabulary + index | 11.73 | none | none |
+| 3 loop-closure association | 3.17 | 0.00 | 0.00 |
+| 4 pose graph optimisation | 3.58 | 0.01 | 0.00 |
+| 5 match pair selection | 1.94 | 0.00 | 0.00 |
+| 6 feature matching | 2.25 | 8.15 | 3.63 |
+| 7 triangulation + bundle adjustment | 6.69 | 2.70 | 0.40 |
+| 8 COLMAP + TUM export | 2.07 | 0.47 | 0.23 |
+| **total** | **40.07** | **19.35** | **0.48** |
+
+All four acceptance bounds pass: registered 225 against `>= 220`, reprojection 1.334 px
+against `<= 1.704`, ATE 4.327 mm against `<= 5.495`, runtime ratio 0.483 against `<= 2.0`.
+
+**RoboCap** stride 4 (4528 keyframes, 1132 rig frames, 4 fisheye cameras, 124 m walk),
+measured in `data/bench/robocap_compare.md`. No ground truth ships with this segment, so
+there is no acceptance table and the trajectory row is a disagreement, not an error:
+
+| Metric | A blob | B colsfm |
+|---|---|---|
+| registered / total images | 4526 / 4528 | 4528 / 4528 |
+| 3D points | 168 874 | 157 887 |
+| observations | 947 651 | 714 413 |
+| mean reprojection error (px) | 1.486 | 1.501 |
+| track length mean / median | 5.61 / 4.00 | 4.52 / 3.00 |
+| rig rigidity spread (mm) | 0.000 | 0.000 |
+| vs input basalt trajectory (mm RMSE) | 334.10 | 461.25 |
+
+| Stage | A (s) | B (s) | B/A |
+|---|---|---|---|
+| 1 feature extraction + keyframe selection | 183.91 | 123.32 | 0.67 |
+| 2 BoW vocabulary + index | 243.39 | none | none |
+| 3 loop-closure association | 75.66 | 0.00 | 0.00 |
+| 4 pose graph optimisation | 386.61 | 0.34 | 0.00 |
+| 5 match pair selection | 5.62 | 0.04 | 0.01 |
+| 6 feature matching | 52.53 | 152.03 | 2.89 |
+| 7 triangulation + bundle adjustment | 178.75 | 138.02 | 0.77 |
+| 8 COLMAP + TUM export | 7.07 | 8.05 | 1.14 |
+| **total** | **1133.53** | **421.79** | **0.37** |
+
+The blob spends 705.7 s of its 1133.5 s on stages 2, 3 and 4, which exist only to find loop
+closures. colsfm skips all three by default, which is most of the 0.37x. Matching is the one
+stage that is slower, at 2.89x here and 3.63x on Galileo.
+
+RoboCap with loop closure: pending (estimator rewrite in progress)
+
+### Where colsfm deviates from the blob
+
+1. **The point cloud is a superset, from LO-RANSAC.** cuSFM grows one disjoint track per
+   connected component of the match graph and triangulates it with plain MSAC: no local
+   optimisation, no final refit. It rejects roughly half its candidate tracks. COLMAP's
+   LO-RANSAC keeps them. On Galileo that is 14 496 points against 5065 on the blob's own
+   matches, at a lower reprojection error. 98 to 99 % of the blob's points have one of ours
+   within 5 cm, and merging is already at a fixed point, so the difference is structural.
+2. **No per-match scores, so no SSC.** See decision 7. The grid subsample runs after
+   verification and only reduces the count.
+3. **No pose priors in bundle adjustment.** pycolmap's `PosePrior` is 3-DoF position plus an
+   optional gravity direction. There is no 6-DoF absolute-pose prior and no relative-pose
+   prior in the BA path, so cuSFM's `use_relative_pose_constraint` with its
+   `relative_pose_translation_error_meters` (0.1 m) has no equivalent. colsfm registers every
+   rig frame before the first triangulation and lets only bundle adjustment move it; nothing
+   pulls it back.
+4. **No unweighted constant-frame quirk.** cuSFM whitens every reprojection residual by
+   `1/sigma` except the ones observing the gauge keyframe, whose functor has no weight member:
+   13 of 6276 blocks on Galileo. COLMAP applies one weighting uniformly, and there is no way to
+   ask for the inconsistency. This is a blob defect, so it is left out on purpose.
+5. **No 3-D depth residual.** `VehicleCameraReprojectionCost3D` handles keypoints that carry
+   depth. pycolmap's bundle adjuster is 2-D only, and Galileo sets
+   `keypoint_feature_has_depth: false`.
+6. **The loop-edge estimator is a two-view estimate plus prior-pose scale**, not the blob's
+   four-view stereo estimator with baseline-locked scale and no `StereoPoseRefineSolver`.
+   Measured on RoboCap against the blob's 90 LOOP edges: retrieval and pair selection are
+   right (all 90 blob pairs are covered by our 488 edges to within 2 rig frames, and feeding
+   the blob's own edges through `solve_pose_graph` lands 135.0 mm from its result, while
+   oracle poses on our own pairs land at 39.9 mm), but our measurement lands at 609.0 mm,
+   worse than the 460.8 mm of the input trajectory. Stereo triangulation plus PnP was measured
+   at 434.5 mm, better than the input but still far from 39.9 mm. The estimator is the open
+   item; the retrieval is not.
+7. **The epipolar gate is in pixels.** The blob's
+   `max_mean_point_to_epipolarline_error: 10e-6` rejects 168 of 180 RoboCap candidates and
+   makes the blob produce zero loop associations. colsfm uses `ransac_max_error_px = 4.0`,
+   COLMAP's own default.
+8. **No BoW artifacts.** Nothing downstream reads the word ids, the tree, the IDF values or the
+   file formats, so `colsfm.retrieval` keeps only the ranked candidate list.
+9. **The LightGlue score threshold is 0.1, not 0.3.** The blob's 0.3 is calibrated for its own
+   engine. Against COLMAP's graph, 0.3 makes the low-texture `left_stereo_*` pairs collapse:
+   22 of 331 Galileo pairs come back empty (6.6 %) against the blob's 8 (2.4 %).
+
+### Gotchas found
+
+1. **`cuda-version = "13.0.*"` does not select the CUDA pycolmap build.** pycolmap 4.2.0 has
+   `cpu_*`, `cuda_129_*` and `cuda_130_*` builds on conda-forge, and the `cpu_*` build declares
+   no `cuda-version` constraint at all, so it satisfies a CUDA 13 environment and the solver
+   takes it. The first solve here silently installed `pycolmap-4.2.0-cpu_h874a1db_0` and
+   `pycolmap.has_cuda` was False. The build string is the only thing that selects it:
+   `pycolmap = { version = "4.2.0.*", build = "cuda_130*" }`.
+2. **pixi will not feed `__cuda` to the solver unless the feature asks.** With the build string
+   pinned the solve failed with `pycolmap 4.2.0 would require __cuda >=13.0, for which no
+   candidates were found`, even though `pixi info` reports `__cuda=13.0=0`.
+   `[feature.colsfm.system-requirements] cuda = "13.0"` fixes it. pixi 0.77.1 prints a
+   deprecation warning for that table and points at a `platforms = [{ ... }]` form which its own
+   parser rejects and which is workspace-scoped anyway. The warning is accepted on purpose.
+3. **A bare `pyserde` breaks the PyPI solve.** simplecv 0.7.2 requires
+   `pyserde>=0.31.2,<0.32`; the conda solver pins 0.32.1 first and the PyPI solve then has no
+   solution. Same shape as the `typing-extensions` cap in the fork's own gotcha list above.
+   Both caps are declared conda-side so one solver owns the constraint.
+4. **ONNX Runtime's CUDA provider needs cuDNN, and its absence is not an exception.** The
+   provider dlopens `libcudnn.so` for the convolutions. Without it, ONNX Runtime throws inside
+   a COLMAP worker thread and the process aborts with SIGABRT. `colsfm.features.resolve_device`
+   probes for the library first and falls back to the CPU provider, which is about 50x slower
+   (1.8 s per 1920x1200 image against 0.03 s). The real fix is `cudnn = "9.*"` in the feature.
+5. **`Camera.has_prior_focal_length` defaults to False and silently downgrades two-view
+   geometry.** PINHOLE falls back to a fundamental matrix (`UNCALIBRATED`, `cam2_from_cam1 is
+   None`); OPENCV_FISHEYE returns `DEGENERATE` with zero inliers, because F cannot model
+   fisheye. Nothing warns. Every camera built from `frames_meta.json` sets it True explicitly.
+6. **pycolmap overrides Ceres' solver tolerances.** pycolmap ships `function_tolerance = 0.0`,
+   `gradient_tolerance = 1e-4`, `parameter_tolerance = 0.0`. cuSFM leaves Ceres' own defaults
+   in place, so `colsfm.mapping` sets 1e-6, 1e-10 and 1e-8 back. A port that trusts the
+   pycolmap defaults solves a different problem.
+7. **The beartype claw makes per-point pycolmap calls quadratic.** With
+   `beartype_this_package()` active, a loop of `Image.project_point(xyz)` calls carrying
+   jaxtyping-annotated locals leaks about 15 uncollectable objects per call. Repeated
+   `build_scene()` calls went 0.54 s, 1.60 s, 2.64 s, 4.05 s, and the suite took 367 s.
+   Batching through `Camera.img_from_cam(points_in_cam)` removed it: `build_scene()` is 0.004 s
+   and the suite is 37 s. Rule for `colsfm/`: never call a pycolmap per-item accessor inside a
+   Python loop when a batched overload exists.
+8. **Copying the blob's `--num_thread 1` is wrong.** That gflag counts the blob's *own worker
+   processes*, and the runner launches one per camera. COLMAP is a single process, so 1
+   serialises JPEG decode against the GPU and costs 4.4x on Galileo: 33.9 s against 7.6 s.
+   `--num-threads` defaults to -1 here, and Ceres takes the config's 8.
+9. **`write_keypoints` accepts any column width.** It casts to float32 (so
+   `123.456789012345` comes back as `123.45679`) and stores whatever column count it is handed.
+   COLMAP writes Nx2, Nx4 or Nx6, but Nx1, Nx3, Nx5 and Nx8 all round-trip unchanged. A
+   malformed width is a silent corruption downstream, not an error at write time.
+10. **`demo_rerun.read_colmap_model` mis-parses a model with a zero-observation image.**
+    COLMAP writes two lines per image, and an image with no 2D points has an *empty* second
+    line. The parser filters empty lines before taking every second line, so the pose/points
+    alternation shifts from that point on and `POINTS2D` lines are read as poses. It does not
+    raise: on a three-image model it returned a nonsense entry with a 201 m translation and
+    dropped a real pose. `colsfm.benchmark` reads models with
+    `pycolmap.Reconstruction.read_text` instead. `demo_rerun.py` is not changed here.
+11. **The 10 s loop gate rejects every candidate on Galileo.** `generate_association_main`
+    drops candidates with `|dt| < loop_interval_threshold_in_seconds` (10 s), while
+    `pose_graph_main` drops `|dt| < loop_closure_interval_ratio * session_duration` (0.08 of
+    the session). The shipped Galileo sequence lasts **0.933 s** end to end, so the fixed gate
+    kills everything and only the ratio gate (0.075 s, about two rig frames) is live.
+    `LoopClosureDiagnostics.min_time_gap_seconds` reports which gap was applied.
+12. **Brute-force retrieval collapses at 4528 images.** The cost is
+    `(n_images * n_descriptors)^2 * 128` inner products, so `max_total_descriptors` divides a
+    fixed budget across the images. Galileo's 226 images get 256 descriptors each and the
+    retrieval works (9.4 s). RoboCap's 4528 images get 22 each, the largest off-diagonal score
+    is 0.227, and after the temporal gate nothing clears the score threshold: zero loop
+    candidates on a 124 m walk with 90 genuine revisits. Raising the cap is not the fix. Giving
+    those 4528 images 256 descriptors each costs 3.4e14 FLOP, about 40 minutes at this
+    machine's measured 147 GFLOP/s float32 GEMM; using every descriptor costs 2.2e16 FLOP,
+    about 41 hours. That quadratic is why the vocabulary backend exists.
+
+### How to run
+
+```bash
+pixi run colsfm-galileo    # 226 frames, 8 pinhole cameras, about 19 s
+pixi run colsfm-robocap    # 4528 frames, 4 fisheye cameras, about 7 min
+pixi run colsfm-test       # tests/colsfm
+pixi run colsfm-probe      # tests/colsfm_probes, the pycolmap capability suite
+pixi run colsfm-lint       # ruff over colsfm and tests/colsfm
+```
+
+Both tasks call `python -m colsfm run`, which takes the same `--input-dir` as
+`cusfm_cli` and writes the same output layout. Useful flags:
+
+```bash
+--loop-closure                 # run stage 5; off by default (decision 10)
+--no-use-gpu                   # force the ONNX CPU provider
+--max-matches-per-pair 500     # verified matches kept per pair; None keeps every inlier
+--ba-num-threads 1             # a bit-reproducible Ceres solve
+--optimize-extrinsics          # refine sensor_from_rig during bundle adjustment
+```
+
+`python -m colsfm stage --stage pair_selection` runs a metadata-only stage. It needs neither
+images nor a GPU, so a dataset's keyframe and pair counts can be checked before paying for
+feature extraction.
+
+The benchmark compares two runs in the same output layout and knows nothing about which
+producer wrote which:
+
+```bash
+pixi run -e colsfm python -m colsfm.bench_cli \
+    --dataset galileo \
+    --run-a data/cusfm_runs/galileo_blobref/cusfm \
+    --run-b data/cusfm_runs/galileo_colsfm/cusfm \
+    --input-dir data/r2b_galileo \
+    --save data/bench/galileo_compare.rrd \
+    --report data/bench/galileo_compare.md
+```
+
+It prints the tables, writes markdown and JSON, checks the acceptance bounds against run B,
+and writes one Rerun recording with run A at `/world/rig_00` and run B at `/world/rig_01`.
+
+To validate that recording without a display, open it in a headless viewer and take pixel
+evidence through the Rerun viewer MCP:
+
+```bash
+pixi run -e colsfm rerun --headless data/bench/galileo_compare.rrd
+```
+
+Then `connect`, `viewer_state` for the timelines, `set_time` onto `frame_time`, and
+`screenshot`. Screenshots of the accepted result are kept in `data/bench/screenshots/`. A
+successful exit and a written `.rrd` are not evidence that anything rendered.
+
+### Reverse-engineering toolchain
+
+The 21 executables are **unstripped**, with C++ symbols and embedded source paths
+(`/home/jryu/workspaces/visual_mapping/src/...`), which is what makes the specs possible at
+all. Decompilation used **Ghidra 12.1.3**, unpacked project-local under
+`data/cusfm_re/ghidra_12.1.3_PUBLIC/` and driven headless with a JDK supplied per invocation
+by `pixi exec -s openjdk=21`, so nothing is installed on the host and nothing lands in a
+pixi environment. Output goes to `data/cusfm_re/decomp/<binary>/`, one `.c` per function
+(389 functions for `pose_graph_main` alone), selected by
+`ghidra_scripts/DecompMatching.java` (name substrings) or `DecompAt.java` (entry addresses,
+needed to tell overloaded symbols such as the two `EstimateRelativePose` apart). A second
+shell with radare2, rizin, pyghidra and binwalk comes from a nix flake through
+`data/cusfm_re/tools/re-shell.sh`, which runs **nix-portable** in its proot fallback:
+`pixi exec -s nix` cannot build here, because the host has no user namespaces and a rootless
+daemon therefore cannot start. The protobuf schema comes out of the binaries themselves: each
+one embeds `FileDescriptorProto`s in its `protodesc_cold` ELF section, and all **31** `.proto`
+files across the 21 binaries are now vendored as
+`data/cusfm_schema/cusfm_protos.fdset` (up from the original 19), verified by re-serialising
+all 516 keyframes of a real `feature_extractor_main` run byte for byte. gflags help for every
+binary is dumped to `data/cusfm_re/help/<binary>.txt`, which is how flags that no config
+mentions were found. All of `data/cusfm_re/` is gitignored scratch; only the specs, the
+fdset and the numbers in this file are kept.
