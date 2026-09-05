@@ -28,15 +28,25 @@ blob's feature extractor resizes every input to its network size
 (`docs/spec/feature_extractor_main.md` §8), and the fixed-shape graph above does
 the same: a 1226x370 KITTI frame is inferred over 1920x1200, five times the
 pixels it has, for 19.6 ms against pycolmap's 7.8 ms at the native size
-(`docs/kitti-06-results.md` §9). `native_resolution=True` instead runs
-`data/cusfm_models/raco-aliked-dyn.onnx`, whose spatial axes are symbolic, at
-each image's own size rounded up to `INPUT_DIM_DIVISOR` — so KITTI runs at
-1248x384 and Galileo at 1920x1216. Images are grouped by that rounded size so a
-batch is still one shape, and the mapping back to pixels needs nothing new:
-`normalized_to_pixels` already targets the *original* size, and rounding up (a
-rescale) rather than padding (a translation) keeps it exact.
-`native_resolution=False` restores the stretch, on the old graph and the old
-engine, so the two are measurable against each other.
+(`docs/kitti-06-results.md` §9). `native_resolution=True` instead runs each image at its own size rounded up to
+`INPUT_DIM_DIVISOR` — so KITTI at 1248x384 and Galileo at 1920x1216. Images are
+grouped by that rounded size so a batch is still one shape, and the mapping back
+to pixels needs nothing new: `normalized_to_pixels` already targets the
+*original* size, and rounding up (a rescale) rather than padding (a translation)
+keeps it exact. `native_resolution=False` restores the stretch, on the old graph
+and the old engine, so the two are measurable against each other.
+
+**Native resolution does not mean the shape-dynamic engine.** Two engines can
+serve a size, and the shape-dynamic one
+(`data/cusfm_models/raco-aliked-dyn.onnx`, spatial axes symbolic) is only faster
+below the top of its profile. Galileo *is* the top — 1920x1200, the profile
+maximum — and there the dynamic engine costs 4.96 s against the fixed engine's
+2.70 s over 226 images: one profile's tactics have to cover 256x256 to 1216x1920,
+and the host pays a `cv2.resize` from 1200 to 1216 the fixed path skips. So
+`select_raco_engine` decides per size group, `raco_engine="auto"`: a group the
+fixed engine already accepts goes to the fixed engine, everything else to the
+dynamic one, and KITTI keeps its 11.86 to 4.87 ms an image. `raco_engine="fixed"`
+and `"dynamic"` force one, which is how the two are measured against each other.
 
 **Scores are a selection order, not a detector response.** Upstream's boundary
 ranker returns its top 2048 points already ordered but never materialises a
@@ -56,9 +66,10 @@ from __future__ import annotations
 import time
 from collections.abc import Iterator, Sequence
 from contextlib import ExitStack
+from dataclasses import dataclass
 from itertools import islice
 from pathlib import Path
-from typing import Final, TypeAlias
+from typing import Final, Literal, TypeAlias
 
 import numpy as np
 import pycolmap
@@ -67,7 +78,7 @@ from numpy import ndarray
 
 from colsfm import REPO_ROOT
 from colsfm.database import Descriptors, KeypointsXY, keypoint_counts
-from colsfm.features import TensorRTExtraction
+from colsfm.features import RacoEngineChoice, TensorRTExtraction
 from colsfm.features_trt import (
     ALIKED_IMAGE_BINDING,
     DEFAULT_GPU_PREPROCESSING,
@@ -224,6 +235,91 @@ def network_size_for(image_height: int, image_width: int) -> tuple[int, int]:
     return rounded(image_height, MAXIMUM_NETWORK_HEIGHT), rounded(image_width, MAXIMUM_NETWORK_WIDTH)
 
 
+RacoEngineKind: TypeAlias = Literal["fixed", "dynamic"]
+"""Which of the two RaCo graphs an engine was built from."""
+
+
+@dataclass(frozen=True, slots=True)
+class RacoEngine:
+    """The engine one size group runs through, and the input size it is handed."""
+
+    kind: RacoEngineKind
+    """`fixed` is the batch-dynamic graph at its declared size, `dynamic` the shape-dynamic one."""
+    onnx_path: Path
+    """The graph the engine is built from, and the cache name it is stored under."""
+    network_height: int
+    """The height the engine takes, which is what preprocessing resizes to."""
+    network_width: int
+    """The width the engine takes."""
+    maximum_batch_size: int
+    """The images its optimisation profile admits in one execution."""
+
+
+def fixed_engine_size_group() -> tuple[int, int]:
+    """The `network_size_for` group whose images the fixed-shape engine also serves.
+
+    The two graphs do not take the same numbers for the same picture: the fixed
+    one is declared at 1200x1920 and interpolates to 1216x1920 *inside* itself,
+    while the dynamic export rounds 1200 up to 1216 on the host. So the group is
+    the fixed engine's own input put through the same rounding — 1216x1920 —
+    and not the input itself.
+
+    Returns:
+        `(network_height, network_width)` of the group the fixed engine covers.
+    """
+    return network_size_for(NETWORK_HEIGHT, NETWORK_WIDTH)
+
+
+def select_raco_engine(network_size: tuple[int, int], choice: RacoEngineChoice = "auto") -> RacoEngine:
+    """Pick the engine one size group runs on.
+
+    `auto` exists because the dynamic engine is not free at the top of its
+    profile: Galileo, which *is* the profile maximum, extracts in 4.96 s against
+    the fixed engine's 2.70 s (`docs/gpu-preprocessing.md`), part single-profile
+    tactic selection and part a host `cv2.resize` from 1200 to 1216 that the
+    fixed path skips. Below the maximum the dynamic engine is the whole win —
+    KITTI goes 11.86 to 4.87 ms an image — so the rule is size-directed, not
+    global.
+
+    Args:
+        network_size: `(network_height, network_width)` from `network_size_for`.
+        choice: `auto` decides by size; `fixed` and `dynamic` force one engine.
+
+    Returns:
+        The graph, the input size to preprocess to, and the batch ceiling.
+    """
+    fixed: bool = choice == "fixed" or (choice == "auto" and network_size == fixed_engine_size_group())
+    if fixed:
+        return RacoEngine(
+            kind="fixed",
+            onnx_path=RACO_ONNX_PATH,
+            network_height=NETWORK_HEIGHT,
+            network_width=NETWORK_WIDTH,
+            maximum_batch_size=MAXIMUM_BATCH_SIZE,
+        )
+    return RacoEngine(
+        kind="dynamic",
+        onnx_path=RACO_DYNAMIC_ONNX_PATH,
+        network_height=network_size[0],
+        network_width=network_size[1],
+        maximum_batch_size=DYNAMIC_MAXIMUM_BATCH_SIZE,
+    )
+
+
+def _engine_file(engine: RacoEngine) -> Path:
+    """Build or find the cached engine file for one selection.
+
+    Args:
+        engine: What `select_raco_engine` returned.
+
+    Returns:
+        The serialised engine, built on first use.
+    """
+    if engine.kind == "fixed":
+        return resolve_engine(engine.onnx_path, raco_profile())
+    return resolve_engine(engine.onnx_path, raco_dynamic_profile(), profile_tag=raco_dynamic_engine_tag())
+
+
 def _size_groups(tasks: Sequence[ImageTask]) -> dict[tuple[int, int], list[ImageTask]]:
     """Group images by the network size they will run at, keeping their order.
 
@@ -304,11 +400,11 @@ def extract_raco(
     *,
     min_score: float,
     max_num_features: int,
-    onnx_path: Path | None = None,
     batch_size: int = DEFAULT_BATCH_SIZE,
     preprocessing_workers: int = DEFAULT_PREPROCESSING_WORKERS,
     gpu_preprocessing: bool = DEFAULT_GPU_PREPROCESSING,
     native_resolution: bool = True,
+    raco_engine: RacoEngineChoice = "auto",
 ) -> TensorRTExtraction:
     """Run the batched RaCo-ALIKED engine over the named images and store the features.
 
@@ -321,18 +417,22 @@ def extract_raco(
             rank rather than by detector response.
         max_num_features: Keypoint ceiling per image; the graph's own top-2048
             head normally binds first, so this only ever truncates.
-        onnx_path: The RaCo-ALIKED graph whose engine to use. `None` picks the
-            one `native_resolution` implies.
         batch_size: Images executed together, 1 to the graph's batch ceiling.
+            `native_resolution` bounds it at `DYNAMIC_MAXIMUM_BATCH_SIZE` unless
+            `raco_engine` forces the fixed engine, because `auto` may reach the
+            dynamic one for any size group.
         preprocessing_workers: Decode-and-resize threads.
         gpu_preprocessing: Stage the decoded uint8 frames in one page-locked
             batch buffer and let a TensorRT preprocessing engine transpose, widen
             and scale them. `False` restores the host conversion plus the
             `np.concatenate` that used to build every batch.
         native_resolution: Run each image at its own size, rounded up to
-            `INPUT_DIM_DIVISOR`, through the shape-dynamic graph. `False` is the
-            legacy behaviour: the fixed-shape graph, and every frame stretched to
-            1920x1200 whatever it was.
+            `INPUT_DIM_DIVISOR`, on whichever engine `raco_engine` picks for that
+            size. `False` is the legacy behaviour: the fixed-shape graph, and
+            every frame stretched to 1920x1200 whatever it was.
+        raco_engine: Which engine serves a size group; see `select_raco_engine`.
+            Read only when `native_resolution` is on — the stretch is the fixed
+            engine by definition.
 
     Returns:
         Keypoints stored per `image_id`, and the wall time of the whole pass
@@ -347,34 +447,35 @@ def extract_raco(
         raise FileNotFoundError(f"No COLMAP database at {database_path}")
     if not image_root.is_dir():
         raise FileNotFoundError(f"No image directory at {image_root}")
-    maximum_batch_size: int = DYNAMIC_MAXIMUM_BATCH_SIZE if native_resolution else MAXIMUM_BATCH_SIZE
+    engine_choice: RacoEngineChoice = raco_engine if native_resolution else "fixed"
+    maximum_batch_size: int = MAXIMUM_BATCH_SIZE if engine_choice == "fixed" else DYNAMIC_MAXIMUM_BATCH_SIZE
     if not MINIMUM_BATCH_SIZE <= batch_size <= maximum_batch_size:
         raise ValueError(f"batch_size must be in [{MINIMUM_BATCH_SIZE}, {maximum_batch_size}], got {batch_size}")
 
     started: float = time.perf_counter()
     tasks: list[ImageTask] = _image_tasks(database_path, image_root, image_names)
-    graph_path: Path = onnx_path or (RACO_DYNAMIC_ONNX_PATH if native_resolution else RACO_ONNX_PATH)
-    engine_path: Path = (
-        resolve_engine(graph_path, raco_dynamic_profile(), profile_tag=raco_dynamic_engine_tag())
-        if native_resolution
-        else resolve_engine(graph_path, raco_profile())
+    groups: dict[tuple[int, int], list[ImageTask]] = (
+        _size_groups(tasks) if native_resolution else {fixed_engine_size_group(): list(tasks)}
     )
     with ExitStack() as stack:
-        session: TensorRTSession = stack.enter_context(TensorRTSession(engine_path, reuse_output_buffers=True))
         database: pycolmap.Database = stack.enter_context(pycolmap.Database.open(database_path))
-        groups: dict[tuple[int, int], list[ImageTask]]
-        if native_resolution:
-            groups = _size_groups(tasks)
-        else:
-            declared_shape: tuple[int, ...] = tuple(session.engine.get_tensor_shape(ALIKED_IMAGE_BINDING))
-            groups = {(int(declared_shape[2]), int(declared_shape[3])): list(tasks)}
-        preprocessors: dict[tuple[int, int], GpuPreprocessor] = {}
+        sessions: dict[Path, TensorRTSession] = {}
+        preprocessors: dict[tuple[Path, int, int], GpuPreprocessor] = {}
         for network_size, group in groups.items():
-            network_height, network_width = network_size
+            if not group:
+                continue
+            engine: RacoEngine = select_raco_engine(network_size, engine_choice)
+            engine_path: Path = _engine_file(engine)
+            if engine_path not in sessions:
+                sessions[engine_path] = stack.enter_context(TensorRTSession(engine_path, reuse_output_buffers=True))
+            session: TensorRTSession = sessions[engine_path]
+            network_height: int = engine.network_height
+            network_width: int = engine.network_width
             preprocessor: GpuPreprocessor | None = None
             if gpu_preprocessing:
-                if network_size not in preprocessors:
-                    preprocessors[network_size] = stack.enter_context(
+                preprocessor_key: tuple[Path, int, int] = (engine_path, network_height, network_width)
+                if preprocessor_key not in preprocessors:
+                    preprocessors[preprocessor_key] = stack.enter_context(
                         GpuPreprocessor(
                             height=network_height,
                             width=network_width,
@@ -383,7 +484,7 @@ def extract_raco(
                             stream=session.stream,
                         )
                     )
-                preprocessor = preprocessors[network_size]
+                preprocessor = preprocessors[preprocessor_key]
             prepared: Iterator[PreparedImage] = _prepared_stream(
                 group, preprocessing_workers, network_height, network_width, not gpu_preprocessing
             )

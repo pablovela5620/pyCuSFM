@@ -261,3 +261,45 @@ pays one build and one page-locked staging buffer per distinct size rather than
 one per batch. The staging buffer is `max_batch * height * width * 3` bytes of
 pinned host memory, which is 45 MB at batch 8 and 1216x1920 — worth knowing
 before pointing this at a set with many distinct camera sizes.
+
+## Native resolution picks an engine, not just a size
+
+Running every image through the shape-dynamic engine cost Galileo 1.8x. Galileo
+is 1920x1200, which *is* the dynamic profile's maximum, so it gains nothing from
+a smaller input and loses two things: one optimisation profile has to pick
+tactics for everything from 256x256 to 1216x1920, and the host pays a
+`cv2.resize` from 1200 to 1216 that the fixed-shape path skips (the fixed graph
+resamples to 1216 inside itself, from the 1920x1200 it declares).
+
+`select_raco_engine` therefore decides per size group, and
+`FeatureOptions.raco_engine="auto"` is the default. The rule is one comparison:
+put the fixed engine's declared input through `network_size_for`, the same
+rounding the dynamic path uses, and a group that equals it goes to the fixed
+engine — today only 1216x1920. The comparison has to be on the rounded group
+rather than on 1200x1920, because no image ever produces a 1200 group; 32 does
+not divide it. `"fixed"` and `"dynamic"` force one engine, which is what a
+measurement of the two wants.
+
+| Galileo, 226 keyframes, warm engines | stage | per image |
+| --- | --- | --- |
+| `raco_engine="auto"` (the default) | **2.64 s** | 11.7 ms |
+| `raco_engine="fixed"` | 2.62 s | 11.6 ms |
+| `raco_engine="dynamic"` | 4.96 s | 22.0 ms |
+
+| KITTI 06, 200 frames, warm engines | stage | per image |
+| --- | --- | --- |
+| `raco_engine="auto"` (dynamic at 1248x384) | **1.09 s** | 5.4 ms |
+| `raco_engine="dynamic"` | 1.09 s | 5.5 ms |
+| `native_resolution=False` (the stretch) | 2.30 s | 11.5 ms |
+
+So `auto` is the fixed number on Galileo and the dynamic number on KITTI, which
+is the whole claim.
+
+**The 1.8x was not build contention.** The dynamic engine had been built while
+other workers held the GPU, and `docs/raco-speed-investigation.md` §3b records
+that a contended build picks worse tactics permanently. Deleting both the
+engine and the TensorRT timing cache and rebuilding on an idle GPU (251 s)
+produced an 8.9 MiB engine against the old 9.2 MiB — different tactics — that
+runs Galileo in 4.960 s against the contended engine's 4.919 s. The profile
+width and the host resize are the whole explanation; nothing here is worth a
+rebuild.

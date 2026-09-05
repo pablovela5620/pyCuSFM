@@ -66,6 +66,14 @@ architecture the cached engine was built for; `raco` additionally needs the
 graph under `data/cusfm_models/`, which is not committed. `pycolmap` is the
 default because it needs none of that."""
 
+RacoEngineChoice: TypeAlias = Literal["auto", "fixed", "dynamic"]
+"""Which RaCo engine runs an image once `native_resolution` is on.
+
+`auto` picks per image size: the fixed-shape engine when the size group is one
+that engine already accepts (Galileo's 1920x1200), the shape-dynamic one
+otherwise (KITTI's 1226x370). `fixed` and `dynamic` force one of them, which is
+what a measurement of the two wants; see `colsfm.features_raco`."""
+
 DeviceChoice: TypeAlias = Literal["auto", "cuda", "cpu"]
 """Requested compute device; `auto` picks CUDA when it is actually usable."""
 
@@ -126,11 +134,18 @@ class FeatureOptions:
     native_resolution: bool = True
     """On `raco` only: run each image at its own size instead of stretching it.
 
-    True picks the shape-dynamic graph and infers a 1226x370 KITTI frame over
-    1248x384 rather than 1920x1200. False is the legacy stretch on the
-    fixed-shape graph, which is what `docs/kitti-06-results.md` §9 measured. The
-    other two backends ignore it: `pycolmap` is already native and `tensorrt` is
-    the blob's own static engine."""
+    True runs a 1226x370 KITTI frame over 1248x384 rather than 1920x1200, on
+    whichever engine `raco_engine` picks for that size. False is the legacy
+    stretch on the fixed-shape graph, which is what `docs/kitti-06-results.md`
+    §9 measured. The other two backends ignore it: `pycolmap` is already native
+    and `tensorrt` is the blob's own static engine."""
+    raco_engine: RacoEngineChoice = "auto"
+    """On `raco` with `native_resolution` only: which engine runs each size.
+
+    `auto` sends a size group the fixed-shape engine already accepts through
+    that engine and everything else through the shape-dynamic one, so Galileo
+    keeps its 2.7 s stage and KITTI keeps its 4.87 ms/image. See
+    `RacoEngineChoice`."""
 
 
 DEFAULT_FEATURE_OPTIONS: Final[FeatureOptions] = FeatureOptions()
@@ -282,6 +297,7 @@ def extract_features(
                 min_score=RACO_MIN_SCORE,
                 max_num_features=options.max_num_features,
                 native_resolution=options.native_resolution,
+                raco_engine=options.raco_engine,
             )
         else:
             from colsfm.features_trt import extract_tensorrt

@@ -802,11 +802,18 @@ their own size rounded up to 32 and runs each group at that shape.
 `FeatureOptions.native_resolution=False` restores the old graph and the old stretch. KITTI
 06's 1226x370 frames fall from **11.9 to 4.9 ms per image** warm (200 frames) and its full
 `--loop-closure` run's extraction stage from §9's 42.3 s to **10.1 s**, total 295.0 s to
-**203.2 s**, at Sim(3) ATE 0.878 m against 0.902 m — cheaper and no worse. Galileo pays for
-it: it is already the profile's *maximum*, so it gains nothing from the smaller input and
-loses the fixed-shape engine's specialised tactics, **11.9 to 21.9 ms per image**. The
-shape-dynamic engine also sizes its execution context for the maximum shape whatever it
-runs, ~16 GB at batch 8, which is the other reason not to widen the profile further. The
+**203.2 s**, at Sim(3) ATE 0.878 m against 0.902 m — cheaper and no worse. Galileo does not
+pay for it, because native resolution picks an *engine* as well as a size:
+`FeatureOptions.raco_engine="auto"` sends a size group the fixed-shape engine already
+accepts — Galileo's, whose 1920x1200 the fixed graph resamples to the same 1216x1920 the
+dynamic export rounds to — back to that engine, and everything else to the dynamic one. On
+226 Galileo keyframes that is **2.62 s fixed against 4.96 s dynamic** (11.6 vs 22.0 ms per
+image); a rebuild of the dynamic engine on an idle GPU reproduced 4.96 s to three digits, so
+the 1.9x is the single wide profile's tactics plus the host 1200→1216 `cv2.resize`, not
+build-time contention. `raco_engine="fixed"`/`"dynamic"` force one engine, which is how those
+two numbers are taken. The shape-dynamic engine also sizes its execution context for the
+maximum shape whatever it runs, ~16 GB at batch 8, which is the other reason not to widen the
+profile further. The
 deviation is deliberate and against the blob, which resizes every input to its network size
 (`docs/spec/feature_extractor_main.md` §8).
 

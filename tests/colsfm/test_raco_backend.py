@@ -27,7 +27,7 @@ from numpy import ndarray
 
 from colsfm import REPO_ROOT
 from colsfm.database import ImagePair, KeypointsXY, create_database, read_descriptors_from_database, read_keypoints
-from colsfm.features import BLOB_MAX_KEYPOINTS, ExtractionReport, FeatureOptions, extract_features
+from colsfm.features import BLOB_MAX_KEYPOINTS, ExtractionReport, FeatureOptions, RacoEngineChoice, extract_features
 from colsfm.frames_meta import FRAMES_META_NAME, CameraParams, FramesMeta, KeyframeMeta, read_frames_meta
 from colsfm.matching import MatchingOptions, MatchReport, match_pairs
 from colsfm.pairs import select_pairs
@@ -175,6 +175,53 @@ def test_the_dynamic_profile_covers_both_datasets_on_the_networks_grid() -> None
         assert minimum[2] <= height <= maximum[2]
         assert minimum[3] <= width <= maximum[3]
     assert raco_dynamic_engine_tag() == "b1-8_256x256_1216x1920"
+
+
+def test_the_engine_is_picked_from_the_size_a_group_runs_at() -> None:
+    """Native resolution is a size, not an engine: Galileo keeps the fixed one.
+
+    The shape-dynamic engine wins below the top of its profile and loses at the
+    top, so `auto` sends the one size group the fixed engine already accepts
+    back to it. The size compared is the group, 1216x1920 — the fixed graph
+    interpolates its declared 1200x1920 input to 1216 itself — while the size
+    the engine is *handed* stays the 1200x1920 it declares.
+    """
+    from colsfm.features_raco import (
+        RACO_DYNAMIC_ONNX_PATH,
+        RACO_ONNX_PATH,
+        RacoEngine,
+        network_size_for,
+        select_raco_engine,
+    )
+
+    galileo: RacoEngine = select_raco_engine(network_size_for(1200, 1920))
+    assert galileo.kind == "fixed"
+    assert galileo.onnx_path == RACO_ONNX_PATH
+    assert (galileo.network_height, galileo.network_width) == (1200, 1920)
+
+    kitti: RacoEngine = select_raco_engine(network_size_for(370, 1226))
+    assert kitti.kind == "dynamic"
+    assert kitti.onnx_path == RACO_DYNAMIC_ONNX_PATH
+    assert (kitti.network_height, kitti.network_width) == (384, 1248)
+
+    crop: RacoEngine = select_raco_engine(network_size_for(480, 640))
+    assert crop.kind == "dynamic"
+    assert (crop.network_height, crop.network_width) == (480, 640)
+
+
+def test_either_engine_can_be_forced_whatever_the_size() -> None:
+    """`fixed` and `dynamic` override the size rule, which is how the two are timed."""
+    from colsfm.features_raco import RacoEngine, network_size_for, select_raco_engine
+
+    forced_dynamic: RacoEngine = select_raco_engine(network_size_for(1200, 1920), "dynamic")
+    assert forced_dynamic.kind == "dynamic"
+    assert (forced_dynamic.network_height, forced_dynamic.network_width) == (1216, 1920)
+    assert forced_dynamic.maximum_batch_size == 8
+
+    forced_fixed: RacoEngine = select_raco_engine(network_size_for(370, 1226), "fixed")
+    assert forced_fixed.kind == "fixed"
+    assert (forced_fixed.network_height, forced_fixed.network_width) == (1200, 1920)
+    assert forced_fixed.maximum_batch_size == 16
 
 
 @pytest.fixture(scope="module")
@@ -363,22 +410,30 @@ def test_a_640x480_crop_runs_at_its_own_size_and_stays_inside_it(
 def test_galileo_at_the_profile_maximum_reproduces_the_legacy_stretch(
     galileo_input: FramesMeta, galileo_input_dir: Path, tmp_path: Path
 ) -> None:
-    """Galileo is the profile's maximum, so the two paths should agree there.
+    """Galileo is the profile's maximum, so all three ways of running it agree there.
 
-    They are not bit-identical: the fixed-shape graph takes 1920x1200 and
-    resamples to 1216 inside itself, the dynamic one is handed 1920x1216 by
-    OpenCV. Both are bilinear over the same pixels, so the detector should return
-    the same points; this asserts most of them coincide to under a pixel, which
-    is what "the stretch was the only difference" means.
+    Two claims in one run. First, `auto` at native resolution reproduces the
+    legacy stretch *exactly*, because at this size it chooses the same fixed
+    engine and hands it the same 1920x1200 — that is the selection rule observed
+    from outside, and it is what removes the 1.8x the dynamic engine costs here.
+    Second, the forced dynamic engine still agrees to under a pixel: it is handed
+    1920x1216 by OpenCV where the fixed graph resamples 1200 to 1216 inside
+    itself, both bilinear over the same pixels, so the detector returns the same
+    points and not the same floats.
     """
     from colsfm.features_raco import extract_raco
 
     keyframe_ids: list[int] = list(galileo_input.rig_frames()[0].keyframe_ids)
     subset: FramesMeta = galileo_input.filtered(keyframe_ids)
     image_names: list[str] = [keyframe.image_name for keyframe in subset.keyframes]
-    stored: dict[bool, KeypointsXY] = {}
-    for native_resolution in (True, False):
-        database_path: Path = tmp_path / f"galileo_{native_resolution}.db"
+    runs: tuple[tuple[str, bool, RacoEngineChoice], ...] = (
+        ("auto", True, "auto"),
+        ("dynamic", True, "dynamic"),
+        ("legacy", False, "auto"),
+    )
+    stored: dict[str, KeypointsXY] = {}
+    for label, native_resolution, raco_engine in runs:
+        database_path: Path = tmp_path / f"galileo_{label}.db"
         create_database(database_path, subset)
         counts, _elapsed = extract_raco(
             database_path,
@@ -387,11 +442,13 @@ def test_galileo_at_the_profile_maximum_reproduces_the_legacy_stretch(
             min_score=0.0,
             max_num_features=BLOB_MAX_KEYPOINTS,
             native_resolution=native_resolution,
+            raco_engine=raco_engine,
         )
         assert all(count == BLOB_MAX_KEYPOINTS for count in counts.values())
-        stored[native_resolution] = read_keypoints(database_path, keyframe_ids[0])
+        stored[label] = read_keypoints(database_path, keyframe_ids[0])
+    assert np.array_equal(stored["auto"], stored["legacy"])
     separations: Float32[ndarray, "num_native num_legacy"] = np.linalg.norm(
-        stored[True][:, None, :] - stored[False][None, :, :], axis=2
+        stored["dynamic"][:, None, :] - stored["legacy"][None, :, :], axis=2
     )
     nearest: Float32[ndarray, " num_native"] = separations.min(axis=1)
     assert float(np.median(nearest)) < 1.0, float(np.median(nearest))
