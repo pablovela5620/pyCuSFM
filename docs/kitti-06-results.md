@@ -246,3 +246,231 @@ state, `274b5c50b4e196c7c5bed1a6343b201b67b650ec`, extracted with
 `git archive HEAD colsfm` into a scratch directory outside the repo and run from
 there; nothing under `colsfm/` was edited. `colsfm.bench_cli` was run from the same
 snapshot so that every number comes from one code state.
+
+## 8. Follow-up: the match cap, loop closure and the TensorRT backends
+
+Section 4 blamed `colsfm`'s 19 % point deficit and its 0.14 px worse reprojection
+error on the fixed 500-match spatial cap, which discarded 3 782 937 verified
+inliers here (retention 0.201). This section tests that: five `colsfm` runs from
+the same cuVSLAM **SLAM** initialisation, differing only in the cap mode, in
+whether loop closure ran, and in which ALIKED and LightGlue implementation ran.
+
+### 8.1 What was run
+
+Every run is the same command with different flags, on the same host as section 5
+(Ryzen 9 9950X3D, RTX 5090):
+
+```bash
+python -m colsfm run \
+    --input-dir data/kitti/06_colsfm_input_slam \
+    --config-dir data/kitti/config \
+    --min-inter-frame-distance 0.5 \
+    --output-dir <run>/cusfm \
+    <flags>
+```
+
+| Label | Flags |
+|---|---|
+| cap 500 | `--no-loop-closure --match-cap-mode fixed` (the section 3 baseline) |
+| cap off | `--no-loop-closure --match-cap-mode off` |
+| image_area | `--no-loop-closure --match-cap-mode image_area` |
+| cap 500 + loops | `--loop-closure --match-cap-mode fixed` |
+| cap off + loops | `--loop-closure --match-cap-mode off` |
+| TensorRT + loops | `--loop-closure --match-cap-mode fixed --features-backend tensorrt --matching-backend tensorrt` |
+
+`--match-cap-mode` and the two `--backend` flags are new; see NOTES.md decisions
+13 and 14. `image_area` keeps the density the 500 was calibrated at — one kept
+match per 4608 px of image — which on KITTI's 1241x376 frames is a cap of 101.
+The TensorRT run keeps `fixed`, because on that backend the cap is the target of
+the blob's *real* SSC spatial NMS rather than a post-verification grid subsample.
+
+Scored exactly as section 3 was:
+
+```bash
+pixi run -e colsfm python -m tools.kitti.evaluate_kitti \
+    --sequence-dir data/kitti/06 --trajectories <label> <run>/cusfm/output_poses/merged_pose_file.tum ...
+```
+
+### 8.2 The cap: 500 is already the right number
+
+Sim(3)-aligned ATE against `data/kitti/06/poses_gt_06.txt`, metres. The two
+reference rows are re-scored here so every number in this table comes from one
+evaluation run.
+
+| Run | RMSE | Mean | Median | STD | Min | Max |
+|---|---:|---:|---:|---:|---:|---:|
+| cuVSLAM SLAM (input) | 1.336 | 1.191 | 1.145 | 0.604 | 0.305 | 2.948 |
+| blob cuSFM, SLAM init | **1.328** | 1.183 | 1.131 | 0.603 | 0.304 | 3.039 |
+| colsfm, cap 500 | **1.552** | 1.408 | 1.299 | 0.653 | 0.503 | 3.459 |
+| colsfm, cap off | 1.822 | 1.667 | 1.659 | 0.735 | 0.463 | 4.148 |
+| colsfm, image_area (101) | 2.103 | 1.890 | 1.560 | 0.923 | 0.301 | 5.236 |
+
+SE(3)-aligned, same runs:
+
+| Run | RMSE | Mean | Median | STD | Min | Max |
+|---|---:|---:|---:|---:|---:|---:|
+| cuVSLAM SLAM (input) | 1.648 | 1.566 | 1.534 | 0.512 | 0.712 | 3.051 |
+| blob cuSFM, SLAM init | 1.605 | 1.525 | 1.476 | 0.498 | 0.737 | 3.071 |
+| colsfm, cap 500 | **1.732** | 1.635 | 1.653 | 0.571 | 0.668 | 3.427 |
+| colsfm, cap off | 1.917 | 1.806 | 1.713 | 0.644 | 0.563 | 4.202 |
+| colsfm, image_area (101) | 2.243 | 2.053 | 1.882 | 0.905 | 0.405 | 5.165 |
+
+Reconstruction and per-stage runtime:
+
+| Metric | cap 500 | cap off | image_area |
+|---|---:|---:|---:|
+| registered images | 2156 | 2156 | 2156 |
+| 3D points | 97 654 | 221 545 | 28 484 |
+| observations | 529 101 | 2 523 036 | 131 926 |
+| mean reprojection (px) | 0.599 | 0.922 | 0.485 |
+| mean track length | 5.42 | 11.39 | 4.63 |
+| feature extraction (s) | 17.9 | 17.7 | 17.2 |
+| matching (s) | 94.4 | 73.9 | 102.4 |
+| pose graph (s) | 0.2 | 0.2 | 0.2 |
+| triangulation + BA (s) | 151.7 | 513.5 | 68.0 |
+| export (s) | 3.6 | 4.3 | 3.4 |
+| **total (s)** | **268.0** | **609.9** | **191.3** |
+
+**The cap was not the problem.** Section 4 read the log line `spatial cap at
+500/pair dropped 3782937 inlier matches` as a loss. It is not: removing the cap
+gives the mapper 4.8x the observations and 2.3x the points, and the trajectory
+gets **worse**, from 1.552 to 1.822 Sim(3) RMSE, while the run takes 2.3x as long
+and the reprojection error rises from 0.599 px to 0.922 px. Scaling the cap down
+with the frame area (`image_area`, 101 matches per pair here) is worse again, at
+2.103. 500 sits between two worse answers.
+
+That is the same shape decision 7 measured on Galileo — uncapped 1300 matches per
+pair at 1.80 px and 5.39 mm ATE against 156 matches at 1.33 px and 4.32 mm — so
+the cap is doing the same job on both datasets: it refuses to pile a thousand
+near-collinear observations from one image region onto one track. The 80 % figure
+in section 4 is a red herring; Galileo discards 88 % and gains from it.
+
+`match_cap_mode` therefore stays at `fixed` by default. It exists because the
+question was worth answering, and now it is answered with numbers rather than
+with a log line.
+
+### 8.3 Loop closure is worth 0.8 m, and it is not the pose graph that pays
+
+Two more runs add `--loop-closure`, and two more open the pose-graph loop gates
+that `data/kitti/config` leaves at 0.0. Sim(3)-aligned ATE, metres, every row
+from one `evaluate_kitti` invocation (`/tmp/colsfm_runs/kitti_followup_ate.json`):
+
+| Run | loop edges | RMSE | Mean | Median | STD | Min | Max |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| *paper* CuSfM-View Graph | — | 0.783 | 0.741 | 0.738 | 0.255 | 0.112 | 1.488 |
+| cuVSLAM SLAM (input) | — | 1.336 | 1.191 | 1.145 | 0.604 | 0.305 | 2.948 |
+| blob cuSFM, SLAM init | 0 | 1.328 | 1.183 | 1.131 | 0.603 | 0.304 | 3.039 |
+| colsfm, cap 500 | — | 1.552 | 1.408 | 1.299 | 0.653 | 0.503 | 3.459 |
+| colsfm, cap off | — | 1.822 | 1.667 | 1.659 | 0.735 | 0.463 | 4.148 |
+| colsfm, image_area | — | 2.103 | 1.890 | 1.560 | 0.923 | 0.301 | 5.236 |
+| colsfm, cap 500 + loops | 0 | 0.895 | 0.781 | 0.728 | 0.437 | 0.045 | 1.846 |
+| colsfm, cap off + loops | 0 | 0.817 | 0.731 | 0.681 | 0.363 | 0.103 | 1.503 |
+| **colsfm, TensorRT + loops** | 0 | **0.736** | 0.624 | 0.458 | 0.390 | 0.106 | 1.690 |
+| colsfm, cap 500 + loops, gates open | 279 | 1.428 | 1.303 | 1.301 | 0.585 | 0.431 | 2.774 |
+| colsfm, TensorRT + loops, gates open | 283 | 1.893 | 1.649 | 1.455 | 0.930 | 0.214 | 4.552 |
+
+SE(3)-aligned, same runs:
+
+| Run | RMSE | Mean | Median | STD | Min | Max |
+|---|---:|---:|---:|---:|---:|---:|
+| cuVSLAM SLAM (input) | 1.648 | 1.566 | 1.534 | 0.512 | 0.712 | 3.051 |
+| blob cuSFM, SLAM init | 1.605 | 1.525 | 1.476 | 0.498 | 0.737 | 3.071 |
+| colsfm, cap 500 | 1.732 | 1.635 | 1.653 | 0.571 | 0.668 | 3.427 |
+| colsfm, cap off | 1.917 | 1.806 | 1.713 | 0.644 | 0.563 | 4.202 |
+| colsfm, image_area | 2.243 | 2.053 | 1.882 | 0.905 | 0.405 | 5.165 |
+| colsfm, cap 500 + loops | 1.118 | 1.075 | 0.969 | 0.308 | 0.666 | 1.823 |
+| **colsfm, cap off + loops** | **1.029** | 1.001 | 0.932 | 0.239 | 0.646 | 1.477 |
+| colsfm, TensorRT + loops | 1.111 | 1.038 | 1.092 | 0.396 | 0.295 | 1.861 |
+| colsfm, cap 500 + loops, gates open | 1.589 | 1.517 | 1.452 | 0.473 | 0.746 | 2.838 |
+| colsfm, TensorRT + loops, gates open | 1.989 | 1.795 | 1.660 | 0.857 | 0.570 | 4.611 |
+
+Reconstruction and per-stage runtime for all seven `colsfm` runs:
+
+| Metric | cap 500 | cap off | image_area | 500+loops | off+loops | TRT+loops | 500+loops gated | TRT+loops gated |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| registered images | 2156 | 2156 | 2156 | 2156 | 2156 | 2156 | 2156 | 2156 |
+| 3D points | 97 654 | 221 545 | 28 484 | 96 691 | 174 339 | 174 319 | 97 674 | 176 927 |
+| observations | 529 101 | 2 523 036 | 131 926 | 713 124 | 2 707 266 | 1 214 490 | 712 275 | 1 217 074 |
+| mean reprojection (px) | 0.599 | 0.922 | 0.485 | 0.674 | 0.987 | 0.534 | 0.674 | 0.533 |
+| mean track length | 5.42 | 11.39 | 4.63 | 7.38 | 15.53 | 6.97 | 7.29 | 6.88 |
+| loop edges in the pose graph | 0 | 0 | 0 | 0 | 0 | 0 | 279 | 283 |
+| extra loop pairs matched | 0 | 0 | 0 | 1344 | 1344 | 1320 | 1344 | 1320 |
+| feature extraction (s) | 17.9 | 17.7 | 17.2 | 16.9 | 17.5 | **62.2** | 16.7 | 62.2 |
+| matching (s) | 94.4 | 73.9 | 102.4 | 76.3 | 84.2 | **25.2** | 77.1 | 25.2 |
+| loop closure (s) | 0.0 | 0.0 | 0.0 | 93.0 | 97.6 | 62.3 | 92.6 | 63.5 |
+| pose graph (s) | 0.2 | 0.2 | 0.2 | 0.2 | 0.2 | 0.2 | 1.9 | 1.5 |
+| triangulation + BA (s) | 151.7 | 513.5 | 68.0 | 148.5 | 533.8 | 209.9 | 145.3 | 244.1 |
+| export (s) | 3.6 | 4.3 | 3.4 | 2.9 | 3.4 | 3.5 | 3.6 | 2.9 |
+| **total (s)** | 268.0 | 609.9 | 191.3 | **338.0** | 736.8 | 363.5 | 337.5 | 399.6 |
+
+**The loop is there, and finding it is worth 0.8 m.** `--loop-closure` takes
+`colsfm` from 1.552 to 0.895 (cap 500), 0.817 (cap off) and **0.736** (TensorRT
+backends) Sim(3) RMSE. Section 6 said "sequence 06 is a loop and the loop closure
+was not found"; it is found, and closing it puts `colsfm` past the blob's 1.328
+and past the paper's own 0.783 for its `CuSfM-View Graph` row, from the same
+cuVSLAM SLAM initialisation. The cost is 70 s of extra runtime — 338.0 s against
+268.0 s — because 1344 of the 2386 retrieval candidates still had to be matched.
+
+**It is not the pose graph that closes it.** Every one of those runs reports
+`0 loop edges`: `data/kitti/config/pose_graph_config.pb.txt` sets neither
+`loop_edge_translation_threshold_meters` nor `loop_edge_rotation_threshold_degrees`,
+so `colsfm.pose_graph.gate_loop_edges` rejects all 275-290 verified candidates
+and the pipeline prints its own warning about it. What closes the loop is that
+the loop-closure stage **matches its candidate pairs into the same database**, and
+`colsfm.mapping.load_correspondences` reads every verified two-view geometry —
+so the loop pairs reach triangulation and bundle adjustment as ordinary tracks
+even though no pose-graph constraint survived. Observations rise from 529 101 to
+713 124 and the mean track length from 5.42 to 7.38 while the point count barely
+moves: those are the same points, seen again from the other side of the loop.
+
+**Opening the gates makes it worse.** A `data/kitti/config` copy with
+`loop_edge_translation_threshold_meters: 5` and
+`loop_edge_rotation_threshold_degrees: 60` — the values
+`colsfm.pose_graph.gate_loop_edges` documents for its own A/B — admits 279 and 283
+loop edges and the pose graph converges (cost 77.7 -> 1.56, 30 iterations). The
+trajectory then degrades from 0.895 to 1.428 and from 0.736 to 1.893. The
+measurement each edge carries comes from `colsfm.loop_pose`'s generalized
+resection, and NOTES.md deviation 5 already records that it lands 408 mm from the
+blob's own loop poses on RoboCap where the blob reaches 135 mm; on a 1231 m car
+sequence that error is large enough that 279 such constraints pull the chain off
+the answer bundle adjustment would otherwise have found. **The recommendation for
+KITTI-like data is `--loop-closure` with the pose-graph loop gates left closed**,
+which is what the shipped config already does.
+
+**The TensorRT extractor is the wrong tool for KITTI.** Feature extraction is
+62.2 s against 17.9 s, because `aliked.onnx` takes a fixed 1920x1200 input and a
+1241x376 KITTI frame is stretched *up* to it, while COLMAP's own ALIKED runs at
+the native size. Matching goes the other way, 25.2 s against 94.4 s. The net is a
+wash on total runtime (363.5 s against 338.0 s) and a clear win on accuracy
+(0.736 against 0.895), which is the blob's own descriptors and the blob's own SSC
+doing their job.
+
+### 8.4 What this means against the paper's 0.783
+
+| Method | Sim(3) RMSE | Improvement over its own cuVSLAM input |
+|---|---:|---:|
+| *paper* CuSfM-View Graph | 0.783 | -35 % (from 1.202) |
+| blob cuSFM, SLAM init | 1.328 | +2 % (from 1.336) |
+| colsfm, cap 500, no loops | 1.552 | +16 % |
+| **colsfm, TensorRT + loops** | **0.736** | **-45 % (from 1.336)** |
+
+Section 6 concluded that "the refinement does not reproduce" and that the reason
+was a loop that existed in the data and was never found. That conclusion holds
+for the blob and is now explained for `colsfm`: with the loop found, the open port
+improves its cuVSLAM input by 45 %, against the paper's 35 %, and lands at 0.736
+against the paper's 0.783. The remaining differences from the paper — a different
+GPU, a different cuVSLAM build, COLMAP's LO-RANSAC triangulation against cuSFM's
+MSAC — are the ones section 6 already lists, and none of them is now hiding a
+missing loop.
+
+Two caveats on that number. It is one sequence, and the run that produces it uses
+both TensorRT backends, so it depends on `pycusfm/models/aliked_lightglue/` being
+present. The pycolmap-backend equivalent, `cap 500 + loops`, is 0.895 — still past
+the blob and still a 33 % improvement on its input, with no TensorRT anywhere.
+
+**What changed in the code.** `--match-cap-mode` (NOTES.md decision 14) and the
+two `--*-backend` flags (decision 13). Nothing else: the loop-closure stage, the
+pose graph and the mapper are the same code section 3 measured, and the 1.552
+baseline reproduces section 3's 1.596 to within the run-to-run spread of a
+threaded Ceres solve.
+

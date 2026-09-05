@@ -28,6 +28,14 @@ failure is not an exception: ONNX Runtime throws inside a COLMAP worker thread
 and the process aborts with SIGABRT. `resolve_device` therefore probes for cuDNN
 *before* the call and falls back to the CPU provider, which is ~50x slower
 (1.8 s per 1920x1200 image against 0.03 s on the GPU).
+
+**The other backend.** `FeatureOptions.backend = "tensorrt"` runs the blob's own
+`aliked.onnx` through the blob's own engine instead (`colsfm.features_trt`) —
+same descriptors, same preprocessing, no cuDNN and no COLMAP model download. It
+is not the default because it needs `tensorrt`, `cuda-python` and an engine built
+for this machine's GPU, none of which the pycolmap path needs. Both write the
+same two database columns for the same `image_id`s, so the choice is invisible to
+every later stage.
 """
 
 from __future__ import annotations
@@ -46,11 +54,22 @@ from colsfm.database import image_ids_by_name, keypoint_counts
 AlikedVariant: TypeAlias = Literal["ALIKED_N16ROT", "ALIKED_N32"]
 """The two ALIKED graphs COLMAP 4.2 can download and run."""
 
+FeatureBackend: TypeAlias = Literal["pycolmap", "tensorrt"]
+"""Which ALIKED runs: COLMAP's own ONNX one, or the blob's TensorRT engine.
+
+`tensorrt` is `colsfm.features_trt` — the blob's `aliked.onnx` through the
+engine the blob itself built. It needs `tensorrt` and `cuda-python`, which the
+`colsfm` pixi environment carries, and a GPU whose architecture the cached
+engine was built for. `pycolmap` is the default because it needs neither."""
+
 DeviceChoice: TypeAlias = Literal["auto", "cuda", "cpu"]
 """Requested compute device; `auto` picks CUDA when it is actually usable."""
 
 ResolvedDevice: TypeAlias = Literal["cuda", "cpu"]
 """The device a stage really ran on."""
+
+TensorRTExtraction: TypeAlias = tuple[dict[int, int], float]
+"""What `colsfm.features_trt.extract_tensorrt` returns: keypoints per image id, and seconds."""
 
 BLOB_DETECTOR_THRESHOLD: Final[float] = 0.005
 """`aliked_detector.detector_threshold` in `pycusfm/configs/isaac/keypoint_creation_config.pb.txt`."""
@@ -71,6 +90,12 @@ CUDNN_LIBRARY_NAME: Final[str] = "libcudnn.so"
 class FeatureOptions:
     """How ALIKED runs over one image set."""
 
+    backend: FeatureBackend = "pycolmap"
+    """Which ALIKED implementation runs; see `FeatureBackend`.
+
+    On `tensorrt` the `variant`, `max_image_size`, `num_threads`, `device` and
+    `gpu_index` fields are not read: the engine is the blob's own graph at its
+    own fixed input size, and it runs on CUDA device 0 or not at all."""
     variant: AlikedVariant = "ALIKED_N16ROT"
     """ALIKED graph; `ALIKED_N16ROT` is the architecture the blob's ONNX uses."""
     max_num_features: int = BLOB_MAX_KEYPOINTS
@@ -210,11 +235,32 @@ def extract_features(
     Raises:
         FileNotFoundError: When the database or the image root is missing.
         RuntimeError: When `options.device` is `cuda` and CUDA is unusable.
+        ImportError: When `options.backend` is `tensorrt` and TensorRT or
+            `cuda-python` is not importable.
     """
     if not database_path.is_file():
         raise FileNotFoundError(f"No COLMAP database at {database_path}")
     if not image_root.is_dir():
         raise FileNotFoundError(f"No image directory at {image_root}")
+
+    if options.backend == "tensorrt":
+        # Imported here, not at module scope: TensorRT and `cuda-python` are only
+        # needed by this branch, and a machine without a usable engine must still
+        # be able to run the default backend.
+        from colsfm.features_trt import extract_tensorrt
+
+        extracted: TensorRTExtraction = extract_tensorrt(
+            database_path,
+            image_root,
+            image_names,
+            min_score=options.min_score,
+            max_num_features=options.max_num_features,
+        )
+        tensorrt_report: ExtractionReport = ExtractionReport(
+            keypoint_counts=extracted[0], device="cuda", elapsed_seconds=extracted[1]
+        )
+        print(f"colsfm.features[tensorrt]: {tensorrt_report.summary()}")
+        return tensorrt_report
 
     device: ResolvedDevice = resolve_device(options.device)
     extraction_options: pycolmap.FeatureExtractionOptions = _extraction_options(options, device)

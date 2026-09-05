@@ -21,17 +21,26 @@ import pytest
 from serde.json import from_json
 
 from colsfm.benchmark import rig_rigidity_spread_millimeters
+from colsfm.config import CusfmConfig, read_config_directory
 from colsfm.export import KEYFRAME_METADATA_SUBPATH, RUNTIME_CSV_NAME, RuntimeRecord, read_runtime_records
 from colsfm.frames_meta import FRAMES_META_NAME, FramesMeta, read_frames_meta
 from colsfm.geometry import MILLIMETRES_PER_METRE
+from colsfm.matching import MatchingOptions
 from colsfm.pipeline import (
     ALL_STAGE_NAMES,
+    DEFAULT_CONFIG_DIR,
+    LOOP_EDGES_NAME,
     STAGE_NAMES,
     SUMMARY_NAME,
     ExtrinsicChange,
+    LoopClosureStageResult,
+    LoopEdgeRecord,
     PipelineOptions,
     PipelineSummary,
+    PoseGraphStageResult,
+    run_loop_closure_stage,
     run_pipeline,
+    run_pose_graph_stage,
     stage_names,
 )
 
@@ -85,6 +94,7 @@ def test_the_run_writes_every_artifact_a_cusfm_run_leaves_behind(galileo_run: Pi
         output_dir / "database.db",
         output_dir / "pose_graph" / FRAMES_META_NAME,
         output_dir / "pose_graph" / "vehicle_pose.tum",
+        output_dir / "pose_graph" / LOOP_EDGES_NAME,
         output_dir / "sparse" / "cameras.txt",
         output_dir / "sparse" / "images.txt",
         output_dir / "sparse" / "points3D.txt",
@@ -239,3 +249,60 @@ def test_a_run_without_the_flag_records_nothing_about_extrinsics(galileo_run: Pi
     assert galileo_run.options.optimize_extrinsics is False
     assert galileo_run.extrinsic_changes == ()
     assert stage_names(optimize_extrinsics=False) == STAGE_NAMES
+
+
+# ── What a viewer reads back: the loop edges, the diagnostics, the solver summary ─────
+
+
+def test_the_pose_graph_stage_always_writes_a_loop_edge_file(galileo_run: PipelineSummary) -> None:
+    """`pose_graph/loop_edges.json` exists on every run, holding `[]` when loops are off.
+
+    An absent file cannot say "the stage ran and found nothing", which is the
+    normal outcome and the one a viewer has to draw differently from "not yet".
+    """
+    written: str = (galileo_run.options.output_dir / "pose_graph" / LOOP_EDGES_NAME).read_text()
+    records: list[LoopEdgeRecord] = from_json(list[LoopEdgeRecord], written)
+    assert records == []
+    assert galileo_run.num_loop_edges == len(records)
+
+
+def test_the_disabled_loop_closure_stage_reports_no_diagnostics(
+    galileo_input: FramesMeta, tmp_path: Path
+) -> None:
+    """With the stage off there is nothing to explain, so `diagnostics` is None.
+
+    The field exists so a caller can tell "searched and rejected everything" from
+    "never searched"; None is how the second says so.
+    """
+    result: LoopClosureStageResult = run_loop_closure_stage(
+        galileo_input,
+        tmp_path / "absent.db",
+        read_config_directory(DEFAULT_CONFIG_DIR).pose_graph,
+        MatchingOptions(),
+        enabled=False,
+    )
+    assert result.diagnostics is None
+    assert result.edges == []
+
+
+def test_the_pose_graph_stage_carries_its_solver_summary(
+    galileo_input: FramesMeta, three_samples: FramesMeta, galileo_input_dir: Path, tmp_path: Path
+) -> None:
+    """`PoseGraphStageResult.solve` holds the Ceres summary, and is None with no edges.
+
+    Three rig frames give sequential edges and therefore a solve; one rig frame
+    gives none, and then the input poses stand untouched.
+    """
+    config: CusfmConfig = read_config_directory(DEFAULT_CONFIG_DIR)
+    options: PipelineOptions = PipelineOptions(input_dir=galileo_input_dir, output_dir=tmp_path / "many")
+    solved: PoseGraphStageResult = run_pose_graph_stage(options, three_samples, config, [])
+    assert solved.solve is not None
+    assert solved.solve.iterations >= 0
+    assert set(solved.solve.world_T_rig) == {node.rig_id for node in solved.nodes}
+
+    one_frame: FramesMeta = galileo_input.filtered(list(galileo_input.rig_frames()[0].keyframe_ids))
+    single: PoseGraphStageResult = run_pose_graph_stage(
+        PipelineOptions(input_dir=galileo_input_dir, output_dir=tmp_path / "one"), one_frame, config, []
+    )
+    assert single.edges == []
+    assert single.solve is None

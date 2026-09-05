@@ -14,13 +14,18 @@ from colsfm.database import ImagePair, KeypointsXY, MatchIndices, create_databas
 from colsfm.features import FeatureOptions, extract_features
 from colsfm.frames_meta import FramesMeta, read_frames_meta
 from colsfm.matching import (
+    BLOB_MATCH_TOP_K,
     BLOB_MAX_PIXEL_ERROR,
     BLOB_MIN_NUM_INLIERS,
+    BLOB_NUM_POINTS_TOLERANCE_FRACTION,
     BLOB_RANSAC_CONFIDENCE,
     MatchingOptions,
     MatchReport,
+    MatchScores,
     PairMatchStats,
     match_pairs,
+    resolve_match_cap,
+    select_by_square_covering,
     subsample_matches_by_coverage,
     verification_options,
 )
@@ -335,3 +340,149 @@ def test_matching_caps_the_verified_matches_written_to_the_database(
     assert sum(stats.inlier_matches for stats in capped.pair_stats.values()) < sum(
         stats.inlier_matches for stats in uncapped.pair_stats.values()
     )
+
+
+# ── SSC spatial NMS: the blob's real one, reachable only with per-match scores ────────
+
+
+SSC_IMAGE_WIDTH: int = 1920
+"""Galileo's frame width, the size `BLOB_MATCH_TOP_K` was calibrated at."""
+
+SSC_IMAGE_HEIGHT: int = 1200
+"""Galileo's frame height."""
+
+
+def _scattered_points(count: int, seed: int, width: int = SSC_IMAGE_WIDTH, height: int = SSC_IMAGE_HEIGHT) -> tuple[KeypointsXY, MatchScores]:
+    """Uniformly scattered points with distinct scores.
+
+    Args:
+        count: How many points.
+        seed: Generator seed, so every test is reproducible.
+        width: Image width in pixels.
+        height: Image height in pixels.
+
+    Returns:
+        Float32 `[count, 2]` xy pixel coordinates and Float32 `[count]` scores.
+    """
+    generator: np.random.Generator = np.random.default_rng(seed)
+    positions_xy: KeypointsXY = (generator.random((count, 2)) * np.array([width, height])).astype(np.float32)
+    scores: MatchScores = generator.random(count).astype(np.float32)
+    return positions_xy, scores
+
+
+def test_square_covering_keeps_everything_at_or_below_the_target() -> None:
+    """The blob's `matches.size() < match_top_k` early return: a sparse pair is untouched."""
+    positions_xy, scores = _scattered_points(count=120, seed=0)
+    kept = select_by_square_covering(positions_xy, scores, SSC_IMAGE_WIDTH, SSC_IMAGE_HEIGHT, BLOB_MATCH_TOP_K)
+    assert np.array_equal(kept, np.arange(120))
+
+
+def test_square_covering_lands_inside_the_tolerance_band() -> None:
+    """SSC targets a band, not a ceiling: `match_top_k` plus or minus 30 %.
+
+    That is the one behavioural difference from `subsample_matches_by_coverage`,
+    which is a hard maximum. Checked at the three densities the real data spans:
+    Galileo's ~931 raw matches per pair, KITTI's ~1466, and a saturated 4000.
+    """
+    lowest: int = round(BLOB_MATCH_TOP_K * (1.0 - BLOB_NUM_POINTS_TOLERANCE_FRACTION))
+    highest: int = round(BLOB_MATCH_TOP_K * (1.0 + BLOB_NUM_POINTS_TOLERANCE_FRACTION))
+    for count in (931, 1466, 4000):
+        positions_xy, scores = _scattered_points(count=count, seed=count)
+        kept = select_by_square_covering(positions_xy, scores, SSC_IMAGE_WIDTH, SSC_IMAGE_HEIGHT, BLOB_MATCH_TOP_K)
+        assert lowest <= len(kept) <= highest, f"{count} points thinned to {len(kept)}"
+        assert len(kept) < count
+
+
+def test_square_covering_returns_ascending_unique_indices() -> None:
+    """The result indexes the input once each, in order, so a caller can slice with it."""
+    positions_xy, scores = _scattered_points(count=2000, seed=7)
+    kept = select_by_square_covering(positions_xy, scores, SSC_IMAGE_WIDTH, SSC_IMAGE_HEIGHT, BLOB_MATCH_TOP_K)
+    assert kept.dtype == np.int64
+    assert np.all(np.diff(kept) > 0)
+    assert kept.min() >= 0
+    assert kept.max() < 2000
+
+
+def test_square_covering_is_deterministic() -> None:
+    """Same points, same scores, same answer: nothing here reads a clock or a seed."""
+    positions_xy, scores = _scattered_points(count=3000, seed=11)
+    first = select_by_square_covering(positions_xy, scores, SSC_IMAGE_WIDTH, SSC_IMAGE_HEIGHT, BLOB_MATCH_TOP_K)
+    second = select_by_square_covering(positions_xy, scores, SSC_IMAGE_WIDTH, SSC_IMAGE_HEIGHT, BLOB_MATCH_TOP_K)
+    assert np.array_equal(first, second)
+
+
+def test_square_covering_spreads_the_survivors_over_the_image() -> None:
+    """Every quadrant keeps roughly its share, which is the whole point of SSC.
+
+    A filter that kept the 500 highest scores would pass the band test and fail
+    this one whenever the scores correlate with position — and on real imagery
+    they do, because LightGlue is confident where the texture is.
+    """
+    positions_xy, _ = _scattered_points(count=4000, seed=3)
+    # Scores that fall off towards the right edge, so "strongest first" alone would
+    # empty the right half.
+    scores: MatchScores = (1.0 - positions_xy[:, 0] / SSC_IMAGE_WIDTH).astype(np.float32)
+    kept = select_by_square_covering(positions_xy, scores, SSC_IMAGE_WIDTH, SSC_IMAGE_HEIGHT, BLOB_MATCH_TOP_K)
+    kept_xy: KeypointsXY = positions_xy[kept]
+    quadrant_counts: list[int] = [
+        int(((kept_xy[:, 0] >= half_width * SSC_IMAGE_WIDTH / 2) & (kept_xy[:, 0] < (half_width + 1) * SSC_IMAGE_WIDTH / 2)
+             & (kept_xy[:, 1] >= half_height * SSC_IMAGE_HEIGHT / 2) & (kept_xy[:, 1] < (half_height + 1) * SSC_IMAGE_HEIGHT / 2)).sum())
+        for half_width in (0, 1)
+        for half_height in (0, 1)
+    ]
+    assert min(quadrant_counts) >= len(kept) // 8, f"quadrants {quadrant_counts} of {len(kept)}"
+
+
+def test_square_covering_survives_a_target_of_one() -> None:
+    """A one-match target keeps exactly the strongest point, not a division by zero.
+
+    `image_area` mode can resolve to 1 on a tiny frame, and SSC's upper search
+    bound divides by `2 * target - 2`.
+    """
+    positions_xy, scores = _scattered_points(count=50, seed=5)
+    kept = select_by_square_covering(positions_xy, scores, SSC_IMAGE_WIDTH, SSC_IMAGE_HEIGHT, target=1)
+    assert kept.tolist() == [int(np.argmax(scores))]
+
+
+def test_square_covering_prefers_the_stronger_of_two_neighbours() -> None:
+    """Inside one suppression square the higher score wins, and only it survives.
+
+    Four points, two of them 5 px apart in the top-left corner: at a target of 3
+    over a 400x400 image the suppression square is far wider than 5 px, so the
+    pair collapses to whichever carries the higher score.
+    """
+    positions_xy: KeypointsXY = np.array([[10.0, 10.0], [15.0, 12.0], [390.0, 10.0], [10.0, 390.0]], dtype=np.float32)
+    weaker_first: MatchScores = np.array([0.1, 0.9, 0.5, 0.5], dtype=np.float32)
+    kept = select_by_square_covering(positions_xy, weaker_first, 400, 400, target=3)
+    assert 0 not in kept.tolist()
+    assert 1 in kept.tolist()
+    stronger_first: MatchScores = np.array([0.9, 0.1, 0.5, 0.5], dtype=np.float32)
+    kept = select_by_square_covering(positions_xy, stronger_first, 400, 400, target=3)
+    assert 0 in kept.tolist()
+    assert 1 not in kept.tolist()
+
+
+# ── The cap modes ────────────────────────────────────────────────────────────────────
+
+
+def test_the_fixed_cap_mode_ignores_the_image_size() -> None:
+    """`fixed` is the historical behaviour: 500 everywhere."""
+    options: MatchingOptions = MatchingOptions(match_cap_mode="fixed")
+    assert resolve_match_cap(options, 1920, 1200) == BLOB_MATCH_TOP_K
+    assert resolve_match_cap(options, 1241, 376) == BLOB_MATCH_TOP_K
+
+
+def test_the_off_cap_mode_caps_nothing() -> None:
+    """`off` and a None budget both mean "keep every verified inlier"."""
+    assert resolve_match_cap(MatchingOptions(match_cap_mode="off"), 1920, 1200) is None
+    assert resolve_match_cap(MatchingOptions(max_matches_per_pair=None), 1920, 1200) is None
+
+
+def test_the_image_area_cap_mode_scales_with_resolution() -> None:
+    """`image_area` keeps the calibration's density: 500 at 1920x1200, 101 on KITTI."""
+    options: MatchingOptions = MatchingOptions(match_cap_mode="image_area")
+    assert resolve_match_cap(options, 1920, 1200) == BLOB_MATCH_TOP_K
+    assert resolve_match_cap(options, 1241, 376) == 101
+    assert resolve_match_cap(options, 3840, 2400) == 4 * BLOB_MATCH_TOP_K
+    # A degenerate size still resolves to a usable positive cap rather than 0.
+    assert resolve_match_cap(options, 1, 1) == 1

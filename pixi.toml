@@ -157,6 +157,12 @@ pyserde = ">=0.31.2,<0.32"
 einops = "*"
 cuda-version = "13.0.*"
 cuda-cudart = "*"
+# `cuda.bindings.runtime`, the CUDA runtime binding the TensorRT backends
+# (`colsfm.features_trt`, `colsfm.matching_trt`) allocate their device buffers
+# and streams with.  TensorRT's own Python API takes raw device pointers and
+# ships no allocator, so there is no way to drive an engine without it; the
+# `raco` feature already carries the same package for `tools/raco_extract.py`.
+cuda-python = "13.0.*"
 # TensorRT engines resolve cuBLAS at load time.
 libcublas = "*"
 # ONNX Runtime's CUDA provider (pycolmap's native ALIKED + LightGlue) needs cuDNN;

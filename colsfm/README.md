@@ -20,9 +20,12 @@ results.
 | `cameras.py` | cuSFM camera parameters to `pycolmap.Camera`. |
 | `keyframe_selection.py` | cuSFM's keyframe selection, as `feature_extractor_main` performs it. |
 | `database.py` | The COLMAP database that carries cuSFM's cameras, rig, frames and images into pycolmap, keeping cuSFM's own identifiers. |
-| `features.py` | ALIKED feature extraction over `pycolmap.extract_features`. The replacement for `feature_extractor_main`'s per-image half. |
+| `features.py` | ALIKED feature extraction over `pycolmap.extract_features`, and the backend switch. The replacement for `feature_extractor_main`'s per-image half. |
+| `tensorrt_runtime.py` | The TensorRT plumbing both `_trt` backends share: the blob's engine-name cache, the FP16 builder, and one generic execution session with growing device buffers. |
+| `features_trt.py` | The same stage through the blob's own `aliked.onnx` and its FP16 engine, with the blob's preprocessing and pixel mapping. `--features-backend tensorrt`. |
 | `pairs.py` | Which image pairs get matched. The replacement for `feature_matcher_task_builder_main`. |
-| `matching.py` | LightGlue matching plus COLMAP's geometric verification, then the spatial subsample. The replacement for `feature_matcher_main`. |
+| `matching.py` | LightGlue matching plus COLMAP's geometric verification, then the spatial subsample. The replacement for `feature_matcher_main`. Also owns the blob's real SSC (`select_by_square_covering`) and the cap modes (`resolve_match_cap`). |
+| `matching_trt.py` | The same stage through the blob's own `lightglue_aliked.onnx` and its FP16 engine. The only path with the per-match score, so it runs the real SSC before verification instead of the score-free grid subsample. `--matching-backend tensorrt`. |
 | `retrieval.py` | Image retrieval for loop closure, brute force or vocabulary tree. The replacement for `generate_bow_vocabulary_main` and `generate_bow_index_main`. |
 | `loop_closure.py` | Loop-closure candidate selection, gating and rig-edge assembly. The replacement for `generate_association_main`'s `RetrievalLoopAssociations`. |
 | `loop_pose.py` | The metric rig-to-rig relative pose a loop edge carries: a local triangulated map in the source rig frame, then generalized resection of the target rig. The replacement for `StereoPoseEstimator`. |
@@ -47,9 +50,9 @@ row per stage under these names:
 | # | Stage | Module | Blob stage it replaces |
 |---|---|---|---|
 | 1 | `keyframe_selection` | `keyframe_selection`, `frames_meta` | `feature_extractor_main` (selection half) |
-| 2 | `feature_extraction` | `database`, `cameras`, `features` | `feature_extractor_main` (per-image half) |
+| 2 | `feature_extraction` | `database`, `cameras`, `features`, `features_trt` | `feature_extractor_main` (per-image half) |
 | 3 | `pair_selection` | `pairs` | `feature_matcher_task_builder_main` |
-| 4 | `matching` | `matching` | `feature_matcher_main` |
+| 4 | `matching` | `matching`, `matching_trt` | `feature_matcher_main` |
 | 5 | `loop_closure` | `retrieval`, `loop_closure`, `loop_pose` | `generate_bow_*_main` + `generate_association_main` |
 | 6 | `pose_graph` | `pose_graph` | `pose_graph_main` |
 | 7 | `reconstruction` | `reconstruction`, `mapping` | `keypoints_mapper_main` |
@@ -59,6 +62,34 @@ row per stage under these names:
 Each stage is a `run_<stage>_stage` function returning a small result dataclass, and
 `run_pipeline` only composes them and times each one, so a caller that wants to step through
 a dataset stage by stage runs the same code the full pipeline runs.
+
+## The two ONNX stages have two backends each
+
+Stages 2 and 4 both run a neural network, and each can run it two ways. The default,
+`--features-backend pycolmap --matching-backend pycolmap`, hands the work to COLMAP 4.2's
+own ALIKED and LightGlue, which COLMAP downloads into `~/.cache/colmap/` and runs through
+ONNX Runtime. The alternative, `tensorrt`, runs **the blob's graphs through the blob's
+engines** (`pycusfm/models/aliked_lightglue/`), reusing the `.engine` files already in the
+repo when the TensorRT version and the GPU architecture match.
+
+They are chosen independently, and all four combinations work: both write float32 xy
+keypoints and 128-column float descriptors into the same database rows, and both leave the
+matches and two-view geometries COLMAP's verifier produced. Measured on Galileo's 226
+frames (RTX 5090); the blob column is the binary this replaces:
+
+| | blob | `pycolmap` | `tensorrt` |
+|---|---:|---:|---:|
+| feature extraction (s) | 8.64 | 7.19 | 7.01 |
+| matching (s) | 2.25 | 8.28 | **2.91** |
+| median verified matches per pair | 430 | 161 | 433 |
+| mean reprojection error (px) | 1.550 | 1.332 | 1.414 |
+| ATE vs ground truth (mm) | 5.00 | 4.35 | 5.19 |
+| rig poses vs the blob (mm RMSE / deg RMSE) | — | 0.99 / 1.669 | **0.38 / 0.040** |
+
+So `tensorrt` is the faster matcher by 2.8x and the closer reproduction of the blob, and
+`pycolmap` is the more accurate one on this dataset and the one that needs no TensorRT.
+The default stays `pycolmap` because it needs neither the `tensorrt` and `cuda-python`
+packages nor an engine built for the local GPU.
 
 Three ordering notes matter when reading the code. Pair selection cannot see loop pairs:
 stage 3 emits only the consecutive and stereo pairs it can derive from the metadata, and loop

@@ -41,6 +41,7 @@ from colsfm.mapping import (
     Correspondences,
     MappingOptions,
     MappingResult,
+    RoundStats,
     filter_degenerate_points,
     filter_projection_failures,
     load_correspondences,
@@ -1240,11 +1241,35 @@ WEAKLY_CONSTRAINED_MOVE_M: float = 0.03
 EXTRINSIC_PERTURBATION_M: float = 0.02
 """20 mm of translation error the refinement has to remove."""
 
-EXTRINSIC_RECOVERY_M: float = 1e-3
-"""How close to the unperturbed refinement the perturbed one must land: 1 mm."""
+EXTRINSIC_RECOVERY_M: float = 2e-3
+"""How close to the unperturbed refinement the perturbed one must land: 2 mm.
+
+Not 1 mm, which is what this was and which made the test flaky. Neither side of
+this comparison is a fixed point: both runs are the same unregularised
+block-coordinate descent over the same matches, but they start 20 mm apart and
+stop on their own tolerances, so the gap between them is a property of the
+descent, not of the optimum. Measured 0.660 mm on the committed Galileo database
+and 1.453 mm on a regenerated one — a factor of 2.2 between two artifacts of the
+same run, so the bound has to sit above both."""
 
 EXTRINSIC_RECOVERY_DEG: float = 0.05
-"""How close to the unperturbed refinement the perturbed one must land: 0.05 deg."""
+"""How close to the unperturbed refinement the perturbed one must land: 0.05 deg.
+
+Measured 0.0019 deg, i.e. 26x inside the bound; rotation is far better
+conditioned here than translation."""
+
+EXTRINSIC_RESIDUAL_FRACTION: float = 0.5
+"""Fraction of the perturbation that may survive against the *calibration*.
+
+This bound is a fraction rather than a millimetre figure on purpose. The
+refinement is unregularised — colsfm has no equivalent of cuSFM's absolute and
+relative extrinsic priors (NOTES.md deviation 9) — so its optimum does not sit on
+the factory calibration and there is no reason for it to: on the committed
+Galileo database the *unperturbed* refinement already lands 7.07 mm and 0.30 deg
+away from it, while cutting the mean reprojection error from 1.027 px to 0.860 px.
+So "came back to the calibration" is not the claim this test can make; "removed
+most of a 20 mm perturbation" is, and 7.07 mm of 20 mm is inside this bound with
+room to spare."""
 
 
 def _stereo_partner(frames_meta: FramesMeta, camera_params_id: int) -> int:
@@ -1368,12 +1393,23 @@ def test_refinement_removes_a_20_mm_extrinsic_perturbation(
 ) -> None:
     """Camera 1, knocked 20 mm and 0.5 deg off, lands where the clean refinement lands.
 
-    The unperturbed refinement is the reference rather than the input
-    calibration, because the refinement is **unregularised**: colsfm has no
-    equivalent of cuSFM's absolute and relative extrinsic priors (§7), so its
-    optimum sits a millimetre or two off the factory calibration even with
-    nothing perturbed. Landing on that optimum from 20 mm away is what proves the
-    perturbation was removed rather than merely reduced.
+    The substantive claim is that the perturbation is *removed*, not merely
+    reduced, and the evidence for that is the unperturbed refinement over the
+    same matches: two descents starting 20 mm apart stop within
+    `EXTRINSIC_RECOVERY_M` of each other. The calibration cannot serve as that
+    reference, because this refinement is **unregularised** — colsfm has no
+    equivalent of cuSFM's absolute and relative extrinsic priors (§7) — so its
+    optimum is several millimetres off the factory numbers with nothing perturbed
+    at all (7.07 mm on the committed Galileo database, at a *lower* reprojection
+    error). Against the calibration the test therefore asserts only the weak,
+    artifact-stable claim: at most `EXTRINSIC_RESIDUAL_FRACTION` of the
+    perturbation survives.
+
+    This test was flaky at a 1 mm refinement-against-refinement bound: it
+    measured 0.660 mm on the committed database and 1.453 mm on a regenerated
+    one. Neither number is an error — the descent stops on a tolerance, not on a
+    fixed point — so the bound is 2 mm rather than a seed or a tightened
+    tolerance, which would only hide the same variation.
 
     The fixed-extrinsics run over the same matches is the control: it keeps all
     20 mm, which is the regression this whole change exists for.
@@ -1404,7 +1440,7 @@ def test_refinement_removes_a_20_mm_extrinsic_perturbation(
     )
     assert translation_m < EXTRINSIC_RECOVERY_M
     assert rotation_deg < EXTRINSIC_RECOVERY_DEG
-    assert residual_m < EXTRINSIC_PERTURBATION_M / 2.0
+    assert residual_m < EXTRINSIC_RESIDUAL_FRACTION * EXTRINSIC_PERTURBATION_M
     assert extrinsic_runs.refined.mean_reprojection_error_px <= extrinsic_runs.fixed.mean_reprojection_error_px
 
 
@@ -1478,3 +1514,29 @@ def test_refining_extrinsics_on_a_vehicle_referenced_rig_is_refused(
             mapping_config,
             _quiet_options(optimize_extrinsics=True),
         )
+
+
+def test_the_round_callback_sees_every_round_as_it_finishes(
+    synthetic_rig: SyntheticRig, synthetic_database: Path, isaac_config: CusfmConfig
+) -> None:
+    """`MappingOptions.round_callback` fires once per round, with that round's model.
+
+    The hook a live viewer needs. It runs after the round's filter and solve and
+    before the early-exit check, so the number of calls equals the number of
+    `RoundStats` the mapper returns, and the reconstruction it is handed already
+    holds `RoundStats.num_points3D` points.
+    """
+    seen: list[tuple[int, int, int]] = []
+
+    def record(stats: RoundStats, reconstruction: pycolmap.Reconstruction) -> None:
+        """Record the round index, its reported point count and the live one."""
+        seen.append((stats.round_index, stats.num_points3D, reconstruction.num_points3D()))
+
+    model: PosedModel = build_reconstruction(synthetic_rig.frames_meta)
+    result: MappingResult = run_mapping(
+        model, synthetic_database, isaac_config.vision_mapping, _quiet_options(round_callback=record)
+    )
+    assert len(seen) == len(result.rounds)
+    assert [entry[0] for entry in seen] == [stats.round_index for stats in result.rounds]
+    assert all(reported == live for _index, reported, live in seen)
+    assert seen[-1][1] == result.reconstruction.num_points3D()

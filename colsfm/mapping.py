@@ -118,10 +118,10 @@ from __future__ import annotations
 
 import re
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import Final, TypeAlias
 
 import numpy as np
 import pycolmap
@@ -167,50 +167,6 @@ BRIEF_REPORT_PATTERN: Final[re.Pattern[str]] = re.compile(
 
 
 @dataclass(frozen=True, slots=True)
-class MappingOptions:
-    """Knobs the mapper takes from the command line rather than from a config file."""
-
-    optimize_extrinsics: bool = False
-    """Refine `sensor_from_rig`; cuSFM's `--optimize_extrinsics`, off by default."""
-    fixed_camera_params_id: int | None = None
-    """Camera whose extrinsic stays fixed while the others are refined; cuSFM's `--fixed_camera_name`."""
-    num_threads: int | None = None
-    """Ceres threads; the config's `num_threads` when None. Use 1 for a reproducible solve.
-    Triangulation is single-threaded in COLMAP either way, so it does not carry cuSFM's
-    threaded-triangulation non-determinism (§5.3)."""
-    use_gpu: bool = False
-    """Hand the Ceres solve to the GPU; COLMAP still needs 50+ images before it switches
-    (`min_num_images_gpu_solver`, pycolmap-capabilities.md §11). Off by default because the
-    measured gain does not exist: 1.68 s against 1.60 s on Galileo's 226 images, and 19.2 s
-    against 20.9 s on 800 RoboCap images — 5 % the wrong way, then 8 % the right way. The
-    blob's own mapper is Ceres on the CPU, so that is where the default stays. Which GPU
-    is left to Ceres, i.e. pycolmap's `gpu_index` default of `-1`."""
-    verbose: bool = True
-    """Print one line per triangulation pass and per outer round, as cuSFM does."""
-
-
-@dataclass(slots=True)
-class Correspondences:
-    """The correspondence graph a triangulator needs, kept alive alongside its owner.
-
-    `IncrementalTriangulator` holds raw references to the graph and the
-    reconstruction, so the `DatabaseCache` that owns the graph has to outlive
-    both. Keeping all three in one object is what guarantees that.
-    """
-
-    database_cache: pycolmap.DatabaseCache
-    """Owns the correspondence graph; must outlive every triangulator built on it."""
-    graph: pycolmap.CorrespondenceGraph
-    """Keypoint correspondences from the database's verified two-view geometries."""
-    observation_manager: pycolmap.ObservationManager
-    """Bookkeeping for observations and the filters, bound to the reconstruction."""
-    num_images: int
-    """Images the database contributed correspondences for."""
-    num_image_pairs: int
-    """Verified image pairs that survived `min_num_matches`."""
-
-
-@dataclass(frozen=True, slots=True)
 class RoundStats:
     """One outer triangulate / filter / bundle-adjust round (§5.4)."""
 
@@ -245,6 +201,63 @@ class RoundStats:
     """`CONVERGENCE`, `NO_CONVERGENCE` or `FAILURE`."""
     seconds: float
     """Wall-clock seconds the round took, bundle adjustment included."""
+
+
+RoundCallback: TypeAlias = Callable[[RoundStats, pycolmap.Reconstruction], None]
+"""What `MappingOptions.round_callback` takes: one round's statistics and the live model."""
+
+
+@dataclass(frozen=True, slots=True)
+class MappingOptions:
+    """Knobs the mapper takes from the command line rather than from a config file."""
+
+    optimize_extrinsics: bool = False
+    """Refine `sensor_from_rig`; cuSFM's `--optimize_extrinsics`, off by default."""
+    fixed_camera_params_id: int | None = None
+    """Camera whose extrinsic stays fixed while the others are refined; cuSFM's `--fixed_camera_name`."""
+    num_threads: int | None = None
+    """Ceres threads; the config's `num_threads` when None. Use 1 for a reproducible solve.
+    Triangulation is single-threaded in COLMAP either way, so it does not carry cuSFM's
+    threaded-triangulation non-determinism (§5.3)."""
+    use_gpu: bool = False
+    """Hand the Ceres solve to the GPU; COLMAP still needs 50+ images before it switches
+    (`min_num_images_gpu_solver`, pycolmap-capabilities.md §11). Off by default because the
+    measured gain does not exist: 1.68 s against 1.60 s on Galileo's 226 images, and 19.2 s
+    against 20.9 s on 800 RoboCap images — 5 % the wrong way, then 8 % the right way. The
+    blob's own mapper is Ceres on the CPU, so that is where the default stays. Which GPU
+    is left to Ceres, i.e. pycolmap's `gpu_index` default of `-1`."""
+    verbose: bool = True
+    """Print one line per triangulation pass and per outer round, as cuSFM does."""
+    round_callback: RoundCallback | None = None
+    """Called once at the end of every outer round, after the round's filter and solve.
+
+    The hook a live viewer needs: it receives the round's `RoundStats` and the
+    `pycolmap.Reconstruction` in exactly the state that round left it, so a caller
+    can log the cloud and the poses per round without re-running the mapper or
+    scraping `verbose` output. It runs *before* the early-exit check, so the last
+    round is always reported. Nothing in the mapper reads what it returns, and a
+    callback that raises aborts the mapping — it is a plain call, not a try/except."""
+
+
+@dataclass(slots=True)
+class Correspondences:
+    """The correspondence graph a triangulator needs, kept alive alongside its owner.
+
+    `IncrementalTriangulator` holds raw references to the graph and the
+    reconstruction, so the `DatabaseCache` that owns the graph has to outlive
+    both. Keeping all three in one object is what guarantees that.
+    """
+
+    database_cache: pycolmap.DatabaseCache
+    """Owns the correspondence graph; must outlive every triangulator built on it."""
+    graph: pycolmap.CorrespondenceGraph
+    """Keypoint correspondences from the database's verified two-view geometries."""
+    observation_manager: pycolmap.ObservationManager
+    """Bookkeeping for observations and the filters, bound to the reconstruction."""
+    num_images: int
+    """Images the database contributed correspondences for."""
+    num_image_pairs: int
+    """Verified image pairs that survived `min_num_matches`."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -947,8 +960,10 @@ def run_mapping(
                 seconds=time.perf_counter() - round_started,
             )
         )
+        latest: RoundStats = rounds[-1]
+        if resolved_options.round_callback is not None:
+            resolved_options.round_callback(latest, reconstruction)
         if resolved_options.verbose:
-            latest: RoundStats = rounds[-1]
             print(
                 f"[colsfm] round {round_index} gate {max_pixel_error:.1f} px: merged {num_merged}, "
                 f"completed {num_completed}, filtered {filtered.total()}, diverged {num_diverged}, "

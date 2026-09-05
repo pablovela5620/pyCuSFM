@@ -544,9 +544,12 @@ shipped configs, and A/B re-runs of the real binaries. `colsfm/` implements the 
 | 7 | **A 500-match spatial cap in place of the blob's SSC NMS** | The blob thins each pair to a spatially uniform top 500 using the LightGlue score as the keypoint response. pycolmap exposes no per-match score: `Database.read_matches` and `FeatureMatcher.match` both return bare `uint32[m, 2]` index pairs. `subsample_matches_by_coverage` lays a grid of about `match_top_k` cells over image 0 and keeps one match per occupied cell, after verification, so every survivor is an inlier of the same RANSAC. Measured over the 331 Galileo pairs: uncapped 1300 matches per pair, 1.80 px, 5.39 mm ATE; capped 156 matches per pair, 1.33 px, 4.32 mm; the blob 430 matches, 1.55 px, 5.00 mm. The cap also takes bundle adjustment from 27.7 s to 2.8 s. |
 | 8 | **Relative acceptance bounds, not absolute ones** | The first bounds were absolute: registered >= 220, ATE <= 5 mm, reprojection <= 1.7 px. The ATE and reprojection figures came from the older NOTES table above (3.9 mm, 1.54 px), measured by the demo. When `colsfm.benchmark` measures the blob itself it gets **5.00 mm** and **1.550 px**. So the absolute 5 mm bound told the port to beat the binary it reproduces, and would have failed a bit-perfect clone. Absolute figures also break on a new machine or a re-run of A. Every bound is now a ratio against run A as this harness measures it. |
 | 9 | **Vocabulary-tree retrieval above 500 images** | `RetrievalConfig.backend` is `auto`: brute-force mutual-nearest-neighbour voting at or below 500 images, a hierarchical k-means vocabulary with TF-IDF and the DBoW2 L1 score above it. Brute force is quadratic in images times descriptors (gotcha 12). The vocab backend builds in 42 s on RoboCap and answers all 4528 queries in 1.5 s, and it recovers every one of the blob's 90 loop pairs. |
-| 10 | **Loop closure off by default** | On Galileo, turning loops on moves camera positions by 5 to 13 mm against a 5 mm ATE budget: a short, low-drift sweep has nothing for a loop to fix. On RoboCap the retrieval is right and `colsfm.loop_pose`'s metric rig-to-rig measurement takes the pose graph from 609.0 mm to **408.1 mm** against the blob's PGO, past the 460.8 mm of the input trajectory alone — but not past the 135.0 mm the blob's own edges reach, and the remaining gap is a 6.5 deg rotation disagreement two independent image-based estimators put on the blob's side (see the deviations below). `LoopClosureConfig.enabled` stays False and the caller decides per dataset. |
+| 10 | **Loop closure off by default** | (Revised by decision 15 for long sequences.) On Galileo, turning loops on moves camera positions by 5 to 13 mm against a 5 mm ATE budget: a short, low-drift sweep has nothing for a loop to fix. On RoboCap the retrieval is right and `colsfm.loop_pose`'s metric rig-to-rig measurement takes the pose graph from 609.0 mm to **408.1 mm** against the blob's PGO, past the 460.8 mm of the input trajectory alone — but not past the 135.0 mm the blob's own edges reach, and the remaining gap is a 6.5 deg rotation disagreement two independent image-based estimators put on the blob's side (see the deviations below). `LoopClosureConfig.enabled` stays False and the caller decides per dataset. |
 | 11 | **Its own pixi environment and solve group** | `colsfm` is `no-default-feature`, so the fragile CUDA 13 plus TensorRT solve of the default environment is untouched. Verified: the `default`, `raco` and `bench` blocks of `pixi.lock` are byte-identical to `HEAD`, and no package was removed. |
 | 12 | **Extrinsic refinement as block-coordinate descent, not one Ceres problem** | cuSFM's `--optimize_extrinsics` pass minimises reprojection plus an absolute extrinsic prior (8 blocks) and an inter-camera relative extrinsic prior (777 blocks) in a single Ceres problem. pycolmap's `BundleAdjuster` has no prior term and its problem cannot be extended from standalone pyceres (decision 4), while 30 000 Python reprojection residual blocks in pyceres would be minutes per iteration. `colsfm.extrinsic_refinement` therefore alternates: **(A)** extrinsics only in pyceres with poses and points frozen, one *vectorised* block per camera holding all `2 * n_obs` of its residuals with the robust loss applied inside `Evaluate`, plus both priors; **(B)** pycolmap's own bundle adjustment with `sensor_from_rig` fixed. Ceres' `Corrector` reduces to plain scaling whenever `rho'' <= 0`, so the in-block Cauchy is exact rather than approximate; the residual is returned in square-root form `sqrt(rho(s)/s) * r`, which reports Ceres' cost and Ceres' gradient exactly. The price is linear convergence: 19 rounds on Galileo where one joint solve would take a handful of iterations (deviation 9) — 3.2 s, once the per-round observation gather stopped rebuilding its index (it was 9.9 s). |
+| 13 | **A second backend for both ONNX stages, not a replacement** | `--features-backend tensorrt` and `--matching-backend tensorrt` run the blob's own `aliked.onnx` and `lightglue_aliked.onnx` through the blob's own FP16 engines (`colsfm.features_trt`, `colsfm.matching_trt`, `colsfm.tensorrt_runtime`), reusing the `.engine` files already in `pycusfm/models/aliked_lightglue/` when the TensorRT version and the GPU architecture match. This *revises* decision 3, which was written before anyone measured the alternative: the TensorRT matcher is 2.8x faster than the pycolmap one on Galileo (2.91 s against 8.28 s, against the blob's 2.25 s) and it is the only path with a per-match score, so it runs the blob's real SSC spatial NMS rather than the score-free stand-in of decision 7 — median 433 verified matches per pair against the blob's own 430. It is not the default: it needs `tensorrt`, `cuda-python` and an engine built for the local GPU, and on Galileo the pycolmap path still scores a better ATE (4.35 mm against 5.19 mm). Both backends write the same two database columns for the same `image_id`s, so all four combinations run and every later stage is unchanged. |
+| 14 | **The match cap is a mode, not a number** | `--match-cap-mode {fixed,image_area,off}` alongside `--max-matches-per-pair`. `fixed` is decision 7's 500 and stays the default, because it is what Galileo's four acceptance bounds were measured against. `image_area` keeps that calibration's *density* instead of its count — one kept match per `1920*1200/500 = 4608` px of image, so a KITTI 1241x376 frame gets 101 — and `off` keeps every verified inlier. The KITTI follow-up (`docs/kitti-06-results.md` §8) is what the modes exist for, and it settled the question the other way: on sequence 06 the fixed 500 discards 80 % of the verified inliers, but removing the cap makes the trajectory **worse** (Sim(3) ATE 1.822 m against 1.552 m) at 2.3x the runtime, and `image_area` (101 matches per pair there) is worse again at 2.103 m. 500 sits between two worse answers on both datasets, so it stays the default and the other two modes are there because the question was worth answering with numbers. |
+| 15 | **Loop closure is what KITTI 06 was missing, and it works through the mapper, not the pose graph** | `docs/kitti-06-results.md` §8.3. `--loop-closure` takes sequence 06 from 1.552 to **0.736** Sim(3) ATE — past the blob's 1.328 and past the paper's own 0.783 — from the same cuVSLAM SLAM initialisation. Every one of those runs reports **0 loop edges**: the shipped KITTI config leaves both `gate_loop_edges` thresholds at 0.0, so no pose-graph constraint survives. What closes the loop is that the stage matches its 1344 candidate pairs into the same database and `colsfm.mapping.load_correspondences` reads *every* verified two-view geometry, so the loop pairs reach triangulation and bundle adjustment as ordinary tracks. Opening the gates to 5 m / 60 deg admits 279 edges and makes it **worse** (0.895 -> 1.428), which is deviation 5's 408 mm loop-pose error showing up at 1231 m scale. So: turn loop closure on, leave the pose-graph loop gates closed. |
 
 ### Results: blob against colsfm
 
@@ -635,6 +638,88 @@ and a larger bundle adjustment (684 s against 138 s without loops). Loop closure
 by default because the Galileo-class case gains nothing from it; for long sequences with
 revisits, turn it on.
 
+### TensorRT backend
+
+`--features-backend tensorrt` and `--matching-backend tensorrt` (decision 13) swap COLMAP's
+own ALIKED and LightGlue for the blob's graphs on the blob's engines. The engines are the
+`.engine` files already in `pycusfm/models/aliked_lightglue/`: `colsfm.tensorrt_runtime`
+resolves `<stem>_fp16_<trt-version>_sm_<arch>.engine`, which is the blob's own naming, so on
+a machine with TensorRT 10.13.3.9 and an sm_120 GPU nothing is built. On any other pair it
+builds and caches one FP16 engine (minutes, once).
+
+**Galileo, 226 keyframes, 331 pairs, RTX 5090.** Both colsfm columns are the same run
+except for the two backend flags; the blob column is `data/cusfm_runs/galileo_blobref`.
+
+| Metric | blob | colsfm `pycolmap` | colsfm `tensorrt` |
+|---|---:|---:|---:|
+| feature extraction (s) | 8.64 | 7.19 | **7.01** |
+| feature matching (s) | 2.25 | 8.28 | **2.91** |
+| triangulation + BA (s) | 6.69 | 2.56 | 7.81 |
+| total (s) | 40.07 | 18.48 | 18.16 |
+| keypoints per image | 2048 | 1992-2048 | 2048 |
+| median verified matches per pair | 430 | 161 | **433** |
+| median inlier retention | 0.985 | 0.117 | 0.998 |
+| empty pairs | 8 / 339 | 13 / 331 | 13 / 331 |
+| registered / total images | 224 / 226 | 225 / 226 | 225 / 226 |
+| 3D points | 5065 | 6186 | 14561 |
+| mean reprojection error (px) | 1.550 | 1.332 | 1.414 |
+| ATE vs ground truth (mm RMSE) | 5.00 | **4.35** | 5.19 |
+| rig poses vs the blob (mm / deg RMSE) | — | 0.99 / 1.669 | **0.38 / 0.040** |
+| acceptance bounds | — | 4/4 | 4/4 |
+
+Three things to read out of that table.
+
+**The matcher is 2.8x faster and lands on the blob's own number.** 2.91 s against 8.28 s,
+and a median of 433 verified matches per pair against the blob's published 430 (mean 400.8
+against the blob's 400 on the 34-frame subset). That is not a coincidence: it is the same
+graph, the same 0.3 score gate and the same SSC, so it *should* be the same number. The
+0.117 retention on the pycolmap row is the grid subsample of decision 7 running after
+verification, not a verification failure — the two rows measure different quantities.
+
+**Extraction is a wash.** 7.01 s against 7.19 s, both under the blob's 8.64 s. The blob's
+`aliked.onnx` declares a static `image [1, 3, 1200, 1920]` input, so there is no batch axis
+to widen; what is overlapped instead is JPEG decode and resize, in a bounded thread pool
+ahead of the GPU. Engine execution alone is 24.3 ms per image, i.e. 5.5 s of the 7.0.
+
+**More matches is not better here.** The TensorRT path keeps ~2.7x the matches, which
+triples the point count (14 561 against 6186) and moves bundle adjustment from 2.6 s to
+7.8 s and the ATE from 4.35 mm to 5.19 mm. That is the same effect decision 7 measured when
+it introduced the cap. Both still pass all four bounds, so the default is left at
+`pycolmap`, which is also the backend that needs no TensorRT.
+
+**RoboCap** stride 4 (4528 keyframes, 5656 pairs, 4 fisheye cameras), same three producers:
+
+| Stage | blob (s) | colsfm `pycolmap` (s) | colsfm `tensorrt` (s) |
+|---|---:|---:|---:|
+| feature extraction + keyframe selection | 183.91 | 123.32 | 131.5 |
+| BoW vocabulary + index | 243.39 | — | — |
+| loop-closure association | 75.66 | 0.00 | 0.00 |
+| pose graph optimisation | 386.61 | 0.34 | 0.29 |
+| match pair selection | 5.62 | 0.04 | 0.01 |
+| **feature matching** | **52.53** | 152.03 | **48.41** |
+| triangulation + bundle adjustment | 178.75 | 138.02 | 210.14 |
+| COLMAP + TUM export | 7.07 | 8.05 | 7.96 |
+| **total** | **1133.53** | **421.79** | **398.29** |
+| median verified matches per pair | — | — | 454 |
+| 3D points / mean reprojection (px) | 168 874 / 1.486 | 157 887 / 1.501 | 300 506 / 1.479 |
+
+The matching stage lands on the blob's own 52.53 s, from 152.03 s — the single
+biggest speed-up either backend buys anywhere, and the one the deviation table
+called out as "the one stage that is slower". The bill is paid in bundle
+adjustment, which takes 210 s instead of 138 s because there are 2x the points.
+
+**KITTI is where the fixed input size costs.** `aliked.onnx` takes 1920x1200 and
+nothing else, so a 1241x376 KITTI frame is *stretched up* to it and the engine
+runs at 24.3 ms whatever the source resolution; COLMAP's own ALIKED runs at the
+native size. Extraction over 2156 KITTI frames is therefore 62.2 s on the
+TensorRT backend against 17.9 s on the pycolmap one, while matching goes the
+other way, 25.2 s against 94.4 s (`docs/kitti-06-results.md` §8.3). The rule of
+thumb: the TensorRT matcher is a win everywhere; the TensorRT extractor is a win
+only when the source frames are already about 1920x1200.
+
+`tests/colsfm/test_tensorrt_backends.py` covers both backends and skips cleanly when
+`tensorrt`, `cuda-python`, the ONNX graphs or a CUDA device are missing.
+
 ### Where colsfm deviates from the blob
 
 1. **The point cloud is a superset, from LO-RANSAC.** cuSFM grows one disjoint track per
@@ -643,8 +728,10 @@ revisits, turn it on.
    LO-RANSAC keeps them. On Galileo that is 14 496 points against 5065 on the blob's own
    matches, at a lower reprojection error. 98 to 99 % of the blob's points have one of ours
    within 5 cm, and merging is already at a fixed point, so the difference is structural.
-2. **No per-match scores, so no SSC.** See decision 7. The grid subsample runs after
-   verification and only reduces the count.
+2. **No per-match scores, so no SSC — on the default backend.** See decision 7. The grid
+   subsample runs after verification and only reduces the count. The TensorRT matching
+   backend (decision 13) does see the score and runs the real SSC before verification, so
+   on `--matching-backend tensorrt` this deviation does not exist.
 3. **No pose priors in bundle adjustment.** pycolmap's `PosePrior` is 3-DoF position plus an
    optional gravity direction. There is no 6-DoF absolute-pose prior and no relative-pose
    prior in the BA path, so cuSFM's `use_relative_pose_constraint` with its
@@ -859,6 +946,9 @@ Both tasks call `python -m colsfm run`, which takes the same `--input-dir` as
 --loop-closure                 # run stage 5; off by default (decision 10)
 --no-use-gpu                   # force the ONNX CPU provider
 --max-matches-per-pair 500     # verified matches kept per pair; None keeps every inlier
+--match-cap-mode off           # fixed (default) | image_area | off (decision 14)
+--features-backend tensorrt    # the blob's aliked.onnx on the blob's engine (decision 13)
+--matching-backend tensorrt    # ... and its lightglue_aliked.onnx, with the blob's real SSC
 --ba-num-threads 1             # a bit-reproducible Ceres solve
 --optimize-extrinsics          # second mapping pass with sensor_from_rig free (deviation 9)
 --no-regularised-extrinsics    # ... without cuSFM's extrinsic priors, which overfits

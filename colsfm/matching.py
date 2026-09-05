@@ -60,6 +60,15 @@ engine. COLMAP's graph scores differently, and at 0.3 the low-texture
 against the blob's 8 (2.4 %). The default here is COLMAP's own 0.1, measured at
 13 empty pairs (3.9 %) with a 10th-percentile match count of 116 against the
 blob's 118. `BLOB_MATCH_THRESHOLD` is kept for parity runs.
+
+**The other backend.** `MatchingOptions.backend = "tensorrt"` runs the blob's own
+`lightglue_aliked.onnx` through the blob's own engine instead
+(`colsfm.matching_trt`). That path *does* see the per-match score, so it runs the
+real SSC (`select_by_square_covering`) before verification, at the blob's own 0.3
+threshold, and skips the grid subsample below entirely. It is not the default
+because it needs `tensorrt`, `cuda-python` and an engine built for this machine's
+GPU. Both paths leave the same two database tables filled, so the choice is
+invisible to every later stage.
 """
 
 from __future__ import annotations
@@ -75,7 +84,7 @@ from typing import Final, Literal, TypeAlias
 
 import numpy as np
 import pycolmap
-from jaxtyping import Int64
+from jaxtyping import Float32, Int64
 from numpy import ndarray
 
 from colsfm.database import (
@@ -93,6 +102,19 @@ from colsfm.pairs import write_pair_list
 
 MatcherVariant: TypeAlias = Literal["ALIKED_LIGHTGLUE", "ALIKED_BRUTEFORCE"]
 """The ALIKED matchers COLMAP 4.2 offers; the pipeline uses LightGlue."""
+
+MatchingBackend: TypeAlias = Literal["pycolmap", "tensorrt"]
+"""Which LightGlue runs: COLMAP's own ONNX one, or the blob's TensorRT engine.
+
+`tensorrt` is `colsfm.matching_trt`, which has the per-match score COLMAP's
+bindings hide and therefore runs the blob's real SSC spatial NMS rather than
+`subsample_matches_by_coverage`'s score-free stand-in."""
+
+MatchCapMode: TypeAlias = Literal["fixed", "image_area", "off"]
+"""How `max_matches_per_pair` is turned into a per-pair cap; see `resolve_match_cap`."""
+
+MatchScores: TypeAlias = Float32[ndarray, " num_matches"]
+"""LightGlue's confidence per match, which only the TensorRT backend can see."""
 
 DEFAULT_MIN_SCORE: Final[float] = 0.1
 """COLMAP's own `LightGlueONNXMatchingOptions.min_score`, measured best on Galileo."""
@@ -116,11 +138,33 @@ BLOB_RANSAC_CONFIDENCE: Final[float] = 0.98
 BLOB_MATCH_TOP_K: Final[int] = 500
 """`lightglue_params.match_top_k`; the match budget the blob's SSC NMS aims at."""
 
+BLOB_NUM_POINTS_TOLERANCE_FRACTION: Final[float] = 0.3
+"""`lightglue_params.num_points_tolerance_fraction`; SSC's acceptance band around `match_top_k`."""
+
+CAP_REFERENCE_IMAGE_AREA_PX: Final[int] = 1920 * 1200
+"""The image area `BLOB_MATCH_TOP_K` was calibrated on, i.e. one Galileo camera.
+
+`match_cap_mode = "image_area"` keeps the *match density* of that calibration
+rather than its count: one kept match per `1920*1200 / 500 = 4608` pixels of
+image. Galileo therefore reproduces 500 exactly and KITTI's 1241x376 frames get
+101. See `resolve_match_cap` and the KITTI follow-up in `docs/kitti-06-results.md`
+for what that measured."""
+
 
 @dataclass(frozen=True, slots=True)
 class MatchingOptions:
     """How LightGlue and the two-view verifier run over a pair list."""
 
+    backend: MatchingBackend = "pycolmap"
+    """Which LightGlue implementation runs; see `MatchingBackend`.
+
+    On `tensorrt` the `variant`, `model_path`, `min_score`, `max_num_matches`,
+    `skip_image_pairs_in_same_frame`, `device` and `gpu_index` fields are not
+    read: the engine is the blob's own graph, its score gate is
+    `tensorrt_min_score`, its thinning is `select_by_square_covering`, and it
+    runs on CUDA device 0 or not at all. Verification is the same
+    `pycolmap.verify_matches` call on both paths, so `min_num_inliers`,
+    `max_error_px`, `confidence` and `num_threads` still apply."""
     variant: MatcherVariant = "ALIKED_LIGHTGLUE"
     """Matcher COLMAP runs; LightGlue is what the blob uses."""
     min_score: float = DEFAULT_MIN_SCORE
@@ -156,11 +200,55 @@ class MatchingOptions:
     """Verified matches to keep per pair, spread over the image; None keeps every inlier.
 
     The score-free stand-in for the blob's SSC spatial NMS — see
-    `subsample_matches_by_coverage` and the module docstring."""
+    `subsample_matches_by_coverage` and the module docstring. On the `tensorrt`
+    backend this is the SSC *target* instead, applied before verification with
+    the real LightGlue scores, and the post-verification grid subsample does not
+    run at all."""
+    match_cap_mode: MatchCapMode = "fixed"
+    """How `max_matches_per_pair` becomes a per-pair number; see `resolve_match_cap`."""
+    tensorrt_min_score: float = BLOB_MATCH_THRESHOLD
+    """LightGlue score gate on the `tensorrt` backend, applied with `>` as the blob does.
+
+    A second field rather than a second default for `min_score`, because the two
+    graphs are not the same graph: 0.3 is calibrated for the blob's engine, which
+    this backend runs, while `min_score` is calibrated for COLMAP's, which the
+    default backend runs (see the module docstring's "score threshold" note)."""
+    num_points_tolerance_fraction: float = BLOB_NUM_POINTS_TOLERANCE_FRACTION
+    """SSC's acceptance band around the target, as a fraction of it; `tensorrt` only."""
 
 
 DEFAULT_MATCHING_OPTIONS: Final[MatchingOptions] = MatchingOptions()
 """Shared immutable default, so the signatures below hold no constructor call."""
+
+
+def resolve_match_cap(options: MatchingOptions, image_width: int, image_height: int) -> int | None:
+    """Turn the cap settings into the number of matches one pair may keep.
+
+    Three modes, because 500 was calibrated on one image size and one dataset and
+    is not obviously the right number anywhere else:
+
+    * **`fixed`** — `max_matches_per_pair` verbatim. What every run before the
+      KITTI follow-up used.
+    * **`image_area`** — the same *density*, one kept match per
+      `CAP_REFERENCE_IMAGE_AREA_PX / max_matches_per_pair` pixels of image, so a
+      1920x1200 frame keeps 500 and a 1241x376 KITTI frame keeps 101. The cap
+      then scales with resolution instead of ignoring it.
+    * **`off`** — no cap; every verified inlier survives.
+
+    Args:
+        options: The matching settings.
+        image_width: Width of the pair's first image in pixels.
+        image_height: Height of the pair's first image in pixels.
+
+    Returns:
+        The per-pair cap, or None when nothing is capped.
+    """
+    if options.match_cap_mode == "off" or options.max_matches_per_pair is None:
+        return None
+    if options.match_cap_mode == "fixed":
+        return options.max_matches_per_pair
+    area: int = max(image_width * image_height, 1)
+    return max(round(options.max_matches_per_pair * area / CAP_REFERENCE_IMAGE_AREA_PX), 1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,7 +256,13 @@ class PairMatchStats:
     """What one image pair produced."""
 
     raw_matches: int
-    """Matches LightGlue kept after the score gate, before verification."""
+    """Matches LightGlue kept before verification.
+
+    On the `pycolmap` backend that is after the score gate only, because the grid
+    subsample runs later; on `tensorrt` it is after the score gate *and* SSC,
+    because that is where the blob puts its spatial NMS too. `retention` is
+    therefore comparable to the blob's published 0.985 on the TensorRT path and
+    is a different quantity on the pycolmap one."""
     inlier_matches: int
     """Matches surviving two-view verification; 0 when the pair was emptied."""
 
@@ -297,9 +391,11 @@ def subsample_matches_by_coverage(
     (feature_matcher_main.md §5.3). SSC sorts the matched keypoints by their
     LightGlue score and binary-searches a suppression radius until roughly
     `match_top_k` survive; pycolmap exposes no per-match score, so neither the
-    sort key nor the "strongest per cell" rule is reachable. What *is* reachable
-    is the property the blob is buying with it — spatial uniformity — so this
-    lays a fixed grid over image 0 and keeps one match per occupied cell.
+    sort key nor the "strongest per cell" rule is reachable *on this backend*.
+    What *is* reachable is the property the blob is buying with it — spatial
+    uniformity — so this lays a fixed grid over image 0 and keeps one match per
+    occupied cell. The TensorRT backend does see the score and runs the real
+    thing instead; that is `select_by_square_covering`.
 
     The grid is `num_columns = floor(sqrt(max_matches * width / height))` by
     `num_rows = floor(max_matches / num_columns)`, i.e. cells of roughly
@@ -346,6 +442,136 @@ def subsample_matches_by_coverage(
     return ordered[np.sort(first_in_cell)]
 
 
+def select_by_square_covering(
+    keypoints_xy: KeypointsXY,
+    scores: MatchScores,
+    image_width: int,
+    image_height: int,
+    target: int,
+    tolerance: float = BLOB_NUM_POINTS_TOLERANCE_FRACTION,
+) -> Int64[ndarray, " num_kept"]:
+    """The blob's spatial non-maximum suppression: SSC over scored points.
+
+    `GlobalNonMaximumSuppressionViaSquareCovering` (feature_matcher_main.md §5.3)
+    is the SSC algorithm of Bailo et al. 2018: sort the points by strength, then
+    binary-search a suppression square width `w`; for each candidate width, lay a
+    grid of cells `w/2` on a side, walk the points strongest first, keep a point
+    whose cell is not yet covered and mark the 5x5 block of cells around it.
+    Stop as soon as the surviving count lands inside
+    `[target - target*tolerance, target + target*tolerance]`.
+
+    This is the real thing, not `subsample_matches_by_coverage`'s score-free
+    stand-in: it is only reachable on the TensorRT matching backend, which has
+    the LightGlue score the blob uses as each point's response
+    (`colsfm.matching_trt`). Unlike the stand-in it targets a *band* around
+    `target` rather than a hard ceiling, so a result slightly above `target` is
+    the algorithm working, not a bug.
+
+    The search bounds are the blob's: `low = floor(sqrt(n / target))` and
+    `high = (exp1 + exp3) / (2*target - 2)` with `exp1 = width + height + 2*target`
+    and `exp3 = sqrt(exp2)`, `exp2` the discriminant of the same quadratic.
+
+    Args:
+        keypoints_xy: Float32 `[num_points, 2]` xy pixel coordinates, one per
+            scored point — for a match list, the coordinates in the *first* image.
+        scores: Float32 `[num_points]` strength per point; the LightGlue score.
+        image_width: Image width in pixels.
+        image_height: Image height in pixels.
+        target: Points to aim for, i.e. the blob's `match_top_k`.
+        tolerance: Half-width of the acceptable band as a fraction of `target`.
+
+    Returns:
+        Int64 indices into `keypoints_xy`, ascending. Every point is kept —
+        `arange(num_points)` — when `target` is not positive, when there are
+        already no more than `target` points, or when the image has no area,
+        which is the blob's own `matches.size() < match_top_k` early return. A
+        `target` of one short-circuits to the single strongest point.
+    """
+    num_points: int = len(scores)
+    if target <= 0 or num_points <= target or image_width <= 0 or image_height <= 0:
+        return np.arange(num_points, dtype=np.int64)
+
+    order: Int64[ndarray, " num_points"] = np.argsort(-np.asarray(scores, dtype=np.float64), kind="stable")
+    if target < 2:
+        # The search bound below divides by `2 * target - 2`. A target of one is not a
+        # suppression problem anyway: it is "keep the strongest point".
+        return np.sort(order[:target])
+    ordered_xy: KeypointsXY = np.asarray(keypoints_xy, dtype=np.float32)[order]
+    ordered_indices: list[int] = order.tolist()
+
+    exp1: float = float(image_width + image_height + 2 * target)
+    exp2: float = float(
+        4 * image_width
+        + 4 * target
+        + 4 * image_height * target
+        + image_height * image_height
+        + image_width * image_width
+        - 2 * image_height * image_width
+        + 4 * image_height * image_width * target
+    )
+    low: float = float(math.floor(math.sqrt(num_points / target)))
+    high: float = (exp1 + math.sqrt(max(exp2, 0.0))) / (2 * target - 2)
+    lowest_acceptable: int = round(target - target * tolerance)
+    highest_acceptable: int = round(target + target * tolerance)
+
+    previous_width: float = -1.0
+    kept: list[int] = ordered_indices[:target]
+    while low <= high:
+        width: float = low + (high - low) / 2.0
+        if width == previous_width:
+            break
+        previous_width = width
+        kept = _cover_squares(ordered_xy, ordered_indices, width, image_width, image_height)
+        if lowest_acceptable <= len(kept) <= highest_acceptable:
+            break
+        if len(kept) < lowest_acceptable:
+            high = width - 1.0
+        else:
+            low = width + 1.0
+    return np.sort(np.asarray(kept, dtype=np.int64))
+
+
+def _cover_squares(
+    ordered_xy: KeypointsXY, ordered_indices: Sequence[int], width: float, image_width: int, image_height: int
+) -> list[int]:
+    """One SSC pass at one suppression width.
+
+    The covered set is a Python `set` of flat cell ids rather than a boolean
+    grid: only the kept points write, and each writes 25 cells, so the whole pass
+    is a few thousand hash operations instead of a NumPy slice assignment per
+    point. That is what keeps the binary search inside the per-pair budget.
+
+    Args:
+        ordered_xy: Float32 `[num_points, 2]` coordinates, already sorted strongest first.
+        ordered_indices: The original index of each row of `ordered_xy`.
+        width: Suppression square width in pixels; cells are `width / 2` on a side.
+        image_width: Image width in pixels.
+        image_height: Image height in pixels.
+
+    Returns:
+        The original indices of the kept points, strongest first.
+    """
+    cell_size: float = max(width / 2.0, 1e-6)
+    num_cell_columns: int = int(image_width / cell_size)
+    num_cell_rows: int = int(image_height / cell_size)
+    stride: int = num_cell_columns + 1
+    span: int = int(width / cell_size)
+    columns: list[int] = np.clip((ordered_xy[:, 0] / cell_size).astype(np.int64), 0, num_cell_columns).tolist()
+    rows: list[int] = np.clip((ordered_xy[:, 1] / cell_size).astype(np.int64), 0, num_cell_rows).tolist()
+
+    covered: set[int] = set()
+    kept: list[int] = []
+    for index, row, column in zip(ordered_indices, rows, columns, strict=True):
+        if row * stride + column in covered:
+            continue
+        kept.append(index)
+        column_low: int = max(0, column - span)
+        column_high: int = min(num_cell_columns, column + span)
+        for covered_row in range(max(0, row - span), min(num_cell_rows, row + span) + 1):
+            covered.update(range(covered_row * stride + column_low, covered_row * stride + column_high + 1))
+    return kept
+
+
 def _image_sizes(database: pycolmap.Database, image_ids: Sequence[int]) -> dict[int, tuple[int, int]]:
     """Look up the pixel size of each image through its camera.
 
@@ -365,7 +591,9 @@ def _image_sizes(database: pycolmap.Database, image_ids: Sequence[int]) -> dict[
     return sizes
 
 
-def cap_verified_matches(database_path: Path, pairs: Sequence[ImagePair], max_matches_per_pair: int) -> int:
+def cap_verified_matches(
+    database_path: Path, pairs: Sequence[ImagePair], options: MatchingOptions = DEFAULT_MATCHING_OPTIONS
+) -> int:
     """Rewrite every over-full two-view geometry with a spatially spread subset.
 
     Runs **after** verification, so the survivors are inliers of the same
@@ -373,13 +601,16 @@ def cap_verified_matches(database_path: Path, pairs: Sequence[ImagePair], max_ma
     geometry's `E`/`F`/`H`, its configuration and its triangulation angle are kept
     as verification estimated them.
 
+    The cap is per pair, because `resolve_match_cap`'s `image_area` mode derives
+    it from the first image's size; in `fixed` mode every pair gets the same one.
+
     Args:
         database_path: An existing COLMAP database holding verified geometries.
         pairs: Pairs to cap, as `(min(image_id), max(image_id))`.
-        max_matches_per_pair: Matches to keep per pair.
+        options: The matching settings, for `max_matches_per_pair` and `match_cap_mode`.
 
     Returns:
-        Total inlier matches removed across every pair.
+        Total inlier matches removed across every pair; 0 when nothing is capped.
     """
     removed: int = 0
     first_image_ids: list[int] = sorted({pair[0] for pair in pairs})
@@ -389,13 +620,16 @@ def cap_verified_matches(database_path: Path, pairs: Sequence[ImagePair], max_ma
     with pycolmap.Database.open(database_path) as database:
         sizes: dict[int, tuple[int, int]] = _image_sizes(database, first_image_ids)
         for image_id1, image_id2 in pairs:
+            width, height = sizes[image_id1]
+            cap: int | None = resolve_match_cap(options, width, height)
+            if cap is None:
+                continue
             geometry: pycolmap.TwoViewGeometry = database.read_two_view_geometry(image_id1, image_id2)
             inliers: MatchIndices = np.asarray(geometry.inlier_matches, dtype=np.int64)
-            if len(inliers) <= max_matches_per_pair:
+            if len(inliers) <= cap:
                 continue
-            width, height = sizes[image_id1]
             kept: MatchIndices = subsample_matches_by_coverage(
-                keypoints_by_image_id[image_id1], inliers, width, height, max_matches_per_pair
+                keypoints_by_image_id[image_id1], inliers, width, height, cap
             )
             removed += len(inliers) - len(kept)
             geometry.inlier_matches = kept.astype(np.uint32)
@@ -427,7 +661,16 @@ def match_pairs(
         FileNotFoundError: When the database is missing.
         KeyError: When a pair names an image the database does not hold.
         RuntimeError: When `options.device` is `cuda` and CUDA is unusable.
+        ImportError: When `options.backend` is `tensorrt` and TensorRT or
+            `cuda-python` is not importable.
     """
+    if options.backend == "tensorrt":
+        # Imported here, not at module scope: TensorRT and `cuda-python` are only
+        # needed by this branch, and a machine without a usable engine must still
+        # be able to run the default backend.
+        from colsfm.matching_trt import match_pairs_tensorrt
+
+        return match_pairs_tensorrt(database_path, list(pairs), options)
     if not database_path.is_file():
         raise FileNotFoundError(f"No COLMAP database at {database_path}")
     if not pairs:
@@ -453,9 +696,8 @@ def match_pairs(
         raw: dict[ImagePair, int] = raw_match_counts(database_path, pairs)
         delete_two_view_geometries(database_path, pairs)
         pycolmap.verify_matches(database_path, pair_list_path, geometry_options)
-        if options.max_matches_per_pair is not None:
-            dropped: int = cap_verified_matches(database_path, pairs, options.max_matches_per_pair)
-            print(f"colsfm.matching: spatial cap at {options.max_matches_per_pair}/pair dropped {dropped} inlier matches")
+        dropped: int = cap_verified_matches(database_path, pairs, options)
+        print(f"colsfm.matching: spatial cap ({options.match_cap_mode}, {options.max_matches_per_pair}/pair) dropped {dropped} inlier matches")
         elapsed_seconds: float = time.perf_counter() - started
 
     inliers: dict[ImagePair, int] = pair_inlier_counts(database_path, pairs)

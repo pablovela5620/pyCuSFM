@@ -50,11 +50,20 @@ Ordering notes worth knowing before reading the code:
   stage 7b refines the extrinsics of the model stage 7 left behind. Both
   references give the same `cam_T_world`, so nothing about stage 7's result
   depends on which one was used (`colsfm.reconstruction`).
+* **The two ONNX stages have two backends each.** `--features-backend` and
+  `--matching-backend` pick between COLMAP's own ALIKED and LightGlue (the
+  default) and the blob's graphs on the blob's TensorRT engines
+  (`colsfm.features_trt`, `colsfm.matching_trt`). They are independent, all four
+  combinations run, and the choice is invisible past the database: both write the
+  same keypoint and descriptor columns and leave the same matches and two-view
+  geometries. The TensorRT matcher is the only path that sees a per-match score,
+  so it is the only one that runs the blob's real SSC spatial NMS.
 * **`--use-gpu` governs the ONNX stages only.** ALIKED and LightGlue run on the
   GPU; the Ceres solves stay on the CPU by default, as the blob's own
   `keypoints_mapper_main` and `pose_graph_main` do (docs/open-pipeline-plan.md,
-  "Facts that shape the design"). `--ba-use-gpu` moves the bundle-adjustment
-  linear solve onto the GPU; measured it buys nothing on Galileo (1.68 s against
+  "Facts that shape the design"). It is read by the `pycolmap` backends only —
+  the TensorRT ones run on CUDA device 0 or not at all. `--ba-use-gpu` moves the
+  bundle-adjustment linear solve onto the GPU; measured it buys nothing on Galileo (1.68 s against
   1.60 s) and about 8 % on 800 RoboCap images (19.2 s against 20.9 s), so the
   default stays where the blob is.
 * **Threads are not the blob's `--num_thread 1`.** That flag counts worker
@@ -75,7 +84,7 @@ from typing import Final, Literal, TypeAlias, get_args
 
 import numpy as np
 import pycolmap
-from jaxtyping import Int
+from jaxtyping import Float, Int
 from numpy import ndarray
 from serde import serde
 from serde.json import to_json
@@ -102,13 +111,13 @@ from colsfm.export import (
     write_tum_file,
 )
 from colsfm.extrinsic_refinement import ExtrinsicRefinementOptions, ExtrinsicRefinementResult, refine_extrinsics
-from colsfm.features import DeviceChoice, ExtractionReport, FeatureOptions, extract_features
+from colsfm.features import DeviceChoice, ExtractionReport, FeatureBackend, FeatureOptions, extract_features
 from colsfm.frames_meta import FRAMES_META_NAME, CameraParams, FramesMeta, RigFrame, read_frames_meta, write_frames_meta
 from colsfm.geometry import MILLIMETRES_PER_METRE, TumPose, relative_rotation_degrees
 from colsfm.keyframe_selection import KeyframeSelection, apply_selection, select_keyframes
-from colsfm.loop_closure import LoopClosureConfig, LoopClosureResult, find_loop_edges
+from colsfm.loop_closure import LoopClosureConfig, LoopClosureDiagnostics, LoopClosureResult, find_loop_edges
 from colsfm.mapping import MappingOptions, MappingResult, run_mapping
-from colsfm.matching import BLOB_MATCH_TOP_K, MatchingOptions, MatchReport, match_pairs
+from colsfm.matching import BLOB_MATCH_TOP_K, MatchCapMode, MatchingBackend, MatchingOptions, MatchReport, match_pairs
 from colsfm.pairs import select_pairs
 from colsfm.pose_graph import PoseGraphEdge, PoseGraphResult, RigNode, sequential_edges, solve_pose_graph
 from colsfm.reconstruction import PosedModel, build_reconstruction, gauge_camera_params_id
@@ -174,6 +183,13 @@ DATABASE_NAME: Final[str] = "database.db"
 VEHICLE_POSE_TUM_NAME: Final[str] = "vehicle_pose.tum"
 """`pose_graph_main`'s own rig trajectory file name."""
 
+LOOP_EDGES_NAME: Final[str] = "loop_edges.json"
+"""The gated loop constraints, written beside the rig trajectory.
+
+No cuSFM equivalent — the blob keeps its edges inside `vehicle_pose_graph.pb.txt`
+— but a viewer that wants to draw the loops needs them as data rather than as a
+log line. See `write_loop_edges`."""
+
 SUMMARY_NAME: Final[str] = "summary.json"
 """Machine-readable run report, written by this pipeline and by nothing in cuSFM."""
 
@@ -231,6 +247,18 @@ class PipelineOptions:
     max_matches_per_pair: int | None = BLOB_MATCH_TOP_K
     """Verified matches kept per pair after the spatial subsample; None keeps every inlier.
     The blob's `match_top_k`; see `colsfm.matching.subsample_matches_by_coverage`."""
+    match_cap_mode: MatchCapMode = "fixed"
+    """How `max_matches_per_pair` becomes a per-pair number; see
+    `colsfm.matching.resolve_match_cap`. `fixed` is the 500 every run before the KITTI
+    follow-up used, `image_area` scales it with the frame's resolution, `off` keeps every
+    verified inlier."""
+    features_backend: FeatureBackend = "pycolmap"
+    """Which ALIKED runs: COLMAP's own ONNX one, or the blob's TensorRT engine
+    (`colsfm.features_trt`). See `colsfm.features.FeatureBackend`."""
+    matching_backend: MatchingBackend = "pycolmap"
+    """Which LightGlue runs: COLMAP's own ONNX one, or the blob's TensorRT engine
+    (`colsfm.matching_trt`), which is the only path with the per-match score the blob's
+    SSC spatial NMS needs. See `colsfm.matching.MatchingBackend`."""
 
     @property
     def device(self) -> DeviceChoice:
@@ -506,6 +534,82 @@ def _write_vehicle_pose_file(path: Path, nodes: Sequence[RigNode], world_T_rig_b
     write_tum_file(path, poses)
 
 
+@serde
+@dataclass(frozen=True, slots=True)
+class LoopEdgeRecord:
+    """One gated loop constraint, in a form a viewer can read without pycolmap.
+
+    `PoseGraphEdge` carries a `pycolmap.Rigid3d` and a 6x6 NumPy array, neither of
+    which pyserde can write; this is the same measurement flattened to plain
+    numbers. The information matrix is reduced to its diagonal because that is all
+    `colsfm.pose_graph.default_information` ever puts in it — the off-diagonal
+    blocks are zero by construction — and the diagonal is what a viewer would
+    render as an edge weight.
+    """
+
+    source: int
+    """`rig_id` (cuSFM's `synced_sample_id`) of the source rig frame."""
+    target: int
+    """`rig_id` of the target rig frame."""
+    source_T_target_quaternion_xyzw: tuple[float, float, float, float]
+    """Rotation of the measurement, as `pycolmap.Rotation3d.quat` orders it: x, y, z, w."""
+    source_T_target_translation: tuple[float, float, float]
+    """Translation of the measurement, in metres."""
+    information_diagonal: tuple[float, float, float, float, float, float]
+    """Diagonal of the 6x6 weight, rotation block first then translation."""
+    kind: str
+    """`PoseGraphEdge.kind`; always `"loop"` in this file, kept so the record is self-describing."""
+
+
+def loop_edge_record(edge: PoseGraphEdge) -> LoopEdgeRecord:
+    """Flatten one pose-graph edge into its serialisable form.
+
+    Args:
+        edge: The constraint, as `colsfm.loop_closure` gated it.
+
+    Returns:
+        The same measurement as plain numbers.
+    """
+    quaternion: Float[ndarray, " 4"] = np.asarray(edge.source_T_target.rotation.quat, dtype=np.float64)
+    translation: Float[ndarray, " 3"] = np.asarray(edge.source_T_target.translation, dtype=np.float64)
+    diagonal: Float[ndarray, " 6"] = np.asarray(edge.information, dtype=np.float64).diagonal()
+    return LoopEdgeRecord(
+        source=int(edge.source),
+        target=int(edge.target),
+        source_T_target_quaternion_xyzw=(
+            float(quaternion[0]),
+            float(quaternion[1]),
+            float(quaternion[2]),
+            float(quaternion[3]),
+        ),
+        source_T_target_translation=(float(translation[0]), float(translation[1]), float(translation[2])),
+        information_diagonal=(
+            float(diagonal[0]),
+            float(diagonal[1]),
+            float(diagonal[2]),
+            float(diagonal[3]),
+            float(diagonal[4]),
+            float(diagonal[5]),
+        ),
+        kind=edge.kind,
+    )
+
+
+def write_loop_edges(path: Path, loop_edges: Sequence[PoseGraphEdge]) -> None:
+    """Write the gated loop constraints beside the pose-graph outputs.
+
+    Written on every run, empty list included: a viewer that draws loop edges needs
+    to tell "the stage ran and found none" from "the file is not there yet", and an
+    absent file cannot say the first.
+
+    Args:
+        path: Destination `.json` file; parent directories are created.
+        loop_edges: The constraints stage 5 produced; may be empty.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(to_json([loop_edge_record(edge) for edge in loop_edges]) + "\n")
+
+
 def _largest_translation_change_m(nodes: Sequence[RigNode], world_T_rig_by_rig_id: dict[int, pycolmap.Rigid3d]) -> float:
     """Largest rig position change between the input poses and the solved ones.
 
@@ -661,7 +765,9 @@ def run_feature_extraction_stage(options: PipelineOptions, selected: FramesMeta)
         FileNotFoundError: When the image root is missing.
     """
     create_database(options.database_path, selected, overwrite=True)
-    feature_options: FeatureOptions = FeatureOptions(num_threads=options.num_threads, device=options.device)
+    feature_options: FeatureOptions = FeatureOptions(
+        backend=options.features_backend, num_threads=options.num_threads, device=options.device
+    )
     report: ExtractionReport = extract_features(
         options.database_path,
         options.input_dir,
@@ -734,6 +840,14 @@ class LoopClosureStageResult:
     """Image pairs this stage had to match itself, i.e. the candidates stage 4 had not
     already matched. The candidates it reused are not counted: `summary.json` reports
     the *extra* matching work loop closure cost."""
+    diagnostics: LoopClosureDiagnostics | None = None
+    """`find_loop_edges`' own rejection breakdown, or None when the stage did not run.
+
+    Zero loop edges is the normal outcome on a short or low-recall sequence, and only
+    these counters say which it was. The stage already prints them; carrying the object
+    means a caller — a viewer, a notebook — can read them instead of parsing stdout.
+    None on the two paths that return before the search: loop closure switched off, and
+    a database with no descriptors."""
 
 
 def _warn_about_closed_loop_gates(pose_graph_config: PoseGraphConfig) -> None:
@@ -839,7 +953,9 @@ def run_loop_closure_stage(
         f"{result.diagnostics.rejected_by_geometry} failed geometry, {result.diagnostics.rejected_by_is_good} not good, "
         f"{result.diagnostics.verified} verified over {len(requested_pairs)} candidate pairs"
     )
-    return LoopClosureStageResult(edges=edges, num_pairs_matched=len(candidate_pairs))
+    return LoopClosureStageResult(
+        edges=edges, num_pairs_matched=len(candidate_pairs), diagnostics=result.diagnostics
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -854,6 +970,11 @@ class PoseGraphStageResult:
     """The selected collection with every camera pose re-derived through the rig."""
     translation_change_m: float
     """Largest rig position change the solve produced, in metres."""
+    solve: PoseGraphResult | None = None
+    """The Ceres summary and the solved poses, or None when there was nothing to solve.
+
+    None exactly when `edges` is empty, which happens only on a single-rig-frame
+    collection; the input poses stand and no solver ran."""
 
 
 def run_pose_graph_stage(
@@ -874,8 +995,9 @@ def run_pose_graph_stage(
     edges: list[PoseGraphEdge] = sequential_edges(nodes, config.pose_graph.connected_keyframe_num)
     edges.extend(loop_edges)
     world_T_rig_by_rig_id: dict[int, pycolmap.Rigid3d] = {node.rig_id: node.world_T_rig for node in nodes}
+    solved: PoseGraphResult | None = None
     if edges:
-        solved: PoseGraphResult = solve_pose_graph(nodes, edges)
+        solved = solve_pose_graph(nodes, edges)
         world_T_rig_by_rig_id = solved.world_T_rig
         print(
             f"[colsfm] pose graph: {len(nodes)} nodes, {len(edges)} edges "
@@ -891,11 +1013,13 @@ def run_pose_graph_stage(
     pose_graph_dir: Path = options.output_dir / POSE_GRAPH_DIR_NAME
     write_frames_meta(pose_graph_dir / FRAMES_META_NAME, pose_graph_meta)
     _write_vehicle_pose_file(pose_graph_dir / VEHICLE_POSE_TUM_NAME, nodes, world_T_rig_by_rig_id)
+    write_loop_edges(pose_graph_dir / LOOP_EDGES_NAME, loop_edges)
     return PoseGraphStageResult(
         nodes=nodes,
         edges=edges,
         frames_meta=pose_graph_meta,
         translation_change_m=_largest_translation_change_m(nodes, world_T_rig_by_rig_id),
+        solve=solved,
     )
 
 
@@ -1100,11 +1224,13 @@ def run_pipeline(options: PipelineOptions) -> PipelineSummary:
 
     # ── 4. matching and verification ─────────────────────────────────────────────────
     matching_options: MatchingOptions = MatchingOptions(
+        backend=options.matching_backend,
         max_error_px=config.matching_task_worker.verification.max_pixel_error,
         confidence=config.matching_task_worker.verification.min_ransac_confidence,
         num_threads=options.num_threads,
         device=options.device,
         max_matches_per_pair=options.max_matches_per_pair,
+        match_cap_mode=options.match_cap_mode,
     )
     with timed_stage(clock, "matching"):
         matching: MatchingStageResult = run_matching_stage(options, pair_selection.pairs, matching_options)

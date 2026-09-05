@@ -10,6 +10,9 @@ data/r2b_galileo/stereo.edex
 .python-version
 results/*
 *.engine
+# TensorRT's builder timing cache, written beside the engine it accelerated
+# (colsfm.tensorrt_runtime.build_fp16_engine). Per-machine, like the engines.
+*.timing-cache
 .cache/*
 .local/*
 pycusfm/bin
