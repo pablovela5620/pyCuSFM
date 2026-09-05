@@ -1,0 +1,198 @@
+# rattler-build recipe for a CASPAR pycolmap 4.2.0 with an OPENCV_FISHEYE
+# adapter, built from a LOCAL fork (CUDA 13 / sm_120).
+#
+# This is `packages/pycolmap-caspar/recipe.yaml` with the `source:` pointed at
+# a local clone instead of github.com/colmap/colmap, and a distinct build
+# string.  Everything else -- the two-step libcolmap-then-bindings build, the
+# CUDA 13 / sm_120 pins, the dependency list -- is unchanged.
+#
+# THE FORK: /home/pablo/0Dev/forks/colmap-caspar-fisheye, branch
+# `caspar-opencv-fisheye`, branched from tag 4.2.0
+# (be5e29168d4aff238409d60424812df66aac919f -- the exact revision
+# `packages/pycolmap-caspar` builds).  It adds OPENCV_FISHEYE to Caspar's GPU
+# bundle adjuster: an `opencv_fisheye_core` Symforce residual in
+# `src/thirdparty/Symforce-Caspar/caspar_generate.py`, regenerated f32 AND f64
+# kernel trees, and an `OpenCVFisheyeAdapter` in
+# `src/colmap/estimators/caspar/caspar_model_adapter.h`.  See
+# docs/caspar-fisheye-adapter.md.  Nothing is pushed anywhere; the fork lives
+# only on this machine, which is why `source:` is a `path:` and not a `git:`.
+#
+# BUILD COST: the fork adds 224 generated CUDA translation units per precision
+# tree (712 files in generated/f32, up from 488), so the libcolmap step
+# compiles roughly 45% more CUDA than `packages/pycolmap-caspar` does.
+#
+# ORIGINAL HEADER FOLLOWS.
+#
+# rattler-build recipe for a CASPAR-enabled pycolmap 4.2.0 (CUDA 13 / sm_120).
+#
+# WHY THIS EXISTS: CASPAR is COLMAP's experimental GPU bundle-adjustment backend.
+# It is gated behind the CMake flag -DCASPAR_ENABLED=ON, which defaults OFF, and
+# no distributed binary ships it ON.  The conda-forge `pycolmap 4.2.0 cuda_130*`
+# build already *exposes* `pycolmap.BundleAdjustmentBackend.CASPAR` and
+# `BundleAdjustmentOptions.caspar` — the enum is always bound — but the solve
+# aborts with "Caspar BA backend selected but COLMAP was built without
+# CASPAR_ENABLED; rebuild with -DCASPAR_ENABLED=ON".  So the enum is not a
+# capability probe; only a from-source build gives a working backend.
+#
+# TWO-STEP BUILD: pycolmap's pyproject sets `cmake.source-dir = "python/"`, so
+# the bindings link a SEPARATELY-built colmap library — and CASPAR_ENABLED lives
+# in libcolmap, not in the bindings.  Therefore: build and install libcolmap with
+# CASPAR first, then build the bindings against that install prefix.
+#
+# ARCH: the target GPU is an RTX 5090 (compute capability 12.0, sm_120), which
+# needs CUDA 13.  CASPAR's Symforce-generated kernel CMakeLists defaults to
+# `75 80 86 89 75-virtual` but only `if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)`
+# (src/thirdparty/Symforce-Caspar/generated/f{32,64}/CMakeLists.txt:10-11), so
+# passing -DCMAKE_CUDA_ARCHITECTURES=120 explicitly is honoured and no patch is
+# needed.  COLMAP 4.2.0 additionally hard-errors if CMAKE_CUDA_ARCHITECTURES is
+# "native"/"all"/"all-major" while CASPAR is on, which is why the value is
+# spelled out (cmake/FindDependencies.cmake:311-339).
+#
+# DEPENDENCY LIST: derived from the conda-forge `colmap`/`pycolmap` 4.2.0
+# cuda_130 packages actually installed in this repo's `colsfm` environment,
+# minus the GUI/Qt side (GUI_ENABLED=OFF).  It deliberately does NOT carry the
+# MKL / fmt / faiss-cuda pins of the earlier pysfm monorepo recipe: those existed
+# only to co-solve with a cuda130 PyTorch, which `colsfm-caspar` does not have.
+context:
+  # Local fork of tag 4.2.0 (be5e2916) with the OPENCV_FISHEYE Caspar adapter.
+  colmap_rev: be5e29168d4aff238409d60424812df66aac919f
+  cuda_arch: "120"
+
+package:
+  name: pycolmap
+  version: "4.2.0"
+
+source:
+  # A local path, not a git URL: the fork is unpublished by design.
+  # rattler-build copies the working tree (minus .git) into the build dir, so
+  # the branch that is CHECKED OUT is what gets built -- keep
+  # `caspar-opencv-fisheye` checked out in the fork.
+  path: /home/pablo/0Dev/forks/colmap-caspar-fisheye
+
+build:
+  number: 0
+  # An explicit string keeps this artifact distinguishable from the stock fp32
+  # `pycolmap 4.2.0` built by `packages/pycolmap-caspar` -- same package name
+  # and version, different camera-model coverage.
+  string: caspar_fisheye_cuda130_py312
+  script:
+    # conda's onnxruntime-cpp nests its headers at include/onnxruntime/core/session/,
+    # but COLMAP includes <onnxruntime_cxx_api.h> flat (the prebuilt-release layout).
+    # Put the session dir on the compiler's include search path so it resolves.
+    - export CPATH="$PREFIX/include/onnxruntime/core/session${CPATH:+:$CPATH}"
+    # --- Step 1: build + install libcolmap WITH caspar (the flag lives here) ---
+    - >-
+      cmake -S . -B build_colmap -GNinja
+      -DCMAKE_BUILD_TYPE=Release
+      -DCMAKE_INSTALL_PREFIX=$PREFIX
+      -DCUDA_ENABLED=ON
+      -DCASPAR_ENABLED=ON
+      -DGUI_ENABLED=OFF
+      -DTESTS_ENABLED=OFF
+      -DFETCH_ONNX=OFF
+      -DCMAKE_CUDA_ARCHITECTURES=${{ cuda_arch }}
+      -DCMAKE_PREFIX_PATH=$PREFIX
+    - cmake --build build_colmap --parallel ${{ CPU_COUNT }}
+    - cmake --install build_colmap
+    # --- Step 2: build the pycolmap bindings against our caspar libcolmap ---
+    # GENERATE_STUBS=OFF keeps pybind11-stubgen (a git dependency of the
+    # pyproject build-system table) out of the picture under --no-build-isolation.
+    - export CMAKE_PREFIX_PATH="$PREFIX:${CMAKE_PREFIX_PATH:-}"
+    # scikit-build-core drives the bindings through Unix Makefiles and, unlike
+    # step 1's `cmake --build --parallel`, defaults to a SINGLE job.  ~120
+    # pybind11 translation units at that rate cost ~25 minutes; this cuts it to
+    # about one.  scikit-build-core reads CMAKE_BUILD_PARALLEL_LEVEL from the
+    # environment.
+    - export CMAKE_BUILD_PARALLEL_LEVEL=${{ CPU_COUNT }}
+    - export CMAKE_ARGS="-DCASPAR_ENABLED=ON -DCMAKE_CUDA_ARCHITECTURES=${{ cuda_arch }} -DGENERATE_STUBS=OFF -DFETCH_ONNX=OFF -DCMAKE_PREFIX_PATH=$PREFIX"
+    - python -m pip install . -vv --no-build-isolation --no-deps
+
+requirements:
+  build:
+    - ${{ compiler('cxx') }}
+    - ${{ compiler('c') }}
+    # Pin the build-side CUDA toolkit to ONE version (13.0) so nvcc and the
+    # CCCL/cudart headers match — an unpinned cuda-nvcc grabs a newer toolkit
+    # against 13.0 headers and trips the "compiler and toolkit headers are
+    # incompatible" guard.
+    - cuda-nvcc 13.0.*
+    - cuda-version 13.0.*
+    - cmake
+    - ninja
+    - make
+    - git
+    - libgomp
+    # rattler-build needs patchelf for the final RPATH relink/packaging step.
+    - patchelf
+  host:
+    - python 3.12.*
+    - pip
+    - scikit-build-core
+    # pycolmap 4.2.0's build-system requires pybind11 3.x specifically.
+    - pybind11 >=3.0,<4
+    - numpy
+    # --- COLMAP C++ dependencies (mirrors the conda-forge colmap 4.2.0 build,
+    # minus qt-main / xorg, since GUI_ENABLED=OFF) ---
+    - libboost-devel
+    # COLMAP 4.2.0 links eigen 5 (eigen-abi >=5.0.1.80).
+    - eigen
+    - ceres-solver          # CPU Ceres stays — caspar is an *alternative* backend
+    - poselib               # new hard dependency in 4.2.0
+    - cgal-cpp
+    - sqlite
+    - flann
+    - glog
+    - gflags
+    - freeimage
+    - metis
+    - gmp
+    - lz4-c
+    - libfaiss * *_cuda
+    - openimageio
+    # OpenImageIOConfig.cmake does find_dependency(fmt), so fmt's cmake package
+    # must be present or the very first find_package(OpenImageIO) fails.
+    - fmt
+    # CUDA-13 onnxruntime (C++) for the ALIKED / LightGlue neural features.  With
+    # FETCH_ONNX=OFF, COLMAP find_package()s this instead of downloading the
+    # cuda12 GPU prebuilt, whose CUDA provider needs libcublasLt.so.12 (absent
+    # in a CUDA 13 environment).
+    - onnxruntime-cpp * *_cuda130
+    # COLMAP's FindDependencies.cmake still requires OpenGL with GUI_ENABLED=OFF.
+    - libgl-devel
+    - libopengl-devel
+    - libglx-devel
+    - libegl-devel
+    - glew
+    # CUDA 13 toolchain, matching this repo's colsfm environment.
+    - cuda-version 13.0.*
+    - cuda-cudart-dev
+    - libcurand-dev
+    - libcublas-dev
+    - libcusparse-dev
+    - libcusolver-dev
+  run:
+    - python 3.12.*
+    - numpy
+    - libopenimageio
+    - libfaiss
+    - ceres-solver
+    - poselib
+    - onnxruntime-cpp * *_cuda130
+  run_constraints:
+    # This build only carries sm_120 kernels; a pre-Blackwell GPU would load the
+    # library fine but fail at kernel launch.
+    - __cuda >=13.0
+
+tests:
+  - script:
+      - python -c "import pycolmap; assert pycolmap.has_cuda, 'built without CUDA'"
+      - python -c "import pycolmap; assert hasattr(pycolmap.BundleAdjustmentOptions(), 'caspar')"
+      # The adapter is C++-side and has no Python symbol of its own, so the
+      # cheapest build-time evidence that the fork is what got built is that
+      # the enum the adapter dispatches on exists.
+      - python -c "import pycolmap; assert pycolmap.CameraModelId.OPENCV_FISHEYE is not None"
+
+about:
+  homepage: https://colmap.github.io/
+  license: BSD-3-Clause
+  summary: pycolmap 4.2.0 from a local fork with CASPAR_ENABLED and an OPENCV_FISHEYE Caspar adapter, CUDA 13 / sm_120.

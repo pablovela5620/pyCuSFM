@@ -387,12 +387,78 @@ decode-bench = { cmd = "python -m tools.audit.decode_bench", description = "Benc
 [feature.bench.activation.env]
 LD_LIBRARY_PATH = "${CONDA_PREFIX}/lib/python3.12/site-packages/tensorrt_libs:${CONDA_PREFIX}/lib/python3.12/site-packages/nvidia/cudnn/lib:${CONDA_PREFIX}/lib/python3.12/site-packages/nvidia/cu13/lib:${CONDA_PREFIX}/lib"
 
+# ── colsfm-caspar-fisheye: CASPAR with a native OPENCV_FISHEYE adapter ──────
+# A third mirror of `colsfm`, identical to `colsfm-caspar` except that its
+# pycolmap comes from `packages/pycolmap-caspar-fisheye`, which builds a LOCAL
+# fork of COLMAP 4.2.0 (/home/pablo/0Dev/forks/colmap-caspar-fisheye, branch
+# `caspar-opencv-fisheye`) carrying an `OpenCVFisheyeAdapter` for Caspar's GPU
+# bundle adjuster.  Stock CASPAR skips OPENCV_FISHEYE observations with
+# "unsupported camera model"; this build solves them natively.  See
+# docs/caspar-fisheye-adapter.md.
+#
+# A fourth duplicated dependency list, for the same reason the second and third
+# exist: each `pycolmap` spec has to be alone in its own solve, and none of
+# `colsfm`, `colsfm-caspar` or `colsfm-caspar64` may be re-solved.  Keep all
+# four in sync by hand.
+[feature.colsfm-caspar-fisheye.system-requirements]
+cuda = "13.0"
+
+[feature.colsfm-caspar-fisheye.dependencies]
+python = "3.12.*"
+# THE ONE DIFFERENCE from `colsfm`: a path dependency on the local rattler-build
+# recipe instead of `pycolmap = { version = "4.2.0.*", build = "cuda_130*" }`.
+# The recipe builds libcolmap 4.2.0 with CASPAR and then the bindings against it,
+# so `colmap` arrives from the recipe's own install, not as a conda dependency.
+pycolmap = { path = "packages/pycolmap-caspar-fisheye" }
+pyceres = "2.6.*"
+numpy = "*"
+scipy = "*"
+protobuf = "*"
+pyarrow = "*"
+pillow = "*"
+av = "*"
+pyyaml = "*"
+ffmpeg = "8.*"
+pytest = "*"
+ruff = "*"
+beartype = "*"
+jaxtyping = "*"
+tyro = "*"
+pyserde = ">=0.31.2,<0.32"
+einops = "*"
+cuda-version = "13.0.*"
+cuda-cudart = "*"
+cuda-python = "13.0.*"
+libcublas = "*"
+cudnn = "9.*"
+setuptools = "<78"
+typing-extensions = ">=4.1,<4.16"
+
+[feature.colsfm-caspar-fisheye.pypi-dependencies]
+tensorrt-cu13 = "==10.13.3.9.post1"
+rerun-sdk = { version = "==0.37.1", extras = ["catalog"] }
+simplecv = { git = "https://github.com/rerun-io/examples-monorepo.git", subdirectory = "packages/simplecv" }
+
+[feature.colsfm-caspar-fisheye.pypi-options.dependency-overrides]
+tensorrt-cu12 = "==10.13.3.9.post1"
+cuda-toolkit = ">=13,<14"
+
+[feature.colsfm-caspar-fisheye.activation.env]
+LD_LIBRARY_PATH = "${CONDA_PREFIX}/lib:${CONDA_PREFIX}/lib/python3.12/site-packages/tensorrt_libs"
+
+[feature.colsfm-caspar-fisheye.tasks]
+caspar-fisheye-probe = { cmd = "python -m tools.caspar_fisheye_probe", description = "Validate the OPENCV_FISHEYE CASPAR adapter against Ceres on a synthetic fisheye rig and the Galileo model" }
+caspar-fisheye-test = { cmd = "python -m pytest tests/colsfm_probes -q", description = "Run the pycolmap capability probe suite against the fisheye-adapter CASPAR build" }
+
+
+
 [environments]
 raco = { features = ["raco"], no-default-feature = true, solve-group = "raco" }
 bench = { features = ["raco", "bench"], no-default-feature = true }
 colsfm = { features = ["colsfm"], no-default-feature = true, solve-group = "colsfm" }
 colsfm-caspar = { features = ["colsfm-caspar"], no-default-feature = true, solve-group = "colsfm-caspar" }
 colsfm-caspar64 = { features = ["colsfm-caspar64"], no-default-feature = true, solve-group = "colsfm-caspar64" }
+colsfm-caspar-fisheye = { features = ["colsfm-caspar-fisheye"], no-default-feature = true, solve-group = "colsfm-caspar-fisheye" }
 decode-bench = { features = ["decode-bench"], no-default-feature = true, solve-group = "decode-bench" }
 
 [activation.env]
