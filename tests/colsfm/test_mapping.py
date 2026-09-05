@@ -42,6 +42,7 @@ from colsfm.mapping import (
     MappingOptions,
     MappingResult,
     RoundStats,
+    apply_caspar_options,
     backend_name,
     bundle_adjustment_options,
     filter_degenerate_points,
@@ -782,6 +783,55 @@ def test_the_caspar_backend_reaches_the_options_the_solver_reads(
         reconstruction,
     )
     assert on_gpu.caspar.gpu_index == "0"
+
+
+def test_caspar_solver_options_reach_the_options_object(
+    synthetic_rig: SyntheticRig, isaac_config: CusfmConfig
+) -> None:
+    """`MappingOptions.caspar_options` lands on `BundleAdjustmentOptions.caspar`, cast.
+
+    The convergence sweep of `docs/caspar-build.md` moves CASPAR's stopping rules
+    from the command line, so the dict has to arrive at the solver intact — and the
+    two iteration counters are C++ ints, which pybind11 will not take a float for.
+    """
+    reconstruction: pycolmap.Reconstruction = build_reconstruction(synthetic_rig.frames_meta).reconstruction
+    ba_options: pycolmap.BundleAdjustmentOptions = bundle_adjustment_options(
+        isaac_config.vision_mapping.bundle_adjustment,
+        _quiet_options(
+            ba_backend="caspar",
+            caspar_options={"solver_iter_max": 1000, "pcg_iter_max": 80.0, "pcg_rel_error_exit": 1e-6},
+        ),
+        reconstruction,
+    )
+    assert backend_name(ba_options) == "caspar"
+    assert ba_options.caspar.solver_iter_max == 1000
+    assert isinstance(ba_options.caspar.solver_iter_max, int)
+    assert ba_options.caspar.pcg_iter_max == 80
+    assert isinstance(ba_options.caspar.pcg_iter_max, int)
+    assert ba_options.caspar.pcg_rel_error_exit == pytest.approx(1e-6)
+    # Untouched knobs keep COLMAP's defaults, and `use_gpu` still owns `gpu_index`.
+    defaults: dict[str, object] = pycolmap.BundleAdjustmentOptions().caspar.todict()
+    assert ba_options.caspar.diag_init == defaults["diag_init"]
+    assert ba_options.caspar.gpu_index == "-1"
+
+
+def test_caspar_solver_options_are_inert_on_ceres_and_reject_unknown_names(
+    synthetic_rig: SyntheticRig, isaac_config: CusfmConfig
+) -> None:
+    """Ceres never reads the CASPAR block, and a misspelt knob is an error, not a no-op."""
+    reconstruction: pycolmap.Reconstruction = build_reconstruction(synthetic_rig.frames_meta).reconstruction
+    on_ceres: pycolmap.BundleAdjustmentOptions = bundle_adjustment_options(
+        isaac_config.vision_mapping.bundle_adjustment,
+        _quiet_options(caspar_options={"solver_iter_max": 1000.0}),
+        reconstruction,
+    )
+    assert backend_name(on_ceres) == "ceres"
+    assert on_ceres.caspar.solver_iter_max == pycolmap.BundleAdjustmentOptions().caspar.solver_iter_max
+
+    with pytest.raises(KeyError, match="solver_iter_maxx"):
+        apply_caspar_options(pycolmap.BundleAdjustmentOptions().caspar, {"solver_iter_maxx": 1.0})
+    with pytest.raises(KeyError, match="gpu_index"):
+        apply_caspar_options(pycolmap.BundleAdjustmentOptions().caspar, {"gpu_index": 0.0})
 
 
 def test_the_default_backend_is_ceres_and_leaves_caspar_alone(

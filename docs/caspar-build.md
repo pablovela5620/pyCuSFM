@@ -468,3 +468,243 @@ instrument that proved precision was not the problem, and it is the environment
 to reach for when a future CASPAR question needs the arithmetic held exact while
 something else varies. Keep the package and the environment for that purpose;
 do not put a pipeline on it.
+
+## § Convergence sweep
+
+The fp64 experiment above left one hypothesis standing: CASPAR stops short. This
+section tests it by moving CASPAR's stopping rules from the command line —
+`--caspar-option name=value`, threaded through `PipelineOptions.caspar_option` to
+`MappingOptions.caspar_options` and applied to `BundleAdjustmentOptions.caspar`
+in `colsfm.mapping.bundle_adjustment_options`. The flag repeats:
+
+```bash
+python -m colsfm run ... --ba-backend caspar \
+    --caspar-option solver_iter_max=1000 pcg_iter_max=80
+```
+
+### What CASPAR can stop on at all
+
+`pycolmap.BundleAdjustmentOptions().caspar.todict()` on the fp32 build:
+
+| knob | default |
+|---|---:|
+| `solver_iter_max` | 200 |
+| `pcg_iter_max` | 20 |
+| `pcg_rel_error_exit` | 1e-4 |
+| `pcg_rel_score_exit` | -1.0 (disabled) |
+| `pcg_rel_decrease_min` | -1.0 (disabled) |
+| `solver_rel_decrease_min` | 1.0 |
+| `score_exit_value` | 0.0 |
+| `diag_init` / `diag_min` | 1.0 / 1e-12 |
+| `diag_scaling_up` / `diag_scaling_down` | 2.0 / 0.333333 |
+| `diag_exit_value` | 1e3 |
+| `gpu_index` | "-1" |
+
+The header is more informative than the defaults.
+`thirdparty/Symforce-Caspar/generated/f32/solver.h` declares **three** exit
+reasons and no others:
+
+```cpp
+enum class ExitReason { MAX_ITERATIONS, CONVERGED_SCORE_THRESHOLD, CONVERGED_DIAG_EXIT };
+```
+
+So CASPAR has **no gradient, parameter or function tolerance** — nothing
+corresponding to the 1e-6 / 1e-10 / 1e-8 triple `colsfm.mapping` hands Ceres.
+With `score_exit_value = 0.0` the score test can never fire on a non-zero
+residual, which leaves exactly two ways out: the damping `diag` climbing past
+1e3 (reported as convergence — the LM step has stopped helping), or the
+iteration cap (reported as `NO_CONVERGENCE`). "Converged" from CASPAR therefore
+means "damping ran away", not "the gradient is small".
+
+### Galileo, from the converged state
+
+`data/cusfm_runs/galileo_colsfm/cusfm/sparse`, 29 rig frames, 6194 points, one
+global BA with one gauge frame, intrinsics fixed, TRIVIAL loss on both sides and
+colsfm's own Ceres settings (SPARSE_SCHUR, 200 iterations, 1e-6 / 1e-10 / 1e-8).
+Starting reprojection 1.332403 px. Pose deltas are against the Ceres row.
+
+| setting | termination | reproj px | vs ceres | solve s | max abs dt mm | rms dt mm | max dR deg |
+|---|---|---:|---:|---:|---:|---:|---:|
+| ceres | CONVERGENCE | 1.3627 | — | 0.06 | — | — | — |
+| caspar default | CONVERGENCE | 1.3623 | -0.0003 | 0.26 | 0.688 | 0.548 | 0.0095 |
+| `solver_iter_max=1000` | CONVERGENCE | 1.3624 | -0.0003 | 0.23 | 0.648 | 0.517 | 0.0091 |
+| `pcg_iter_max=80` | CONVERGENCE | 1.3624 | -0.0003 | 0.80 | 0.650 | 0.538 | 0.0087 |
+| `pcg_rel_error_exit=1e-5` | CONVERGENCE | 1.3623 | -0.0004 | 0.35 | 0.724 | 0.575 | 0.0099 |
+| `pcg_rel_error_exit=1e-6` | CONVERGENCE | 1.3624 | -0.0003 | 0.68 | 0.610 | 0.489 | 0.0086 |
+| `score_exit_value=1e-6` | CONVERGENCE | 1.3624 | -0.0003 | 0.53 | 0.612 | 0.492 | 0.0087 |
+| `diag_exit_value=1e9` | CONVERGENCE | 1.3624 | -0.0003 | 0.51 | 0.661 | 0.535 | 0.0091 |
+| `solver_iter_max=1000 pcg_iter_max=80` | CONVERGENCE | 1.3626 | -0.0001 | 1.57 | **0.288** | **0.241** | 0.0045 |
+| ... `+ pcg_rel_error_exit=1e-6` | CONVERGENCE | 1.3624 | -0.0003 | 0.77 | 0.666 | 0.547 | 0.0089 |
+| `pcg_rel_decrease_min=1e-3` | CONVERGENCE | 1.3324 | -0.0303 | 0.03 | 1.139 | 0.692 | 0.0234 |
+| `pcg_rel_score_exit=1e-3` | CONVERGENCE | 1.3324 | -0.0303 | 0.04 | 1.139 | 0.692 | 0.0234 |
+| `solver_rel_decrease_min=1e-2` | CONVERGENCE | 1.3324 | -0.0303 | 0.05 | 1.139 | 0.692 | 0.0234 |
+| `solver_rel_decrease_min=1e-4` | CONVERGENCE | 1.3324 | -0.0303 | 0.04 | 1.139 | 0.692 | 0.0234 |
+
+Three corrections to the paragraph above this section:
+
+1. **fp32 CASPAR does not report `NO_CONVERGENCE` on Galileo.** Every fp32 run
+   in the table terminates `CONVERGENCE`. The `NO_CONVERGENCE` row in the fp64
+   probe table is an fp64 observation, and it does not generalise.
+2. **There is no 0.04 px deficit on Galileo either.** fp32 CASPAR lands 0.0003 px
+   *below* Ceres. The 0.04 px figure (0.715 against 0.674) is a KITTI-only,
+   five-round, whole-pipeline number, not a per-solve one.
+3. **Four of the knobs are traps.** Enabling `pcg_rel_decrease_min` or
+   `pcg_rel_score_exit`, or moving `solver_rel_decrease_min` off its 1.0 default,
+   returns the input model **unchanged** (1.3324 px is the starting value) in
+   0.03-0.05 s. Those three are early-exit ratios that fire on the first
+   iteration; do not put them in a sweep expecting more work, they buy none.
+
+The converged model is a weak discriminator: one solve moves the mean
+reprojection by 0.03 px, so every legitimate setting looks alike, and the widest
+disagreement with Ceres is 0.7 mm on a multi-metre scene.
+
+### Galileo, from a state far from the optimum
+
+KITTI's mapper hands CASPAR a freshly re-triangulated and filtered model, not a
+converged one. The same sweep, with poses perturbed by sigma = 0.01 m / 0.3 deg
+and points by sigma = 0.02 m (starting reprojection 82.5 px):
+
+| setting | termination | reproj px | solve s | max abs dt mm vs ceres | rms dt mm | max dR deg |
+|---|---|---:|---:|---:|---:|---:|
+| ceres | CONVERGENCE | (diverged points) | 0.16 | — | — | — |
+| caspar default | CONVERGENCE | 1.3640 | 10.3 | 10.2 | 5.13 | 0.206 |
+| `solver_iter_max=1000` | CONVERGENCE | 1.3655 | 13.2 | 10.3 | 5.15 | 0.205 |
+| `pcg_iter_max=80` | NO_CONVERGENCE | 1.3641 | 15.0 | 10.8 | 5.08 | 0.193 |
+| `pcg_iter_max=200` | NO_CONVERGENCE | 1.3643 | 6.7 | 10.6 | 7.38 | 0.261 |
+| `pcg_rel_error_exit=1e-6` | NO_CONVERGENCE | 1.3645 | 0.8 | 10.0 | 5.22 | 0.210 |
+| `pcg_rel_error_exit=1e-8` | NO_CONVERGENCE | 1.3644 | 6.0 | 10.1 | 5.21 | 0.208 |
+| `diag_exit_value=1e9` | NO_CONVERGENCE | 1.3647 | 1.0 | 9.9 | 5.23 | 0.213 |
+| `solver_iter_max=1000 pcg_iter_max=80` | CONVERGENCE | 1.3651 | 7.4 | 10.8 | 5.11 | 0.190 |
+| max effort (1000 / 200 / 1e-8) | CONVERGENCE | 1.3644 | 70.8 | 11.1 | 5.02 | 0.187 |
+
+Ceres' own mean reprojection is not usable here — from 82 px it walks a handful
+of weakly-constrained points into their own cameras, which is exactly what
+`filter_degenerate_points` and `filter_projection_failures` exist for inside the
+mapper and which this bare probe does not run. Its poses are still the reference.
+
+Two things are visible even so. `NO_CONVERGENCE` **is** reachable on fp32, and
+what reaches it is *tightening* the PCG side: the default's `CONVERGENCE` is the
+damping blow-up, and a more accurate inner solve keeps LM alive until the
+iteration cap. And every setting, from the default to a 70 s max-effort run,
+lands within 1.3640-1.3655 px and 5.0-7.4 mm rms of Ceres. **A 9x change in
+solver budget moves the answer by less than the spread between two of its own
+settings.**
+
+### KITTI 06, the question that was asked
+
+The three settings the Galileo tables leave standing — more PCG iterations, more
+LM iterations, and both plus a tighter inner tolerance — on the full sequence.
+Same command as § Double precision with `--ba-backend caspar` plus
+`--caspar-option`, scored by `tools/kitti/evaluate_kitti.py` against
+`data/kitti/06/poses_gt_06.txt` (1078 matched poses):
+
+```bash
+pixi run -e colsfm-caspar python -m colsfm run \
+    --input-dir data/kitti/06_colsfm_input_slam --output-dir <out> \
+    --config-dir data/kitti/config --min-inter-frame-distance 0.5 \
+    --loop-closure --match-cap-mode fixed --ba-backend caspar \
+    --caspar-option solver_iter_max=1000 pcg_iter_max=80
+```
+
+| run | Sim(3) RMSE m | SE(3) RMSE m | final reproj px | mapping s |
+|---|---:|---:|---:|---:|
+| Ceres (Cauchy, the baseline) | **0.895** | **1.118** | 0.6741 | 148.5 |
+| Ceres, TRIVIAL loss | 0.899 | 1.097 | 0.7078 | 319.7 |
+| CASPAR default | 1.299 | 1.601 | 0.7147 | 31.5 |
+| `pcg_iter_max=80` | 1.287 | 1.562 | 0.7217 | 75.6 † |
+| `solver_iter_max=1000 pcg_iter_max=80` | 1.286 | 1.518 | 0.7276 | 120.3 † |
+| `solver_iter_max=1000 pcg_iter_max=200 pcg_rel_error_exit=1e-8` | 1.279 | 1.501 | 0.7264 | 176.3 |
+
+† `nvidia-smi` showed another worker holding 1.2-7.4 GB on the same 5090 for the
+whole of these two runs, so their mapping seconds are upper bounds. The default,
+the Ceres rows and the max-effort row ran on an idle GPU. ATE is unaffected by
+contention either way.
+
+**No setting closes the gap.** A 5.6x mapping-time increase buys 0.020 m of the
+0.404 m Sim(3) deficit — 5 % — and the last three rows agree with each other to
+0.008 m, which is the run-to-run spread of the mapper itself. SE(3) moves more
+(0.100 m of 0.483 m, 21 %) but lands nowhere near Ceres. Spending more on the
+solver also makes the *reprojection* slightly worse, not better (0.7147 →
+0.7276), which is the first sign that the two solvers are not racing along the
+same path to the same point.
+
+### Where the gap is actually made
+
+The per-round line of each run (`[colsfm] round N gate … reprojection … px`)
+shows the deficit is born in round 0 and then merely carried:
+
+| round | gate px | Ceres Cauchy | Ceres TRIVIAL | CASPAR default | CASPAR max effort |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 25 | 0.8626 | 0.9060 | 0.9251 | 0.9243 |
+| 1 | 20 | 0.8357 | 0.9056 | 0.9197 | 0.9923 |
+| 2 | 15 | 0.8014 | 0.8763 | 0.8884 | 0.8880 |
+| 3 | 10 | 0.7536 | 0.8202 | 0.8299 | 0.8341 |
+| 4 | 5 | 0.6741 | 0.7078 | 0.7147 | 0.7264 |
+
+Two readings, and they kill the stopping-criterion hypothesis outright:
+
+1. **The solver budget does not touch round 0.** 0.9251 px at the default and
+   0.9243 px at 1000 LM iterations / 200 PCG iterations / 1e-8 — a 0.0008 px
+   difference for roughly six times the work. CASPAR is *already at* its solution
+   after the default budget; it is not stopping short.
+2. **Compared like with like, CASPAR reproduces Ceres.** The right Ceres column is
+   the TRIVIAL one, because CASPAR applies no robust loss. Against it, CASPAR is
+   0.019 px behind at round 0 and **0.007 px** behind at the end. The "0.04 px
+   deficit" of the earlier sections is almost entirely the Cauchy loss, which
+   CASPAR cannot honour — and the Cauchy/TRIVIAL Ceres pair scores 0.895 against
+   0.899 m, i.e. the loss is worth 0.004 m of ATE, not 0.4 m.
+
+So CASPAR minimises the same objective to within 1 % of Ceres' own value and
+still lands 0.4 m away on the ground.
+
+### Verdict: not a stopping-criterion problem
+
+**The 0.4 m gap on KITTI 06 is not a stopping-criterion problem.** Every knob
+CASPAR exposes was moved, one at a time and in combination, on a converged
+Galileo solve, on a Galileo solve started 82 px from its optimum, and on the full
+KITTI sequence. Nothing recovered more than 5 % of the Sim(3) deficit, and the
+setting that did (176 s of mapping against the default's 31.5 s) gave up
+CASPAR's only advantage to get it. Two of the three signatures the hypothesis
+rested on do not survive contact:
+
+- `NO_CONVERGENCE` is not a symptom of stopping short. fp32 CASPAR reports
+  `CONVERGENCE` on every Galileo solve from the converged state, and reaches
+  `NO_CONVERGENCE` only when the PCG tolerance is *tightened* — the default's
+  "convergence" is `CONVERGED_DIAG_EXIT`, the damping blow-up, since
+  `score_exit_value = 0` makes the score test unreachable and CASPAR has no
+  gradient, step or function tolerance at all.
+- The 0.04 px reprojection deficit is the Cauchy loss, not lost accuracy. Held
+  to the same TRIVIAL objective, CASPAR and Ceres finish 0.007 px apart, and
+  Ceres scores the same ATE under either loss.
+
+**The remaining hypothesis is gauge freedom — the solvers agree on the cost and
+disagree on the point.** The perturbed-Galileo table is the direct evidence: from
+the same start, every CASPAR setting lands within 1.3640-1.3655 px, a spread
+smaller than its own run-to-run noise, yet 5.0-7.4 mm rms and up to 0.26° away
+from Ceres' poses. The disagreement does not shrink with budget, so it is not
+truncation; it is displacement along directions the reprojection objective barely
+penalises. colsfm pins the gauge with a single
+`set_constant_rig_from_world_pose` on the lowest frame id, which fixes six
+degrees of freedom of a 1078-frame, 1.2 km chain and leaves scale and the
+low-curvature bending modes to the data alone. On Galileo — 29 frames, a few
+metres across — that costs 0.7 mm and is invisible. On KITTI it is the whole
+0.4 m, and it is set in round 0, before the five-round schedule has any chance to
+correct it.
+
+**The one experiment that would test it.** Take the *final* CASPAR model
+(`data/kitti/06_colsfm_caspar/cusfm/sparse`), run a single Ceres global BA on it
+with colsfm's own settings and no re-triangulation and no filtering, re-export
+the TUM poses and re-score. It costs one solve, and it separates the two
+remaining explanations cleanly:
+
+- ATE snaps back towards 0.9 m → both solvers see the same basin and Ceres simply
+  sits at a different point in it. The gap is gauge/conditioning, and the fix is
+  to constrain it — more constant frames, or a scale prior from the rig baseline,
+  or Ceres' `use_inner_iterations` equivalent.
+- ATE stays near 1.29 m → Ceres agrees this is a minimum, and the divergence was
+  decided by which tracks round 0's 25 px gate and `filter_degenerate_points`
+  kept, not by the solve. The fix is then in the mapper's schedule, not in
+  CASPAR's options at all.
+
+Either way, do not spend more on CASPAR's solver: the sweep above shows that
+budget buys nothing.

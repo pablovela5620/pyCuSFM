@@ -116,7 +116,7 @@ from colsfm.frames_meta import FRAMES_META_NAME, CameraParams, FramesMeta, RigFr
 from colsfm.geometry import MILLIMETRES_PER_METRE, TumPose, relative_rotation_degrees
 from colsfm.keyframe_selection import KeyframeSelection, apply_selection, select_keyframes
 from colsfm.loop_closure import LoopClosureConfig, LoopClosureDiagnostics, LoopClosureResult, find_loop_edges
-from colsfm.mapping import BaBackend, MappingOptions, MappingResult, run_mapping
+from colsfm.mapping import BaBackend, CasparOptions, MappingOptions, MappingResult, run_mapping
 from colsfm.matching import BLOB_MATCH_TOP_K, MatchCapMode, MatchingBackend, MatchingOptions, MatchReport, match_pairs
 from colsfm.pairs import select_pairs
 from colsfm.pose_graph import PoseGraphEdge, PoseGraphResult, RigNode, sequential_edges, solve_pose_graph
@@ -151,6 +151,33 @@ STAGE_NAMES: Final[tuple[StageName, ...]] = tuple(
     stage for stage in ALL_STAGE_NAMES if stage != EXTRINSIC_REFINEMENT_STAGE
 )
 """The stages a default run records: every stage but the second mapping pass."""
+
+
+def parse_caspar_options(items: tuple[str, ...]) -> CasparOptions | None:
+    """Turn `--caspar-option name=value` strings into the dict `MappingOptions` takes.
+
+    Args:
+        items: One `name=value` per repetition of the flag.
+
+    Returns:
+        The parsed overrides, or None when nothing was passed, which is what keeps
+        COLMAP's own CASPAR defaults.
+
+    Raises:
+        ValueError: When an item has no `=`, or its value is not a number.
+    """
+    if not items:
+        return None
+    options: CasparOptions = {}
+    for item in items:
+        name, separator, raw = item.partition("=")
+        if not separator:
+            raise ValueError(f"[colsfm] --caspar-option takes `name=value`, got `{item}`")
+        try:
+            options[name.strip()] = float(raw)
+        except ValueError as error:
+            raise ValueError(f"[colsfm] --caspar-option `{name.strip()}` needs a number, got `{raw}`") from error
+    return options
 
 
 def stage_names(optimize_extrinsics: bool) -> tuple[StageName, ...]:
@@ -250,6 +277,11 @@ class PipelineOptions:
     ba_num_threads: int | None = None
     """Ceres threads; None takes `bundle_adjustment_config.num_threads` (8) from the config,
     which is what the blob solves with. Set 1 for a bit-reproducible solve."""
+    caspar_option: tuple[str, ...] = ()
+    """CASPAR solver overrides as `name=value`, e.g. `--caspar-option solver_iter_max=1000
+    pcg_iter_max=80`. Read only when `--ba-backend caspar` actually runs; see
+    `colsfm.mapping.CasparOptions` for the names and `docs/caspar-build.md`
+    § Convergence sweep for what moving them buys."""
     max_matches_per_pair: int | None = BLOB_MATCH_TOP_K
     """Verified matches kept per pair after the spatial subsample; None keeps every inlier.
     The blob's `match_top_k`; see `colsfm.matching.subsample_matches_by_coverage`."""
@@ -1260,6 +1292,7 @@ def run_pipeline(options: PipelineOptions) -> PipelineSummary:
         num_threads=options.ba_num_threads,
         use_gpu=options.ba_use_gpu,
         ba_backend=options.ba_backend,
+        caspar_options=parse_caspar_options(options.caspar_option),
     )
 
     # ── 7. triangulation and bundle adjustment ───────────────────────────────────────

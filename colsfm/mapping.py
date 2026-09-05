@@ -206,6 +206,16 @@ a `LOG(WARNING)` and the solve still reports success, so this is a pre-flight, n
 CASPAR_DISABLED_MARKER: Final[str] = "CASPAR_ENABLED"
 """What COLMAP's "built without CASPAR_ENABLED" `ValueError` says; the capability test."""
 
+CasparOptions: TypeAlias = dict[str, float | int]
+"""Numeric overrides for `pycolmap.BundleAdjustmentOptions.caspar`, by attribute name.
+
+The stopping and damping knobs of CASPAR's Levenberg-Marquardt / PCG loop —
+`solver_iter_max`, `pcg_iter_max`, `pcg_rel_error_exit`, `pcg_rel_score_exit`,
+`pcg_rel_decrease_min`, `solver_rel_decrease_min`, `score_exit_value`, `diag_*`.
+Values are cast to the attribute's own type on the way in, so the integer counters
+take integers whichever way they were written. `gpu_index` is a string and is not
+settable here; `MappingOptions.use_gpu` owns it."""
+
 BRIEF_REPORT_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"Iterations:\s*(\d+),\s*Initial cost:\s*([0-9.eE+-]+),\s*Final cost:\s*([0-9.eE+-]+)"
 )
@@ -281,6 +291,13 @@ class MappingOptions:
     CASPAR would silently drop), `optimize_extrinsics` (which CASPAR cannot honour),
     and a pycolmap built without it. See the module docstring for the robust loss
     CASPAR does not apply."""
+    caspar_options: CasparOptions | None = None
+    """Overrides applied to `BundleAdjustmentOptions.caspar` when `ba_backend` is `caspar`.
+
+    None keeps COLMAP's defaults. Read only on the CASPAR backend: on Ceres the
+    options object is never consulted, so a dict here is silently inert, which is
+    what a sweep driver that flips only `--ba-backend` wants. Unknown names raise
+    (`apply_caspar_options`) rather than being ignored."""
     verbose: bool = True
     """Print one line per triangulation pass and per outer round, as cuSFM does."""
     round_callback: RoundCallback | None = None
@@ -530,6 +547,42 @@ def backend_name(ba_options: pycolmap.BundleAdjustmentOptions) -> BaBackend:
     return "caspar" if ba_options.backend == BUNDLE_ADJUSTMENT_BACKEND["caspar"] else "ceres"
 
 
+def apply_caspar_options(caspar: pycolmap.CasparBundleAdjustmentOptions, overrides: CasparOptions) -> None:
+    """Set CASPAR solver knobs by name, casting each value to the attribute's own type.
+
+    `CasparBundleAdjustmentOptions` binds `solver_iter_max` and `pcg_iter_max` as
+    C++ ints, which pybind11 refuses to take a Python float for, so every value
+    goes through the type the default carries. `gpu_index` is a string knob owned
+    by `MappingOptions.use_gpu` and is rejected here.
+
+    Args:
+        caspar: The `BundleAdjustmentOptions.caspar` block, modified in place.
+        overrides: Attribute name to value.
+
+    Raises:
+        KeyError: When a name is not a numeric CASPAR option.
+    """
+    for name, value in overrides.items():
+        current: object = getattr(caspar, name, None)
+        if not isinstance(current, (int, float)) or isinstance(current, bool):
+            raise KeyError(
+                f"[colsfm] `{name}` is not a numeric CASPAR solver option; "
+                f"the settable ones are {sorted(caspar_option_names())}"
+            )
+        setattr(caspar, name, type(current)(value))
+
+
+def caspar_option_names() -> frozenset[str]:
+    """The numeric option names `apply_caspar_options` accepts.
+
+    Returns:
+        Every key of a default `caspar.todict()` whose value is a number, i.e.
+        everything but the string `gpu_index`.
+    """
+    defaults: dict[str, object] = pycolmap.BundleAdjustmentOptions().caspar.todict()
+    return frozenset(name for name, value in defaults.items() if isinstance(value, (int, float)) and not isinstance(value, bool))
+
+
 def bundle_adjustment_options(
     ba_config: BundleAdjustmentConfig,
     options: MappingOptions,
@@ -586,6 +639,8 @@ def bundle_adjustment_options(
         # `-1` is COLMAP's own pick, which is what `use_gpu` off means everywhere else
         # in this dataclass. Both were measured to solve on the 5090.
         ba_options.caspar.gpu_index = "0" if options.use_gpu else "-1"
+        if options.caspar_options is not None:
+            apply_caspar_options(ba_options.caspar, options.caspar_options)
     return ba_options
 
 
