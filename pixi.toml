@@ -283,6 +283,69 @@ caspar-probe = { cmd = "python -m tools.caspar_probe", description = "Time CASPA
 caspar-test = { cmd = "python -m pytest tests/colsfm_probes -q", description = "Run the pycolmap capability probe suite against the from-source CASPAR build" }
 
 
+# ── colsfm-caspar64: the same stack on a DOUBLE-PRECISION CASPAR ────────────
+# A second mirror, identical to `colsfm-caspar` except that its pycolmap comes
+# from `packages/pycolmap-caspar64`, which adds `-DCASPAR_USE_DOUBLE=ON`.  That
+# flag makes CASPAR's `StorageType` a double and selects the f64 Symforce kernel
+# tree instead of f32.  It exists to test whether double precision recovers the
+# KITTI 06 accuracy the float32 CASPAR build loses on a 1231 m pose chain, and
+# what that costs on a GeForce card's 1/64-rate FP64 units.  See
+# docs/caspar-build.md § Double precision.
+#
+# A third duplicated dependency list, for the same reason the second one exists:
+# each `pycolmap` spec has to be alone in its own solve, and neither `colsfm`
+# nor `colsfm-caspar` may be re-solved.  Keep all three in sync by hand.
+[feature.colsfm-caspar64.system-requirements]
+cuda = "13.0"
+
+[feature.colsfm-caspar64.dependencies]
+python = "3.12.*"
+# THE ONE DIFFERENCE from `colsfm`: a path dependency on the local rattler-build
+# recipe instead of `pycolmap = { version = "4.2.0.*", build = "cuda_130*" }`.
+# The recipe builds libcolmap 4.2.0 with CASPAR and then the bindings against it,
+# so `colmap` arrives from the recipe's own install, not as a conda dependency.
+pycolmap = { path = "packages/pycolmap-caspar64" }
+pyceres = "2.6.*"
+numpy = "*"
+scipy = "*"
+protobuf = "*"
+pyarrow = "*"
+pillow = "*"
+av = "*"
+pyyaml = "*"
+ffmpeg = "8.*"
+pytest = "*"
+ruff = "*"
+beartype = "*"
+jaxtyping = "*"
+tyro = "*"
+pyserde = ">=0.31.2,<0.32"
+einops = "*"
+cuda-version = "13.0.*"
+cuda-cudart = "*"
+cuda-python = "13.0.*"
+libcublas = "*"
+cudnn = "9.*"
+setuptools = "<78"
+typing-extensions = ">=4.1,<4.16"
+
+[feature.colsfm-caspar64.pypi-dependencies]
+tensorrt-cu13 = "==10.13.3.9.post1"
+rerun-sdk = { version = "==0.37.1", extras = ["catalog"] }
+simplecv = { git = "https://github.com/rerun-io/examples-monorepo.git", subdirectory = "packages/simplecv" }
+
+[feature.colsfm-caspar64.pypi-options.dependency-overrides]
+tensorrt-cu12 = "==10.13.3.9.post1"
+cuda-toolkit = ">=13,<14"
+
+[feature.colsfm-caspar64.activation.env]
+LD_LIBRARY_PATH = "${CONDA_PREFIX}/lib:${CONDA_PREFIX}/lib/python3.12/site-packages/tensorrt_libs"
+
+[feature.colsfm-caspar64.tasks]
+caspar-probe = { cmd = "python -m tools.caspar_probe", description = "Time double-precision CASPAR against Ceres bundle adjustment on the synthetic rig and the Galileo model" }
+caspar-test = { cmd = "python -m pytest tests/colsfm_probes -q", description = "Run the pycolmap capability probe suite against the from-source double-precision CASPAR build" }
+
+
 # ── decode-bench: GPU JPEG decode (nvJPEG via torchcodec) benchmarking ───────
 # Isolated audit-only environment for docs/gpu-jpeg-decode.md.  It is
 # `no-default-feature` with its own solve group for the same reason `colsfm`
@@ -329,6 +392,7 @@ raco = { features = ["raco"], no-default-feature = true, solve-group = "raco" }
 bench = { features = ["raco", "bench"], no-default-feature = true }
 colsfm = { features = ["colsfm"], no-default-feature = true, solve-group = "colsfm" }
 colsfm-caspar = { features = ["colsfm-caspar"], no-default-feature = true, solve-group = "colsfm-caspar" }
+colsfm-caspar64 = { features = ["colsfm-caspar64"], no-default-feature = true, solve-group = "colsfm-caspar64" }
 decode-bench = { features = ["decode-bench"], no-default-feature = true, solve-group = "decode-bench" }
 
 [activation.env]

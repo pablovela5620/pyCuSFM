@@ -296,3 +296,175 @@ pixi install -e colsfm-caspar          # builds the package; see the timing abov
 pixi run -e colsfm-caspar caspar-probe # CASPAR vs Ceres, synthetic + Galileo
 pixi run -e colsfm-caspar caspar-test  # the probe suite against the from-source build
 ```
+
+## § Double precision
+
+`CASPAR_USE_DOUBLE` is the second experimental flag COLMAP 4.2.0 exposes next to
+`CASPAR_ENABLED`:
+
+```cmake
+# CMakeLists.txt:78
+option(CASPAR_USE_DOUBLE "Use double precision in Caspar solver" OFF)
+```
+
+It switches two things, and only these two:
+
+1. **The scalar type of the solver.** With the flag on, CMake adds the
+   `CASPAR_USE_DOUBLE` compile definition (`CMakeLists.txt:88-92`), and
+   `src/colmap/estimators/bundle_adjustment_caspar.h:42-48` typedefs
+   `StorageType` to `double` instead of `float`. Every factor, residual and
+   Jacobian in the CASPAR problem changes width.
+2. **Which pre-generated kernel tree is compiled.**
+   `src/thirdparty/CMakeLists.txt:100-106` selects
+   `src/thirdparty/Symforce-Caspar/generated/f64` instead of `.../f32`. Both
+   trees ship inside the 4.2.0 tag (4.5 MB and 4.3 MB), so nothing has to be
+   regenerated — `generate_caspar.py` is not needed.
+
+Upstream treats the two precisions as materially different accuracies. Its own
+CASPAR test hardcodes one tolerance per precision
+(`src/colmap/estimators/bundle_adjustment_caspar_test.cc:457-465`): focal length
+**1.0 px under fp64 against 20.0 px under fp32**, principal point 1.0 against
+10.0, extra params 1e-4 against 1.5e-2. That asymmetry is what made float32 the
+prime suspect for the KITTI 06 accuracy loss.
+
+### The build
+
+`packages/pycolmap-caspar64/` is a copy of `packages/pycolmap-caspar/` with
+`-DCASPAR_USE_DOUBLE=ON` added to **both** cmake invocations — the libcolmap
+configure and the bindings' `CMAKE_ARGS` — plus an explicit build string
+`caspar_f64_cuda130_py312`, so the fp64 artifact can never collide with the fp32
+`pycolmap 4.2.0` in pixi's artifact cache. `[feature.colsfm-caspar64]` and the
+`colsfm-caspar64` environment mirror the fp32 pair with one line changed:
+
+```toml
+# colsfm-caspar
+pycolmap = { path = "packages/pycolmap-caspar" }
+# colsfm-caspar64
+pycolmap = { path = "packages/pycolmap-caspar64" }
+```
+
+`pixi install -e colsfm-caspar64` on the same 32-core machine: **5 min 30 s**,
+against 5 min 16 s for fp32. Double precision costs essentially nothing at
+compile time — the same 662 ninja targets. The configure log confirms the switch
+landed:
+
+```
+-- Caspar precision:  f64
+-- Caspar source dir: $SRC_DIR/src/thirdparty/Symforce-Caspar/generated/f64
+```
+
+and the packaged headers under `include/colmap/thirdparty/Symforce-Caspar/generated/`
+are the `f64` set only. `pixi.lock` grew by **763 lines with zero deletions**;
+the only new key in the `environments:` block is `colsfm-caspar64`, so `colsfm`,
+`colsfm-caspar`, `default`, `raco`, `bench` and `decode-bench` are untouched.
+
+### The probe: fp64 CASPAR reproduces Ceres to machine precision
+
+`pixi run -e colsfm-caspar64 caspar-probe`.
+
+Synthetic rig — 5 frames, 2 PINHOLE cameras, 72 points, perturbed by sigma = 0.05 m:
+
+| backend | solve | final reproj | max \|point − truth\| | agreement with Ceres |
+|---|---:|---:|---:|---|
+| ceres | 0.002 s | 0.000000 px | 3.2e-09 m | — |
+| caspar fp32 | 0.16 s | 0.000109 px | 6.7e-06 m | 8 um / 8e-5 deg |
+| **caspar fp64** | 0.22 s | **0.000000 px** | **5.3e-15 m** | **0.000000 m / 0.000000 deg** |
+
+Galileo — 226 images, 29 rig frames, 6194 points, one global BA from the
+converged state, starting reprojection 1.332403 px:
+
+| backend | solve | final reproj | termination | max pose change vs Ceres |
+|---|---:|---:|---|---:|
+| ceres | 0.113 s | 1.362713 px | CONVERGENCE | — |
+| caspar fp32 | 0.04-0.13 s | 1.36235-1.36238 px | — | 0.72 mm / 0.0099 deg |
+| **caspar fp64** | 1.012 s | **1.362712 px** | NO_CONVERGENCE | **0.003 mm / 0.000044 deg** |
+
+**Numerically the flag does exactly what it promises.** fp64 CASPAR lands 5e-15 m
+from ground truth on the synthetic rig — tighter than Ceres' own 3e-09 — and
+agrees with Ceres to 3 micrometres on Galileo against fp32's 0.72 mm, a 240x
+improvement. Its final reprojection error matches Ceres to the sixth decimal.
+
+**The cost on a GeForce card is exactly the 1/64 FP64 penalty you would expect.**
+On Galileo, fp64 CASPAR takes 1.012 s where fp32 took about 0.1 s and Ceres takes
+0.113 s: fp64 is roughly 10x slower than fp32 CASPAR and **9x slower than CPU
+Ceres**. On this problem size the GPU backend stops being a win at all.
+
+### KITTI 06 — the accuracy does not come back
+
+The §8 `cap 500 + loops` configuration, from the cuVSLAM SLAM initialisation,
+with the backend as the only change:
+
+```bash
+pixi run -e colsfm-caspar64 python -m colsfm run \
+    --input-dir data/kitti/06_colsfm_input_slam \
+    --config-dir data/kitti/config \
+    --output-dir data/kitti/06_colsfm_caspar64/cusfm \
+    --min-inter-frame-distance 0.5 --loop-closure \
+    --match-cap-mode fixed --ba-backend caspar
+```
+
+`summary.json` records `mapping.ba_backend = "caspar"`, so no fallback fired.
+All three ATE rows come from one `tools/kitti/evaluate_kitti.py` invocation
+against `data/kitti/06/poses_gt_06.txt` (`/tmp/caspar64_ate.json`):
+
+| Metric | ceres (CAUCHY) | caspar fp32 | **caspar fp64** |
+|---|---:|---:|---:|
+| mapping stage (s) | 148.5 | **31.5** | 46.1 † |
+| total (s) | 338.0 | 208.6 | 249.5 † |
+| registered images | 2156 | 2156 | 2156 |
+| 3D points | 96 691 | 97 224 | 96 644 |
+| observations | 713 124 | 709 950 | 712 232 |
+| mean reprojection (px) | 0.674 | 0.715 | 0.714 |
+| Sim(3) ATE RMSE (m) | **0.895** | 1.299 | 1.285 |
+| SE(3) ATE RMSE (m) | **1.118** | 1.601 | 1.555 |
+
+† **The two fp64 runtimes are contended and are upper bounds.** Another worker
+held the GPU for the whole run — 31 samples at 10 s intervals, mean utilisation
+64 %, every one of them with a competing process. The four non-BA stages, whose
+cost is independent of the BA backend, inflated by a mean factor of **1.31**
+against the fp32 run (feature extraction 1.39x, matching 1.17x, loop closure
+1.07x, export 1.61x). Dividing the mapping stage by that same factor puts the
+uncontended fp64 estimate near **35 s**, close to fp32's 31.5 s. Treat 35-46 s as
+the range and do not quote 46.1 s as a clean measurement.
+
+**Double precision does not recover the accuracy.** Sim(3) ATE moves from
+1.299 m to 1.285 m — 1.1 %, against the 0.404 m gap to Ceres' 0.895 m. SE(3)
+moves 1.601 to 1.555, 2.9 %. Mean reprojection error is unchanged at 0.714 px
+against Ceres' 0.674 px. **The float32 hypothesis is falsified.**
+
+That is a genuinely informative negative, because the probe proves the arithmetic
+is now exact: fp64 CASPAR and Ceres agree to 3 micrometres on a single global BA,
+yet the full pipeline still lands 0.39 m apart. So the remaining gap is not
+rounding, and — per the existing `ceres, loss TRIVIAL` ablation at 0.899 m — not
+the dropped robust loss either. Both candidate explanations are now eliminated by
+measurement. The evidence points instead at **convergence behaviour**: CASPAR
+terminates `NO_CONVERGENCE` even on the small Galileo solve, and colsfm runs it
+across five triangulate / filter / bundle-adjust rounds, so an under-converged
+solve compounds. The persistent 0.04 px reprojection deficit in both CASPAR
+columns, identical across precisions, is the signature of a solver stopping
+short rather than one computing the wrong answer. That is where the next
+investigation should look — CASPAR's PCG tolerance and iteration budget, not its
+number format.
+
+### Verdict
+
+**No. fp64 CASPAR is not both faster than Ceres and as accurate.** It is faster
+than Ceres on KITTI — roughly 3.2x on the mapping stage as measured, 4.2x if the
+contention correction holds — but it keeps essentially all of fp32's 0.4 m
+accuracy loss while giving back a third of fp32's speed advantage. It is the
+worst of the three on the speed/accuracy trade-off: it costs 1.5x fp32's mapping
+time and buys 1.1 % of ATE. On smaller problems it is worse still, losing to CPU
+Ceres outright (9x slower on Galileo), because a GeForce card runs FP64 at 1/64
+rate.
+
+**Recommendation for pinhole datasets: colsfm should keep defaulting to `colsfm`
+with Ceres, and `colsfm-caspar64` should not become anyone's default.** The
+choice is between the two ends, not the middle. Where trajectory accuracy is the
+deliverable, use Ceres — 0.895 m against 1.285-1.299 m is not a rounding
+difference on a 1231 m sequence. Where mapping throughput is the deliverable and
+0.4 m of ATE is acceptable, use `colsfm-caspar` (fp32), which is 4.7x on the
+stage. `colsfm-caspar64` earns its keep only as a **diagnostic**: it is the
+instrument that proved precision was not the problem, and it is the environment
+to reach for when a future CASPAR question needs the arithmetic held exact while
+something else varies. Keep the package and the environment for that purpose;
+do not put a pipeline on it.
