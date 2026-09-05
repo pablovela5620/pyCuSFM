@@ -159,6 +159,9 @@ cuda-version = "13.0.*"
 cuda-cudart = "*"
 # TensorRT engines resolve cuBLAS at load time.
 libcublas = "*"
+# ONNX Runtime's CUDA provider (pycolmap's native ALIKED + LightGlue) needs cuDNN;
+# without it COLMAP's worker thread SIGABRTs and colsfm.features falls back to CPU.
+cudnn = "9.*"
 setuptools = "<78"
 # Gotcha 5 in NOTES.md, hit again here: simplecv -> pyserde<0.32 caps
 # typing-extensions at <4.16, but the conda solve otherwise pins 4.16.0 and the
