@@ -98,9 +98,108 @@ polygraphy = "*"
 rerun-sdk = { version = "==0.37.1", extras = ["catalog"] }
 
 
+# ── colsfm: the open Python + pycolmap pipeline (docs/open-pipeline-plan.md) ──
+# Deliberately `no-default-feature` with its own solve group: the default
+# environment is a fragile CUDA 13 + TensorRT solve around the frozen cuSFM
+# binaries, and nothing here may perturb it.  pycolmap drags in ceres-solver,
+# eigen 5, libopenimageio, glew and a second CUDA runtime; keeping the solve
+# groups apart is what makes that safe.
+# pixi does not feed `__cuda` to the solver unless the environment asks for it,
+# even when `pixi info` reports `__cuda=13.0`.  Without this the cuda_130
+# pycolmap build resolves to "no candidates were found" for `__cuda >=13.0`.
+# pixi 0.77.1 prints a deprecation warning for this table and points at
+# `platforms = [{ name = ..., platform = ..., cuda = ... }]`, but that form is
+# (a) rejected by 0.77.1's own parser ("expected a string, found table") and
+# (b) workspace-scoped, so it would re-solve the default environment.  The
+# warning is accepted deliberately until pixi supports a feature-scoped form.
+[feature.colsfm.system-requirements]
+cuda = "13.0"
+
+[feature.colsfm.dependencies]
+python = "3.12.*"
+# pycolmap 4.2.0 has cpu_*, cuda_129_* and cuda_130_* builds on conda-forge.
+# `cuda-version = "13.0.*"` is NOT enough to pick the CUDA one: the cpu_* build
+# carries no cuda-version constraint at all, so it satisfies the environment and
+# the solver takes it (measured — the first solve here silently installed
+# `pycolmap-4.2.0-cpu_h874a1db_0` and `pycolmap.has_cuda` was False).  The build
+# string is what actually selects it.  pycolmap already depends on
+# `colmap >=4.2.0,<4.3.0a0` (the C++ runtime library), so `colmap` does NOT
+# need to be listed separately — it arrives as a transitive dependency.
+pycolmap = { version = "4.2.0.*", build = "cuda_130*" }
+# On conda-forge (2.6).  Needed for the pose-graph optimiser: pycolmap ships
+# cost functions but no PGO driver, and pyceres is the Ceres binding COLMAP
+# upstream itself uses.  No PyPI fallback is required.
+pyceres = "2.6.*"
+numpy = "*"
+scipy = "*"
+# The conda package for the Python protobuf runtime is `protobuf`
+# (`libprotobuf` is the C++ side).  Needed to read the cuSFM `.pb.txt` configs.
+protobuf = "*"
+pyarrow = "*"
+pillow = "*"
+av = "*"
+# Only for the interoperability probe: `tests/colsfm_probes/test_model_io.py`
+# imports `demo_rerun.read_colmap_model` to check that a pycolmap-written
+# `images.txt` survives the existing hand-rolled parser, and demo_rerun pulls in
+# `pycusfm`, which imports yaml at module scope.
+pyyaml = "*"
+# Same reasoning as the default feature: keep the validated 8.x major.
+ffmpeg = "8.*"
+pytest = "*"
+ruff = "*"
+beartype = "*"
+jaxtyping = "*"
+tyro = "*"
+# Must be `<0.32`, not `*`: simplecv 0.7.2 requires `pyserde>=0.31.2,<0.32`,
+# and a bare `pyserde` lets the conda solver pin 0.32.1 first, after which the
+# PyPI solve has no solution.  Same shape as the typing-extensions cap.
+pyserde = ">=0.31.2,<0.32"
+einops = "*"
+cuda-version = "13.0.*"
+cuda-cudart = "*"
+# TensorRT engines resolve cuBLAS at load time.
+libcublas = "*"
+setuptools = "<78"
+# Gotcha 5 in NOTES.md, hit again here: simplecv -> pyserde<0.32 caps
+# typing-extensions at <4.16, but the conda solve otherwise pins 4.16.0 and the
+# PyPI solve then has no solution.  Declared conda-side, exactly as the default
+# feature does, so that one solver owns the constraint.
+typing-extensions = ">=4.1,<4.16"
+
+[feature.colsfm.pypi-dependencies]
+# Gotcha 1: `10.13.3.9` (no `.post1`) depends on the retired
+# `nvidia-cuda-runtime-cu13==0.0.1` and cannot resolve.
+tensorrt-cu13 = "==10.13.3.9.post1"
+# Pinned exact for the same reason as the default feature: the validating
+# viewer must be >= the writing SDK, and conda-forge lags at 0.37.0.
+rerun-sdk = { version = "==0.37.1", extras = ["catalog"] }
+# Gotcha 4: never `simplecv = "*"` — PyPI's `simplecv` is an unrelated 2013
+# machine-vision package.  Only the monorepo copy has rerun_rig_logger.py.
+simplecv = { git = "https://github.com/rerun-io/examples-monorepo.git", subdirectory = "packages/simplecv" }
+
+# Gotcha 2 is a property of `pycusfm`'s own `pyproject.toml`, which this feature
+# does not install (no editable self-dependency here).  The override is repeated
+# anyway because `[pypi-options]` at the workspace level belongs to the default
+# feature, and a `no-default-feature` environment does not inherit it; without
+# it a future `tensorrt-cu12` edge would silently reintroduce the CUDA 12 stack.
+[feature.colsfm.pypi-options.dependency-overrides]
+tensorrt-cu12 = "==10.13.3.9.post1"
+cuda-toolkit = ">=13,<14"
+
+# The TensorRT wheels ship their `.so` files in `site-packages/tensorrt_libs`,
+# which is on no RPATH.  Appended (not prepended) so that conda-forge's own
+# CUDA libraries keep priority for pycolmap.
+[feature.colsfm.activation.env]
+LD_LIBRARY_PATH = "${CONDA_PREFIX}/lib:${CONDA_PREFIX}/lib/python3.12/site-packages/tensorrt_libs"
+
+[feature.colsfm.tasks]
+colsfm-probe = { cmd = "python -m pytest tests/colsfm_probes -q", description = "Run the pycolmap capability probe suite" }
+colsfm-lint = { cmd = "ruff check tests/colsfm_probes", description = "Lint the pycolmap probe suite" }
+
 [environments]
 raco = { features = ["raco"], no-default-feature = true, solve-group = "raco" }
 bench = { features = ["raco", "bench"], no-default-feature = true }
+colsfm = { features = ["colsfm"], no-default-feature = true, solve-group = "colsfm" }
 
 [activation.env]
 LD_LIBRARY_PATH = "${PIXI_PROJECT_ROOT}/pycusfm/x86_cuda13/lib:${CONDA_PREFIX}/lib/python3.12/site-packages/tensorrt_libs:${CONDA_PREFIX}/lib:/usr/lib/x86_64-linux-gnu"
