@@ -21,15 +21,10 @@ from typing import Annotated, TypeAlias
 
 import tyro
 
-from colsfm.pipeline import (
-    PipelineOptions,
-    PipelineSummary,
-    SelectionOptions,
-    StageResult,
-    run_pipeline,
-    run_stage,
-)
+from colsfm.pipeline import StageResult, run_pipeline, run_stage
+from colsfm.run_config import PipelineOptions, SelectionOptions
 from colsfm.run_lifecycle import SUMMARY_NAME, CheapStageName
+from colsfm.run_report import PipelineSummary
 
 
 @dataclass(frozen=True, slots=True)

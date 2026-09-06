@@ -41,7 +41,9 @@ from colsfm.features import BLOB_MAX_KEYPOINTS, ExtractionReport, FeatureOptions
 from colsfm.frames_meta import FRAMES_META_NAME, CameraParams, FramesMeta, KeyframeMeta, read_frames_meta
 from colsfm.matching import MatchingOptions, MatchReport, match_pairs
 from colsfm.pairs import select_pairs
-from colsfm.pipeline import PipelineOptions, PipelineSummary, run_pipeline
+from colsfm.pipeline import run_pipeline
+from colsfm.run_config import PipelineOptions
+from colsfm.run_report import PipelineSummary
 
 pytest.importorskip("tensorrt", reason="the raco backend needs the tensorrt package")
 pytest.importorskip("cuda.bindings.runtime", reason="the raco backend allocates through cuda-python")

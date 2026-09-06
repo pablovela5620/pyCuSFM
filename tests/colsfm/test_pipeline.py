@@ -29,23 +29,8 @@ from colsfm.export import KEYFRAME_METADATA_SUBPATH, RUNTIME_CSV_NAME, RuntimeRe
 from colsfm.frames_meta import FRAMES_META_NAME, FramesMeta, read_frames_meta
 from colsfm.geometry import MILLIMETRES_PER_METRE
 from colsfm.matching import MatchingOptions, MatchLimitPolicy
-from colsfm.pipeline import (
-    DEFAULT_CONFIG_DIR,
-    ExtrinsicChange,
-    LoopClosureStageResult,
-    LoopEdgeRecord,
-    PipelineOptions,
-    PipelineSummary,
-    PoseGraphStageResult,
-    ResolvedRun,
-    SelectionOptions,
-    StageResult,
-    resolve_run,
-    run_loop_closure_stage,
-    run_pipeline,
-    run_pose_graph_stage,
-    run_stage,
-)
+from colsfm.pipeline import StageResult, run_pipeline, run_stage
+from colsfm.run_config import DEFAULT_CONFIG_DIR, PipelineOptions, ResolvedRun, SelectionOptions, resolve_run
 from colsfm.run_lifecycle import (
     ALL_STAGE_NAMES,
     LOOP_EDGES_NAME,
@@ -58,6 +43,8 @@ from colsfm.run_lifecycle import (
     stage_names,
     timed_stage,
 )
+from colsfm.run_report import ExtrinsicChange, LoopEdgeRecord, PipelineSummary
+from colsfm.stages import LoopClosureStageResult, PoseGraphStageResult, run_loop_closure_stage, run_pose_graph_stage
 
 SMOKE_MIN_INTER_FRAME_DISTANCE_M: float = 0.5
 """`feature_extractor_main`'s own default gate; keeps 34 of Galileo's 226 keyframes."""

@@ -25,8 +25,8 @@ from serde.json import from_json
 
 from colsfm.export import RUNTIME_CSV_NAME, RuntimeRecord, read_runtime_records
 from colsfm.frames_meta import FRAMES_META_NAME
-from colsfm.pipeline import PipelineSummary
 from colsfm.run_lifecycle import KEYFRAME_DIR_NAME, LOOP_EDGES_NAME, SUMMARY_NAME
+from colsfm.run_report import PipelineSummary
 from colsfm.walkthrough import WalkthroughConfig, WalkthroughResult, run_walkthrough
 
 SMOKE_MIN_INTER_FRAME_DISTANCE_M: float = 0.5

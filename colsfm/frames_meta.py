@@ -15,6 +15,12 @@ alike. Only differing fields are written, so fields the pipeline never models �
 round trip untouched, exactly as `update_keyframe_pose_main` preserves them
 (export.md §5.2), and an unedited collection re-serialises byte for byte.
 
+`message` stays a public field on purpose. Hiding it behind a facade would rename
+one attribute and delete nothing: the overlay in `current_message` is what makes
+the typed fields authoritative, and it is already the only path serialisation,
+filtering, `with_camera_to_world` and `with_extrinsics` take. The template is
+readable data, not a second source of truth.
+
 Conventions (export.md §2, keypoints_mapper_main.md §4.3):
 
 - `camera_to_world` **is** `world_T_cam`; axis-angle in degrees, translation in metres.

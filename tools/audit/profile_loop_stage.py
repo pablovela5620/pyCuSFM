@@ -16,10 +16,10 @@ from pathlib import Path
 import tyro
 
 from colsfm.matching import MatchingBackend, MatchingOptions
-from colsfm.pipeline import (
+from colsfm.run_config import PipelineOptions
+from colsfm.stages import (
     KeyframeSelectionStageResult,
     LoopClosureStageResult,
-    PipelineOptions,
     run_keyframe_selection_stage,
     run_loop_closure_stage,
 )

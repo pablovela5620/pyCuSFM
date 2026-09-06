@@ -24,7 +24,9 @@ from colsfm.features import BLOB_MAX_KEYPOINTS, ExtractionReport, FeatureOptions
 from colsfm.frames_meta import CameraParams, FramesMeta, KeyframeMeta
 from colsfm.matching import MatchingOptions, MatchReport, match_pairs
 from colsfm.pairs import select_pairs
-from colsfm.pipeline import PipelineOptions, PipelineSummary, run_pipeline
+from colsfm.pipeline import run_pipeline
+from colsfm.run_config import PipelineOptions
+from colsfm.run_report import PipelineSummary
 
 pytest.importorskip("tensorrt", reason="the TensorRT backends need the tensorrt package")
 pytest.importorskip("cuda.bindings.runtime", reason="the TensorRT backends allocate through cuda-python")

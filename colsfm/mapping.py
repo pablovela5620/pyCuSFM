@@ -148,15 +148,12 @@ inside the pycolmap solve by construction); and `refine_focal_length` must equal
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Final, TypeAlias
+from typing import Final
 
-import numpy as np
 import pycolmap
-from jaxtyping import Bool, Float64
-from numpy import ndarray
 
 from colsfm.ba_backend import (
     BUNDLE_ADJUSTMENT_BACKEND,
@@ -171,14 +168,52 @@ from colsfm.ba_backend import (
 )
 from colsfm.ceres_pose import COLMAP_LINEAR_SOLVER, LinearSolver
 from colsfm.config import BundleAdjustmentConfig, LossFunctionType, VisionMappingConfig
+from colsfm.correspondences import Correspondences, load_correspondences, registered_image_ids
+from colsfm.mapping_result import MappingResult, PolishStats, RoundCallback, RoundStats
+from colsfm.point_filters import (
+    _filter_points,
+    _FilterCounts,
+    filter_degenerate_points,
+    filter_projection_failures,
+    projection_sanity_bound_px,
+)
 from colsfm.reconstruction import (
     RIG_ID,
     PosedModel,
-    RigReference,
     camera_sensor_id,
 )
-from colsfm.reconstruction import num_registered_images as num_observing_images
 from colsfm.solver_report import SolverReport, parse_brief_report
+
+__all__ = [
+    "BaBackend",
+    "CasparOptions",
+    "Correspondences",
+    "MappingOptions",
+    "MappingResult",
+    "PolishStats",
+    "RoundCallback",
+    "RoundStats",
+    "bundle_adjustment_options",
+    "caspar_capability_of",
+    "ceres_polish_options",
+    "filter_degenerate_points",
+    "filter_projection_failures",
+    "load_correspondences",
+    "pixel_error_schedule",
+    "projection_sanity_bound_px",
+    "registered_image_ids",
+    "resolve_ba_backend",
+    "run_mapping",
+    "solve_bundle_adjustment",
+    "triangulator_options",
+]
+"""The mapper's public surface.
+
+`colsfm.mapping` stays the one import path callers use, whichever of its four
+modules a name is defined in: the split is about giving each file one reason to
+change, not about making every caller learn the new layout. `colsfm.mapping` is
+the mapping stage; `colsfm.correspondences`, `colsfm.point_filters` and
+`colsfm.mapping_result` are the pieces it is made of."""
 
 MAPPING_LINEAR_SOLVER: Final[LinearSolver] = "SPARSE_SCHUR"
 """cuSFM's CPU linear solver, and the only one this stage ever wants: a bundle adjustment
@@ -201,82 +236,6 @@ LOSS_FUNCTION_BY_NAME: Final[dict[LossFunctionType, pycolmap.LossFunctionType]] 
     "HUBER": pycolmap.LossFunctionType.HUBER,
 }
 """cuSFM's `loss_type` enum to pycolmap's; the two sets coincide exactly."""
-
-@dataclass(frozen=True, slots=True)
-class RoundStats:
-    """One outer triangulate / filter / bundle-adjust round (§5.4)."""
-
-    round_index: int
-    """Zero-based round number, `k` in the gate schedule."""
-    max_pixel_error: float
-    """The round's reprojection gate `g_k`, in pixels."""
-    num_merged: int
-    """Observations merged by `merge_all_tracks`."""
-    num_completed: int
-    """Observations added by `complete_all_tracks`."""
-    num_filtered: int
-    """Observations dropped by the reprojection, angle, depth and track-length filters."""
-    num_diverged: int
-    """Observations dropped by the degeneracy guard *after* the solve, i.e. points bundle
-    adjustment itself pushed out of bounds. Normally 0; see `filter_degenerate_points`."""
-    num_observations: int
-    """Observations left in the reconstruction after filtering; cuSFM's `num observed`."""
-    observation_change: float
-    """`(merged + completed + filtered) / observations`, the early-exit statistic."""
-    num_points3D: int
-    """Points left after this round's bundle adjustment."""
-    mean_reprojection_error_px: float
-    """Mean reprojection error after this round, in pixels."""
-    ba_num_iterations: int | None
-    """Ceres iterations the solver reported, or None when it reported none.
-
-    None is the normal outcome on the CASPAR backend, which writes no Ceres-shaped
-    report at all. It used to be recorded as 0 iterations at 0.0 cost, which reads
-    as a solve that converged instantly (`colsfm.solver_report`)."""
-    ba_initial_cost: float | None
-    """Ceres cost before the solve, or None. Not cuSFM's logged `Initial cost`,
-    which is a normalised RMS."""
-    ba_final_cost: float | None
-    """Ceres cost after the solve, or None."""
-    ba_termination: str
-    """`CONVERGENCE`, `NO_CONVERGENCE` or `FAILURE`; the solver reports this whatever
-    its report says, so it is not optional."""
-    seconds: float
-    """Wall-clock seconds the round took, bundle adjustment included."""
-
-
-@dataclass(frozen=True, slots=True)
-class PolishStats:
-    """The one Ceres bundle adjustment that finishes a CASPAR mapping run.
-
-    Nothing is merged, completed or filtered around it, so the observation set that
-    goes in is the one that comes out and every number here is the solve's alone
-    (`docs/caspar-build.md` § Shipped: CASPAR + Ceres polish).
-    """
-
-    num_observations: int
-    """Observations the solve parameterised; unchanged by it, since nothing filters."""
-    ba_num_iterations: int | None
-    """Ceres iterations, from `brief_report()`. 22 on KITTI 06 from CASPAR's answer;
-    None if the polish somehow published no report."""
-    ba_initial_cost: float | None
-    """Ceres cost of the model the rounds left behind, or None."""
-    ba_final_cost: float | None
-    """Ceres cost after the polish; 3.4 % below the initial one on KITTI 06. None when
-    the solve published no report."""
-    ba_termination: str
-    """`CONVERGENCE`, `NO_CONVERGENCE` or `FAILURE`."""
-    mean_reprojection_error_before_px: float
-    """Mean reprojection error as CASPAR left it, in pixels."""
-    mean_reprojection_error_after_px: float
-    """Mean reprojection error after the polish, over the same observations."""
-    seconds: float
-    """Wall-clock seconds inside `BundleAdjuster.solve()`; 9.8 s on KITTI 06's 2156 images."""
-
-
-RoundCallback: TypeAlias = Callable[[RoundStats, pycolmap.Reconstruction], None]
-"""What `MappingOptions.round_callback` takes: one round's statistics and the live model."""
-
 
 @dataclass(frozen=True, slots=True)
 class MappingOptions:
@@ -344,168 +303,6 @@ class MappingOptions:
     scraping `verbose` output. It runs *before* the early-exit check, so the last
     round is always reported. Nothing in the mapper reads what it returns, and a
     callback that raises aborts the mapping — it is a plain call, not a try/except."""
-
-
-@dataclass(slots=True)
-class Correspondences:
-    """The correspondence graph a triangulator needs, kept alive alongside its owner.
-
-    `IncrementalTriangulator` holds raw references to the graph and the
-    reconstruction, so the `DatabaseCache` that owns the graph has to outlive
-    both. Keeping all three in one object is what guarantees that.
-    """
-
-    database_cache: pycolmap.DatabaseCache
-    """Owns the correspondence graph; must outlive every triangulator built on it."""
-    graph: pycolmap.CorrespondenceGraph
-    """Keypoint correspondences from the database's verified two-view geometries."""
-    observation_manager: pycolmap.ObservationManager
-    """Bookkeeping for observations and the filters, bound to the reconstruction."""
-    num_images: int
-    """Images the database contributed correspondences for."""
-    num_image_pairs: int
-    """Verified image pairs that survived `min_num_matches`."""
-
-
-@dataclass(frozen=True, slots=True)
-class MappingResult:
-    """What `run_mapping` produced, and how long each phase took.
-
-    Every count is a **property** computed from `reconstruction` on demand, not a
-    number copied out of it at return time. `colsfm.extrinsic_refinement` keeps
-    adjusting the very same model after `run_mapping` has returned, and a stored
-    count would then be quietly describing a model that no longer exists.
-    """
-
-    reconstruction: pycolmap.Reconstruction
-    """The adjusted reconstruction; the same object that was passed in."""
-    reference: RigReference
-    """Where the rig origin sits, carried through from the `PosedModel` that was mapped."""
-    rounds: tuple[RoundStats, ...]
-    """Per-round statistics, in order."""
-    correspondence_seconds: float
-    """Time spent loading keypoints and two-view geometries from the database."""
-    triangulation_seconds: float
-    """Time spent in the initial triangulation passes."""
-    bundle_adjustment_seconds: float
-    """Time spent inside `BundleAdjuster.solve`, summed over the rounds and the polish."""
-    total_seconds: float
-    """Wall-clock seconds for the whole call."""
-    extrinsics_refined: bool = False
-    """Whether this pass refined `sensor_from_rig`; what makes `refined_extrinsics`
-    something other than the input calibration read back out of the rig."""
-    ba_backend: BaBackend = "ceres"
-    """Which backend the solves actually ran on — `ceres` whenever one of the three
-    fallbacks of `MappingOptions.ba_backend` fired, so this is evidence rather than a
-    request."""
-    ba_fallback_reason: str | None = None
-    """Why `ba_backend` is not what was asked for, or None when it is.
-
-    The three sentences of `colsfm.ba_backend`: an unsupported camera model,
-    `optimize_extrinsics`, or a pycolmap built without CASPAR_ENABLED. Recorded
-    rather than only printed, so `summary.json` says why a run that asked for the
-    GPU backend solved on the CPU."""
-    polish: PolishStats | None = None
-    """The closing Ceres solve of a CASPAR run, or None when none ran.
-
-    None means either `ba_backend == "ceres"` — a fallback included, since a Ceres
-    run is already at its own fixed point — or `caspar_ceres_polish` switched off.
-    Its seconds are part of `bundle_adjustment_seconds`."""
-
-    @property
-    def num_registered_images(self) -> int:
-        """Images belonging to a registered frame, whether or not they see a point.
-
-        Returns:
-            The count `registered_image_ids` reports, which is every image of a
-            `build_reconstruction` model.
-        """
-        return len(registered_image_ids(self.reconstruction))
-
-    @property
-    def num_images_with_observations(self) -> int:
-        """Images that observe at least one point; what a COLMAP export writes out.
-
-        Returns:
-            `colsfm.reconstruction.num_registered_images` of this model — the other,
-            narrower sense of "registered"; see that function.
-        """
-        return num_observing_images(self.reconstruction)
-
-    @property
-    def num_points3D(self) -> int:
-        """Triangulated points that survived every filter.
-
-        Returns:
-            The point count.
-        """
-        return self.reconstruction.num_points3D()
-
-    @property
-    def num_observations(self) -> int:
-        """Point-to-image observations in the final map.
-
-        Returns:
-            The observation count.
-        """
-        return self.reconstruction.compute_num_observations()
-
-    @property
-    def mean_reprojection_error_px(self) -> float:
-        """Mean reprojection error over all observations, in pixels.
-
-        Returns:
-            The mean error; valid only after `update_point_3d_errors`, which
-            `run_mapping` calls at the end of every round.
-        """
-        return self.reconstruction.compute_mean_reprojection_error()
-
-    @property
-    def mean_track_length(self) -> float:
-        """Mean observations per point; cuSFM's `Mean length`.
-
-        Returns:
-            The mean track length.
-        """
-        return self.reconstruction.compute_mean_track_length()
-
-    @property
-    def refined_extrinsics(self) -> dict[int, pycolmap.Rigid3d] | None:
-        """`vehicle_T_cam` per `camera_params_id` after the solve.
-
-        Returns:
-            The extrinsics read back out of the adjusted rig, or None when nothing
-            refined them — either because `optimize_extrinsics` was off or because
-            the rig is vehicle-referenced, which COLMAP would freeze anyway. The
-            reference camera's entry is the input one exactly: it is the rig origin,
-            so bundle adjustment holds no block for it.
-        """
-        if not self.extrinsics_refined or self.reference.camera_params_id is None:
-            return None
-        return self.reference.vehicle_T_cam_by_camera_params_id(self.reconstruction)
-
-
-@dataclass(frozen=True, slots=True)
-class _FilterCounts:
-    """Observations removed by one round's filters, split by cause."""
-
-    reprojection_and_angle: int = 0
-    """Dropped by `filter_all_points3D` (reprojection, negative depth, triangulation angle)."""
-    negative_depth: int = 0
-    """Dropped by the explicit cheirality pass."""
-    short_track: int = 0
-    """Dropped for having fewer than `min_correspondences` observations."""
-    degenerate: int = 0
-    """Dropped by the pre-solve guard: the world-Z cap, a non-finite coordinate or a
-    coordinate whose magnitude exceeds `depth_threshold`."""
-
-    def total(self) -> int:
-        """Total observations removed.
-
-        Returns:
-            The sum of every cause.
-        """
-        return self.reprojection_and_angle + self.negative_depth + self.short_track + self.degenerate
 
 
 def pixel_error_schedule(mapping_config: VisionMappingConfig) -> tuple[float, ...]:
@@ -680,91 +477,6 @@ def ceres_polish_options(
     return bundle_adjustment_options(ba_config, replace(options, ba_backend="ceres"), reconstruction)
 
 
-def load_correspondences(
-    reconstruction: pycolmap.Reconstruction,
-    database_path: Path,
-    min_num_matches: int = 0,
-) -> Correspondences:
-    """Load keypoints and verified two-view geometries into the reconstruction.
-
-    The database's keypoints become each image's `points2D` and its verified
-    two-view geometries become the correspondence graph the triangulator walks.
-    Nothing is re-estimated: the images already carry poses, and COLMAP's
-    `DatabaseCache` is used only for the keypoints and the graph.
-
-    Database image ids must equal the reconstruction's, because the graph is
-    keyed by them. Both come from cuSFM's keyframe ids, so they agree by
-    construction; a mismatch is a bug in whoever wrote the database and is
-    reported rather than silently mis-triangulated.
-
-    Args:
-        reconstruction: A reconstruction with registered, pose-carrying frames.
-        database_path: COLMAP database written by the feature and matching stages.
-        min_num_matches: Drop image pairs with fewer inlier matches; cuSFM's
-            `min_num_matches_per_pair`.
-
-    Returns:
-        The graph, the observation manager and the cache that owns them.
-
-    Raises:
-        FileNotFoundError: When the database does not exist.
-        ValueError: When a database image name maps to a different id than the
-            reconstruction's, or when the database holds none of its images.
-    """
-    if not database_path.is_file():
-        raise FileNotFoundError(f"No COLMAP database at {database_path}")
-    cache_options: pycolmap.DatabaseCacheOptions = pycolmap.DatabaseCacheOptions()
-    cache_options.min_num_matches = min_num_matches
-    cache_options.ignore_watermarks = False
-    cache_options.image_names = {image.name for image in reconstruction.images.values()}
-    with pycolmap.Database.open(database_path) as database:
-        database_cache: pycolmap.DatabaseCache = pycolmap.DatabaseCache.create(database, cache_options)
-
-    image_id_by_name: dict[str, int] = {image.name: image_id for image_id, image in reconstruction.images.items()}
-    mismatched: list[str] = []
-    num_loaded: int = 0
-    for image_id, cached_image in database_cache.images.items():
-        expected_image_id: int | None = image_id_by_name.get(cached_image.name)
-        if expected_image_id is None:
-            continue
-        if expected_image_id != image_id:
-            mismatched.append(f"{cached_image.name}: database id {image_id}, reconstruction id {expected_image_id}")
-            continue
-        reconstruction.image(image_id).points2D = cached_image.points2D
-        num_loaded += 1
-    if mismatched:
-        raise ValueError(f"Database and reconstruction disagree on image ids: {mismatched[:5]}")
-    if num_loaded == 0:
-        raise ValueError(f"{database_path} holds none of the reconstruction's {reconstruction.num_images()} images")
-
-    graph: pycolmap.CorrespondenceGraph = database_cache.correspondence_graph
-    observation_manager: pycolmap.ObservationManager = pycolmap.ObservationManager(reconstruction, graph)
-    return Correspondences(
-        database_cache=database_cache,
-        graph=graph,
-        observation_manager=observation_manager,
-        num_images=num_loaded,
-        num_image_pairs=graph.num_image_pairs(),
-    )
-
-
-def registered_image_ids(reconstruction: pycolmap.Reconstruction) -> list[int]:
-    """Image ids belonging to a registered frame, ascending.
-
-    Args:
-        reconstruction: The model.
-
-    Returns:
-        Sorted image ids.
-    """
-    image_ids: list[int] = []
-    for frame_id in reconstruction.reg_frame_ids():
-        for data_id in reconstruction.frame(frame_id).data_ids:
-            if data_id.sensor_id.type == pycolmap.SensorType.CAMERA:
-                image_ids.append(data_id.id)
-    return sorted(image_ids)
-
-
 def _triangulate(
     triangulator: pycolmap.IncrementalTriangulator,
     image_ids: Sequence[int],
@@ -797,152 +509,6 @@ def _triangulate(
         if added == 0:
             break
     return total
-
-
-def filter_degenerate_points(
-    observation_manager: pycolmap.ObservationManager,
-    reconstruction: pycolmap.Reconstruction,
-    depth_threshold: float,
-) -> int:
-    """Delete every point whose world position is non-finite or out of bounds.
-
-    A point goes when any coordinate is NaN or infinite, or when the largest
-    coordinate magnitude exceeds `depth_threshold`. That is deliberately stricter
-    than cuSFM, whose only spatial filter is a one-sided cap on the world Z axis
-    (keypoints_mapper_main.md §5.5); a bound on all three axes and both signs
-    subsumes it, and cuSFM's asymmetry looks like an oversight rather than a
-    design. On Galileo the difference is nothing — the guard removes 0 points in
-    all five rounds.
-
-    Two things make the guard necessary, and neither is caught by COLMAP's own
-    filters:
-
-    1. **NaN is invisible to every threshold test.** They all ask
-       `error > threshold`, and any comparison against NaN is false, so a NaN
-       point survives filtering and then poisons the whole normal equation.
-    2. **A converged solve can still throw a point to infinity.** Measured on 200
-       RoboCap rig frames: round 0's bundle adjustment reports CONVERGENCE and
-       halves its cost while pushing 5 of 31 017 points out to 4941 m. Under the
-       fisheye model those points project next to the projection singularity, so
-       their reprojection error comes out at 4.5e153 px — which is where the
-       round's reported mean of 1.4e149 px came from. The pre-solve filter alone
-       cannot help: the model going *into* that solve was clean (max error
-       22.4 px). The guard therefore runs after the solve as well as before it.
-
-    Args:
-        observation_manager: Bookkeeping bound to the reconstruction.
-        reconstruction: The model to filter, edited in place.
-        depth_threshold: `vision_mapping_config.depth_threshold`, in metres.
-
-    Returns:
-        Observations removed, i.e. the summed track length of the deleted points.
-    """
-    point3D_ids: list[int] = list(reconstruction.points3D)
-    if not point3D_ids:
-        return 0
-    points_xyz: Float64[ndarray, "num_points 3"] = np.array(
-        [reconstruction.point3D(point3D_id).xyz for point3D_id in point3D_ids], dtype=np.float64
-    )
-    # `np.abs(nan) > threshold` is False, so the finiteness term has to carry the NaNs.
-    out_of_bounds: Bool[ndarray, "num_points"] = ~np.isfinite(points_xyz).all(axis=1) | (
-        np.abs(points_xyz).max(axis=1) > depth_threshold
-    )
-    removed: int = 0
-    for point3D_id in np.asarray(point3D_ids)[out_of_bounds].tolist():
-        removed += reconstruction.point3D(point3D_id).track.length()
-        observation_manager.delete_point3D(point3D_id)
-    return removed
-
-
-def projection_sanity_bound_px(reconstruction: pycolmap.Reconstruction) -> float:
-    """The largest reprojection error that can still be a measurement.
-
-    Args:
-        reconstruction: The model, for its cameras' pixel dimensions.
-
-    Returns:
-        The longest image side over every camera, or 0.0 for a model without
-        cameras. An observation further than a whole image from its point is not
-        a bad measurement, it is a failed projection.
-    """
-    sides: list[float] = [float(max(camera.width, camera.height)) for camera in reconstruction.cameras.values()]
-    return max(sides) if sides else 0.0
-
-
-def filter_projection_failures(
-    observation_manager: pycolmap.ObservationManager, reconstruction: pycolmap.Reconstruction
-) -> int:
-    """Drop observations a solve has made unprojectable, at a numeric-sanity bound.
-
-    Not a quality filter — the round's own gate (25 down to 5 px) is far tighter
-    and owns that job. This only catches projection *failures*, at
-    `projection_sanity_bound_px`, and it exists because bundle adjustment can
-    produce them out of a clean model:
-
-    On RoboCap's 4528 fisheye images, 4 points of 209 905 end up within
-    5-90 mm of a camera centre — one of them at **negative** depth. At that
-    distance `OPENCV_FISHEYE` projects them thousands of image widths away and
-    their reprojection error comes out at 4.5e153 px, which is where the
-    `1e152 px` mean and the CHOLMOD "not positive definite" warnings in the first
-    three rounds came from. The model going *into* each of those solves was clean
-    (max 23.5 px), so no pre-solve filter can prevent it.
-
-    Deleting them now rather than in the next round changes no result — the next
-    gate is at most 25 px, so anything above a whole image width was already
-    doomed — but it keeps the round's reported metric meaningful and keeps the
-    next solve from linearising the same singularity.
-
-    Args:
-        observation_manager: Bookkeeping bound to the reconstruction.
-        reconstruction: The model to filter, edited in place.
-
-    Returns:
-        Observations removed.
-    """
-    bound_px: float = projection_sanity_bound_px(reconstruction)
-    if bound_px <= 0.0:
-        return 0
-    # `filter_points3D` covers reprojection error, cheirality and triangulation angle;
-    # a zero angle threshold switches the last of the three off, leaving the two that
-    # describe a failed projection.
-    return observation_manager.filter_points3D(bound_px, 0.0, set(reconstruction.points3D))
-
-
-def _filter_points(
-    observation_manager: pycolmap.ObservationManager,
-    reconstruction: pycolmap.Reconstruction,
-    mapping_config: VisionMappingConfig,
-    max_pixel_error: float,
-) -> _FilterCounts:
-    """Apply cuSFM's point filters for one round, before its bundle adjustment (§5.4-§5.5).
-
-    The reprojection gate decays per round; the triangulation angle is the max
-    over observing pairs, matching cuSFM's `HasLargeEnoughTriangulateAngle`; the
-    depth test is a **world Z** cap, one axis and one-sided, not a camera depth.
-    `filter_degenerate_points` adds the non-finite and absurd-coordinate guard
-    cuSFM has no equivalent of; see its docstring.
-
-    Args:
-        observation_manager: Bookkeeping bound to the reconstruction.
-        reconstruction: The model to filter.
-        mapping_config: The mapping configuration.
-        max_pixel_error: The round's gate, in pixels.
-
-    Returns:
-        Observations removed, split by cause.
-    """
-    reprojection_and_angle: int = observation_manager.filter_all_points3D(
-        max_pixel_error, mapping_config.min_triangulation_deg
-    )
-    negative_depth: int = observation_manager.filter_observations_with_negative_depth()
-    short_track: int = observation_manager.filter_points3D_with_short_tracks(mapping_config.min_correspondences)
-    degenerate: int = filter_degenerate_points(observation_manager, reconstruction, mapping_config.depth_threshold)
-    return _FilterCounts(
-        reprojection_and_angle=reprojection_and_angle,
-        negative_depth=negative_depth,
-        short_track=short_track,
-        degenerate=degenerate,
-    )
 
 
 def solve_bundle_adjustment(

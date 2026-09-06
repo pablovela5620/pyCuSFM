@@ -54,8 +54,8 @@ from colsfm.mapping import (
     registered_image_ids,
     solve_bundle_adjustment,
 )
-from colsfm.pipeline import optimised_camera_poses
 from colsfm.solver_report import SolverReport, parse_brief_report
+from colsfm.stages import optimised_camera_poses
 
 Positions: TypeAlias = Float64[ndarray, "n 3"]
 
