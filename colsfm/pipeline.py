@@ -810,15 +810,7 @@ def run_keyframe_selection_stage(options: PipelineOptions) -> KeyframeSelectionS
     )
 
 
-@dataclass(frozen=True, slots=True)
-class FeatureExtractionStageResult:
-    """Stage 2: what ALIKED stored in the freshly created database."""
-
-    report: ExtractionReport
-    """Per-image keypoint counts, the device used and the wall time."""
-
-
-def run_feature_extraction_stage(options: PipelineOptions, selected: FramesMeta) -> FeatureExtractionStageResult:
+def run_feature_extraction_stage(options: PipelineOptions, selected: FramesMeta) -> ExtractionReport:
     """Create the COLMAP database and run ALIKED over the selected keyframes.
 
     Args:
@@ -827,7 +819,8 @@ def run_feature_extraction_stage(options: PipelineOptions, selected: FramesMeta)
         selected: The collection keyframe selection kept.
 
     Returns:
-        The extraction report.
+        The extraction report: per-image keypoint counts, the device used and the
+        wall time.
 
     Raises:
         FileNotFoundError: When the image root is missing.
@@ -836,24 +829,15 @@ def run_feature_extraction_stage(options: PipelineOptions, selected: FramesMeta)
     feature_options: FeatureOptions = FeatureOptions(
         backend=options.features_backend, num_threads=options.num_threads, device=options.device
     )
-    report: ExtractionReport = extract_features(
+    return extract_features(
         options.database_path,
         options.input_dir,
         [keyframe.image_name for keyframe in selected.keyframes],
         feature_options,
     )
-    return FeatureExtractionStageResult(report=report)
 
 
-@dataclass(frozen=True, slots=True)
-class PairSelectionStageResult:
-    """Stage 3: the consecutive and stereo pairs the matcher will be given."""
-
-    pairs: list[ImagePair]
-    """Normalised, deduplicated, sorted image pairs; no loop pair is here yet."""
-
-
-def run_pair_selection_stage(selected: FramesMeta, config: CusfmConfig) -> PairSelectionStageResult:
+def run_pair_selection_stage(selected: FramesMeta, config: CusfmConfig) -> list[ImagePair]:
     """Enumerate the pairs `feature_matcher_task_builder_main` would have written.
 
     Args:
@@ -861,7 +845,7 @@ def run_pair_selection_stage(selected: FramesMeta, config: CusfmConfig) -> PairS
         config: The config profile, for `connected_keyframe_num`.
 
     Returns:
-        The pair list.
+        The normalised, deduplicated, sorted image pairs; no loop pair is here yet.
 
     Raises:
         ValueError: When `connected_keyframe_num` is below 1.
@@ -871,20 +855,12 @@ def run_pair_selection_stage(selected: FramesMeta, config: CusfmConfig) -> PairS
         f"[colsfm] {len(pairs)} pairs from connected_keyframe_num="
         f"{config.pose_graph.connected_keyframe_num} and {len(selected.stereo_pairs)} stereo declarations"
     )
-    return PairSelectionStageResult(pairs=pairs)
-
-
-@dataclass(frozen=True, slots=True)
-class MatchingStageResult:
-    """Stage 4: LightGlue matches and their verified two-view geometries."""
-
-    report: MatchReport
-    """Per-pair raw and inlier counts, the device used and the wall time."""
+    return pairs
 
 
 def run_matching_stage(
     options: PipelineOptions, pairs: Sequence[ImagePair], matching_options: MatchingOptions
-) -> MatchingStageResult:
+) -> MatchReport:
     """Match and verify every selected pair into the database.
 
     Args:
@@ -893,9 +869,10 @@ def run_matching_stage(
         matching_options: Matching and verification settings.
 
     Returns:
-        The match report.
+        The match report: per-pair raw and inlier counts, the device used and the
+        wall time.
     """
-    return MatchingStageResult(report=match_pairs(options.database_path, list(pairs), matching_options))
+    return match_pairs(options.database_path, list(pairs), matching_options)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1091,17 +1068,9 @@ def run_pose_graph_stage(
     )
 
 
-@dataclass(frozen=True, slots=True)
-class ReconstructionStageResult:
-    """Stage 7: the triangulated, bundle-adjusted model."""
-
-    mapping: MappingResult
-    """The adjusted reconstruction, its rig reference and the per-round statistics."""
-
-
 def run_reconstruction_stage(
     options: PipelineOptions, pose_graph_meta: FramesMeta, config: CusfmConfig, mapping_options: MappingOptions
-) -> ReconstructionStageResult:
+) -> MappingResult:
     """Triangulate and bundle-adjust the pose-graph poses.
 
     With `--optimize-extrinsics` the reconstruction is built on the **gauge
@@ -1118,7 +1087,7 @@ def run_reconstruction_stage(
         mapping_options: Command-line style mapper knobs.
 
     Returns:
-        The mapping result.
+        The adjusted reconstruction, its rig reference and the per-round statistics.
 
     Raises:
         FileNotFoundError: When the database does not exist.
@@ -1130,7 +1099,7 @@ def run_reconstruction_stage(
     model: PosedModel = build_reconstruction(pose_graph_meta, reference_camera_params_id=reference_camera_params_id)
     mapping: MappingResult = run_mapping(model, options.database_path, config.vision_mapping, mapping_options)
     _print_mapping(mapping)
-    return ReconstructionStageResult(mapping=mapping)
+    return mapping
 
 
 @dataclass(frozen=True, slots=True)
@@ -1247,15 +1216,138 @@ def run_export_stage(options: PipelineOptions, mapped_meta: FramesMeta, mapping:
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════
+# the observer
+# ══════════════════════════════════════════════════════════════════════════════════════
+
+
+class PipelineObserver:
+    """What a bystander is told while `run_pipeline` runs; every method a no-op.
+
+    The one seam a viewer, a notebook or a report needs to watch a run without
+    re-sequencing it. Each `on_*` method is handed the stage's own typed result,
+    *after* its timing window has closed, so nothing an observer does lands in
+    `runtime.csv`; `stage_scope` is the only hook inside the window, and exists
+    because the stage functions print their counters rather than returning them.
+
+    Two ordering guarantees the visualisation depends on:
+
+    * `on_reconstruction` runs before stage 7b starts, so an observer that wants
+      the un-refined model sees it before the refinement mutates it in place.
+    * `on_export` runs after `run_export_stage` has written every artifact, so a
+      reader may open them.
+
+    Subclass and override what you need. The base class is what `run_pipeline`
+    uses when no observer is passed.
+    """
+
+    def run_started(self, options: PipelineOptions, stages: tuple[StageName, ...]) -> None:
+        """Announce the run before stage 1.
+
+        Args:
+            options: The options the run will execute.
+            stages: The stages it will record, in order.
+        """
+
+    def stage_scope(self, stage: StageName) -> contextlib.AbstractContextManager[None]:
+        """Wrap one stage's body, inside its timing window.
+
+        Args:
+            stage: The stage about to run.
+
+        Returns:
+            A context manager entered around the stage call; the default does
+            nothing. An observer that wants a stage's console output redirects
+            stdout here.
+        """
+        return contextlib.nullcontext()
+
+    def on_keyframe_selection(self, result: KeyframeSelectionStageResult) -> None:
+        """Stage 1 finished.
+
+        Args:
+            result: The configuration read, the input collection and the selection.
+        """
+
+    def on_feature_extraction(self, report: ExtractionReport) -> None:
+        """Stage 2 finished.
+
+        Args:
+            report: Per-image keypoint counts, the device used and the wall time.
+        """
+
+    def on_pair_selection(self, pairs: Sequence[ImagePair]) -> None:
+        """Stage 3 finished.
+
+        Args:
+            pairs: The consecutive and stereo pairs the matcher will be given.
+        """
+
+    def on_matching(self, report: MatchReport) -> None:
+        """Stage 4 finished.
+
+        Args:
+            report: Per-pair raw and inlier counts, the device used and the wall time.
+        """
+
+    def on_loop_closure(self, result: LoopClosureStageResult) -> None:
+        """Stage 5 finished.
+
+        Args:
+            result: The gated loop edges, the extra pairs matched and the diagnostics.
+        """
+
+    def on_pose_graph(self, result: PoseGraphStageResult) -> None:
+        """Stage 6 finished.
+
+        Args:
+            result: The nodes, the edges, the re-posed collection and the largest move.
+        """
+
+    def on_reconstruction(self, mapping: MappingResult) -> None:
+        """Stage 7 finished, before stage 7b may refine the same model in place.
+
+        Args:
+            mapping: The triangulated, bundle-adjusted model and its round statistics.
+        """
+
+    def on_extrinsic_refinement(self, result: ExtrinsicRefinementStageResult) -> None:
+        """Stage 7b finished; only called when `--optimize-extrinsics` is set.
+
+        Args:
+            result: The refined model, the re-calibrated collection and the movement.
+        """
+
+    def on_export(self, result: ExportStageResult, mapping: MappingResult) -> None:
+        """Stage 8 finished and every artifact but `summary.json` is on disk.
+
+        Args:
+            result: The exported collection and what was written.
+            mapping: The final mapping result the export was made from.
+        """
+
+    def run_finished(self, summary: PipelineSummary) -> None:
+        """The run is over and `summary.json` is written.
+
+        Args:
+            summary: What the run produced and how long each stage took.
+        """
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════
 # the run
 # ══════════════════════════════════════════════════════════════════════════════════════
 
 
-def run_pipeline(options: PipelineOptions) -> PipelineSummary:
+def run_pipeline(options: PipelineOptions, observer: PipelineObserver | None = None) -> PipelineSummary:
     """Run every stage and write cuSFM's outputs into `options.output_dir`.
+
+    The only sequencer in the package: a caller that wants to watch a run — the
+    Rerun walkthrough, a notebook — passes an observer rather than composing the
+    stage functions itself.
 
     Args:
         options: Input, output, config and the per-stage knobs.
+        observer: Told about each stage as it completes; None watches nothing.
 
     Returns:
         The run's summary, which is also written to `<output_dir>/summary.json`.
@@ -1264,31 +1356,37 @@ def run_pipeline(options: PipelineOptions) -> PipelineSummary:
         FileNotFoundError: When the input metadata or a config file is missing.
         ValueError: When a stage cannot proceed, e.g. no keyframe survives selection.
     """
+    watcher: PipelineObserver = PipelineObserver() if observer is None else observer
     started: float = time.perf_counter()
     if not options.frames_meta_path.is_file():
         raise FileNotFoundError(f"No {FRAMES_META_NAME} at {options.frames_meta_path}")
     options.output_dir.mkdir(parents=True, exist_ok=True)
     (options.output_dir / RUNTIME_CSV_NAME).unlink(missing_ok=True)
-    clock: StageClock = StageClock(output_dir=options.output_dir, stages=stage_names(options.optimize_extrinsics))
+    stages: tuple[StageName, ...] = stage_names(options.optimize_extrinsics)
+    clock: StageClock = StageClock(output_dir=options.output_dir, stages=stages)
     print(f"[colsfm] config {options.config_dir} | input {options.input_dir} | output {options.output_dir}")
+    watcher.run_started(options, stages)
 
     # ── 1. keyframe selection ────────────────────────────────────────────────────────
-    with timed_stage(clock, "keyframe_selection"):
+    with timed_stage(clock, "keyframe_selection"), watcher.stage_scope("keyframe_selection"):
         selection: KeyframeSelectionStageResult = run_keyframe_selection_stage(options)
         write_frames_meta(options.output_dir / KEYFRAME_DIR_NAME / FRAMES_META_NAME, selection.selected)
         print(
             f"[colsfm] selected {len(selection.selected.keyframes)}/{len(selection.frames_meta.keyframes)} keyframes "
             f"in {len(selection.rig_frames)} rig frames over {len(selection.selected.cameras)} cameras"
         )
+    watcher.on_keyframe_selection(selection)
     config: CusfmConfig = selection.config
 
     # ── 2. feature extraction ────────────────────────────────────────────────────────
-    with timed_stage(clock, "feature_extraction"):
-        extraction: FeatureExtractionStageResult = run_feature_extraction_stage(options, selection.selected)
+    with timed_stage(clock, "feature_extraction"), watcher.stage_scope("feature_extraction"):
+        extraction: ExtractionReport = run_feature_extraction_stage(options, selection.selected)
+    watcher.on_feature_extraction(extraction)
 
     # ── 3. pair selection ────────────────────────────────────────────────────────────
-    with timed_stage(clock, "pair_selection"):
-        pair_selection: PairSelectionStageResult = run_pair_selection_stage(selection.selected, config)
+    with timed_stage(clock, "pair_selection"), watcher.stage_scope("pair_selection"):
+        pairs: list[ImagePair] = run_pair_selection_stage(selection.selected, config)
+    watcher.on_pair_selection(pairs)
 
     # ── 4. matching and verification ─────────────────────────────────────────────────
     matching_options: MatchingOptions = MatchingOptions(
@@ -1300,18 +1398,21 @@ def run_pipeline(options: PipelineOptions) -> PipelineSummary:
         max_matches_per_pair=options.max_matches_per_pair,
         match_cap_mode=options.match_cap_mode,
     )
-    with timed_stage(clock, "matching"):
-        matching: MatchingStageResult = run_matching_stage(options, pair_selection.pairs, matching_options)
+    with timed_stage(clock, "matching"), watcher.stage_scope("matching"):
+        matching: MatchReport = run_matching_stage(options, pairs, matching_options)
+    watcher.on_matching(matching)
 
     # ── 5. loop closure ──────────────────────────────────────────────────────────────
-    with timed_stage(clock, "loop_closure"):
+    with timed_stage(clock, "loop_closure"), watcher.stage_scope("loop_closure"):
         loops: LoopClosureStageResult = run_loop_closure_stage(
             selection.selected, options.database_path, config.pose_graph, matching_options, enabled=options.loop_closure
         )
+    watcher.on_loop_closure(loops)
 
     # ── 6. pose graph ────────────────────────────────────────────────────────────────
-    with timed_stage(clock, "pose_graph"):
+    with timed_stage(clock, "pose_graph"), watcher.stage_scope("pose_graph"):
         pose_graph: PoseGraphStageResult = run_pose_graph_stage(options, selection.selected, config, loops.edges)
+    watcher.on_pose_graph(pose_graph)
 
     mapping_options: MappingOptions = MappingOptions(
         num_threads=options.ba_num_threads,
@@ -1322,29 +1423,33 @@ def run_pipeline(options: PipelineOptions) -> PipelineSummary:
     )
 
     # ── 7. triangulation and bundle adjustment ───────────────────────────────────────
-    with timed_stage(clock, "reconstruction"):
-        reconstruction: ReconstructionStageResult = run_reconstruction_stage(
+    with timed_stage(clock, "reconstruction"), watcher.stage_scope("reconstruction"):
+        reconstruction: MappingResult = run_reconstruction_stage(
             options, pose_graph.frames_meta, config, mapping_options
         )
+    # Before 7b: the refinement adjusts this very reconstruction in place.
+    watcher.on_reconstruction(reconstruction)
 
     # ── 7b. extrinsic refinement ─────────────────────────────────────────────────────
-    mapping: MappingResult = reconstruction.mapping
+    mapping: MappingResult = reconstruction
     mapped_meta: FramesMeta = pose_graph.frames_meta
     changes: tuple[ExtrinsicChange, ...] = ()
     rounds_run: int = 0
     if options.optimize_extrinsics:
-        with timed_stage(clock, EXTRINSIC_REFINEMENT_STAGE):
+        with timed_stage(clock, EXTRINSIC_REFINEMENT_STAGE), watcher.stage_scope(EXTRINSIC_REFINEMENT_STAGE):
             refinement: ExtrinsicRefinementStageResult = run_extrinsic_refinement_stage(
                 options, pose_graph.frames_meta, config, mapping_options, mapping
             )
-            mapping = refinement.mapping
-            mapped_meta = refinement.frames_meta
-            changes = refinement.changes
-            rounds_run = refinement.rounds_run
+        watcher.on_extrinsic_refinement(refinement)
+        mapping = refinement.mapping
+        mapped_meta = refinement.frames_meta
+        changes = refinement.changes
+        rounds_run = refinement.rounds_run
 
     # ── 8. export ────────────────────────────────────────────────────────────────────
-    with timed_stage(clock, "export"):
-        run_export_stage(options, mapped_meta, mapping)
+    with timed_stage(clock, "export"), watcher.stage_scope("export"):
+        export: ExportStageResult = run_export_stage(options, mapped_meta, mapping)
+    watcher.on_export(export, mapping)
 
     summary: PipelineSummary = PipelineSummary(
         options=options,
@@ -1352,7 +1457,7 @@ def run_pipeline(options: PipelineOptions) -> PipelineSummary:
         num_input_keyframes=len(selection.frames_meta.keyframes),
         num_selected_keyframes=len(selection.selected.keyframes),
         num_rig_frames=len(selection.rig_frames),
-        num_pairs=len(pair_selection.pairs),
+        num_pairs=len(pairs),
         num_loop_pairs=loops.num_pairs_matched,
         num_loop_edges=len(loops.edges),
         num_pose_graph_edges=len(pose_graph.edges),
@@ -1367,9 +1472,10 @@ def run_pipeline(options: PipelineOptions) -> PipelineSummary:
     print(
         f"[colsfm] done in {summary.total_seconds:.2f}s | "
         f"{summary.mapping.num_images_with_observations} images, {summary.mapping.num_points3D} points, "
-        f"{summary.mapping.mean_reprojection_error_px:.4f} px | extraction on {extraction.report.device}, "
-        f"{matching.report.empty_pairs} empty pairs"
+        f"{summary.mapping.mean_reprojection_error_px:.4f} px | extraction on {extraction.device}, "
+        f"{matching.empty_pairs} empty pairs"
     )
+    watcher.run_finished(summary)
     return summary
 
 
@@ -1403,7 +1509,7 @@ def run_stage(options: PipelineOptions, stage: CheapStageName) -> StageResult:
     """
     selection: KeyframeSelectionStageResult = run_keyframe_selection_stage(options)
     pairs: list[ImagePair] = (
-        run_pair_selection_stage(selection.selected, selection.config).pairs if stage == "pair_selection" else []
+        run_pair_selection_stage(selection.selected, selection.config) if stage == "pair_selection" else []
     )
     rig_frames: tuple[RigFrame, ...] = selection.rig_frames
     print(

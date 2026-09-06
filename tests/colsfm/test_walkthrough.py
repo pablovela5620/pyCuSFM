@@ -21,8 +21,11 @@ from pathlib import Path
 
 import pytest
 import rerun.experimental as rrx
+from serde.json import from_json
 
+from colsfm.export import RUNTIME_CSV_NAME, RuntimeRecord, read_runtime_records
 from colsfm.frames_meta import FRAMES_META_NAME
+from colsfm.pipeline import KEYFRAME_DIR_NAME, LOOP_EDGES_NAME, SUMMARY_NAME, PipelineSummary
 from colsfm.walkthrough import WalkthroughConfig, WalkthroughResult, run_walkthrough
 
 SMOKE_MIN_INTER_FRAME_DISTANCE_M: float = 0.5
@@ -231,13 +234,40 @@ def test_the_two_variants_do_not_share_a_recording_id(
 
 
 def test_the_workspace_holds_a_readable_cusfm_run(walkthrough: WalkthroughResult) -> None:
-    """The walkthrough leaves the same artifacts a `run_pipeline` run leaves."""
+    """The walkthrough leaves *every* artifact a `run_pipeline` run leaves.
+
+    `summary.json` is in the list because it is what the old split runner never
+    wrote: the walkthrough sequenced the stages itself and skipped the summary,
+    and this test excluded it, so the two executors could drift unnoticed. The
+    walkthrough is now an observer of `run_pipeline`, so the full set applies.
+    """
     expected: list[Path] = [
         walkthrough.work_dir / "database.db",
+        walkthrough.work_dir / KEYFRAME_DIR_NAME / FRAMES_META_NAME,
         walkthrough.work_dir / "pose_graph" / FRAMES_META_NAME,
+        walkthrough.work_dir / "pose_graph" / "vehicle_pose.tum",
+        walkthrough.work_dir / "pose_graph" / LOOP_EDGES_NAME,
         walkthrough.work_dir / "sparse" / "images.txt",
+        walkthrough.work_dir / "sparse" / "cameras.txt",
+        walkthrough.work_dir / "sparse" / "points3D.txt",
         walkthrough.work_dir / "kpmap" / "keyframes" / FRAMES_META_NAME,
-        walkthrough.work_dir / "runtime.csv",
+        walkthrough.work_dir / RUNTIME_CSV_NAME,
+        walkthrough.work_dir / SUMMARY_NAME,
     ]
     missing: list[str] = [str(path) for path in expected if not path.exists()]
     assert not missing, f"the walkthrough did not write {missing}"
+
+
+def test_the_workspace_summary_reports_the_stages_the_recording_shows(walkthrough: WalkthroughResult) -> None:
+    """`summary.json` and the recording agree on which stages ran and how long they took.
+
+    The equivalence check the split runner could not have: one ledger feeds
+    `runtime.csv`, `summary.json` and the observer's own timings.
+    """
+    summary: PipelineSummary = from_json(
+        PipelineSummary, (walkthrough.work_dir / SUMMARY_NAME).read_text()
+    )
+    assert tuple(summary.stage_seconds) == EXPECTED_STAGE_NAMES
+    assert summary.stage_seconds == walkthrough.seconds_by_stage
+    rows: list[RuntimeRecord] = read_runtime_records(walkthrough.work_dir / RUNTIME_CSV_NAME)
+    assert tuple(row.command for row in rows) == EXPECTED_STAGE_NAMES

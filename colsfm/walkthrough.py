@@ -7,15 +7,20 @@ pixi run -e colsfm python -m colsfm.walkthrough \
     --output data/bench/galileo_walkthrough.rrd
 ```
 
-The module runs a real dataset through `colsfm.pipeline`'s **own** stage
-functions — `run_keyframe_selection_stage` … `run_export_stage`, the same calls
-`run_pipeline` composes — and logs each stage's real intermediate data into one
-recording on a `stage` sequence timeline. Scrubbing that timeline from 1 to N
-walks the architecture of Figure 2 of *CuSfM: CUDA-Accelerated
-Structure-from-Motion* (arXiv:2510.15271): dictionary construction → loop
-closure detection → pose graph optimisation on the first row, feature
-extraction → feature matching on the second, camera projection, triangulation
-and mapping, and extrinsic refinement on the third.
+The module is an **observer** of `colsfm.pipeline.run_pipeline`, never a second
+runner: `run_walkthrough` calls `run_pipeline` with a `WalkthroughObserver`, and
+the observer is handed each stage's typed result once that stage's timing window
+has closed. One sequencer therefore resolves the options, times the stages into
+`runtime.csv` and writes `summary.json`; the walkthrough only draws. A run under
+the walkthrough leaves exactly the artifacts `python -m colsfm run` leaves, and a
+new stage or backend is added in one place.
+
+Each stage's real intermediate data lands in one recording on a `stage` sequence
+timeline. Scrubbing that timeline from 1 to N walks the architecture of Figure 2
+of *CuSfM: CUDA-Accelerated Structure-from-Motion* (arXiv:2510.15271):
+dictionary construction → loop closure detection → pose graph optimisation on
+the first row, feature extraction → feature matching on the second, camera
+projection, triangulation and mapping, and extrinsic refinement on the third.
 
 Nothing here re-implements a stage. Everything logged is read back out of the
 stage results, the COLMAP database the run wrote, or the run directory the
@@ -78,7 +83,6 @@ from __future__ import annotations
 
 import contextlib
 import io
-import time
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -102,35 +106,24 @@ from colsfm.benchmark import AcceptanceBounds, Comparison, RunArtifacts, compare
 from colsfm.cameras import colmap_camera
 from colsfm.config import CusfmConfig
 from colsfm.database import ImagePair, KeypointsXY, read_keypoints, read_two_view_geometry
-from colsfm.export import RUNTIME_CSV_NAME, RuntimeRecord, append_runtime_record
-from colsfm.frames_meta import FRAMES_META_NAME, FramesMeta, KeyframeMeta, RigFrame, read_frames_meta, write_frames_meta
-from colsfm.mapping import MappingOptions, MappingResult, RoundStats
-from colsfm.matching import MatchingOptions, PairMatchStats
+from colsfm.features import ExtractionReport
+from colsfm.frames_meta import FRAMES_META_NAME, FramesMeta, KeyframeMeta, RigFrame, read_frames_meta
+from colsfm.mapping import MappingResult, RoundStats
+from colsfm.matching import MatchReport, PairMatchStats
 from colsfm.pairs import consecutive_pairs, stereo_pairs
 from colsfm.pipeline import (
     DEFAULT_CONFIG_DIR,
-    KEYFRAME_DIR_NAME,
     ExportStageResult,
     ExtrinsicChange,
     ExtrinsicRefinementStageResult,
-    FeatureExtractionStageResult,
     KeyframeSelectionStageResult,
     LoopClosureStageResult,
-    MatchingStageResult,
-    PairSelectionStageResult,
+    PipelineObserver,
     PipelineOptions,
+    PipelineSummary,
     PoseGraphStageResult,
-    ReconstructionStageResult,
     StageName,
-    run_export_stage,
-    run_extrinsic_refinement_stage,
-    run_feature_extraction_stage,
-    run_keyframe_selection_stage,
-    run_loop_closure_stage,
-    run_matching_stage,
-    run_pair_selection_stage,
-    run_pose_graph_stage,
-    run_reconstruction_stage,
+    run_pipeline,
     stage_names,
 )
 from colsfm.pose_graph import PoseGraphEdge, RigNode
@@ -869,7 +862,7 @@ def sample_keyframes(selected: FramesMeta, wanted: int) -> list[KeyframeMeta]:
 def log_feature_extraction(
     stage: WalkthroughStage,
     selected: FramesMeta,
-    extraction: FeatureExtractionStageResult,
+    extraction: ExtractionReport,
     database_path: Path,
     input_dir: Path,
     num_samples: int,
@@ -883,7 +876,7 @@ def log_feature_extraction(
     Args:
         stage: This stage's timeline slot and prose.
         selected: The collection keyframe selection kept.
-        extraction: What `run_feature_extraction_stage` returned.
+        extraction: The report `run_feature_extraction_stage` returned.
         database_path: The database the stage wrote.
         input_dir: The dataset's raw image root.
         num_samples: How many keyframes to show.
@@ -908,7 +901,7 @@ def log_feature_extraction(
             rr.Points2D(rerun_keypoints(keypoints_xy), colors=SELECTED_COLOR, radii=KEYPOINT_RADIUS),
         )
         panes.append(SamplePane(entity_path=sample_path, name=f"{sensor_name} #{keyframe.keyframe_id} ({len(keypoints_xy)} kp)"))
-    counts: dict[int, int] = extraction.report.keypoint_counts
+    counts: dict[int, int] = extraction.keypoint_counts
     ordered: Int64[ndarray, "n"] = np.asarray([counts[key] for key in sorted(counts)], dtype=np.int64)
     rr.log(f"{stage.entity_root}/keypoint_counts", rr.BarChart(ordered, color=SELECTED_COLOR))
     log_notes(
@@ -917,8 +910,8 @@ def log_feature_extraction(
             ("images extracted", str(len(counts))),
             ("keypoints total", f"{int(ordered.sum()):,}"),
             ("keypoints per image (min / median / max)", f"{int(ordered.min())} / {int(np.median(ordered))} / {int(ordered.max())}"),
-            ("device", extraction.report.device),
-            ("seconds", f"{extraction.report.elapsed_seconds:.2f}"),
+            ("device", extraction.device),
+            ("seconds", f"{extraction.elapsed_seconds:.2f}"),
             ("database", f"`{database_path}`"),
             ("samples drawn", ", ".join(pane.name for pane in panes) if panes else "none; the imagery is not on disk"),
         ],
@@ -931,7 +924,7 @@ def log_pair_selection(
     stage: WalkthroughStage,
     selected: FramesMeta,
     config: CusfmConfig,
-    pair_selection: PairSelectionStageResult,
+    pairs: Sequence[ImagePair],
     console: str,
 ) -> None:
     """Stage 3: the consecutive and stereo pairs as lines between camera centres.
@@ -940,7 +933,7 @@ def log_pair_selection(
         stage: This stage's timeline slot and prose.
         selected: The collection keyframe selection kept.
         config: The config profile, for `connected_keyframe_num`.
-        pair_selection: What `run_pair_selection_stage` returned.
+        pairs: The pairs `run_pair_selection_stage` returned.
         console: What it printed.
     """
     rr.set_time(STAGE_TIMELINE, sequence=stage.index)
@@ -971,7 +964,7 @@ def log_pair_selection(
     log_notes(
         stage,
         [
-            ("pairs total", str(len(pair_selection.pairs))),
+            ("pairs total", str(len(pairs))),
             ("consecutive pairs (blue)", str(len(consecutive))),
             ("stereo pairs (orange)", str(len(stereo))),
             ("connected_keyframe_num", str(config.pose_graph.connected_keyframe_num)),
@@ -1001,7 +994,7 @@ def _pair_for_display(report_pairs: Mapping[ImagePair, PairMatchStats]) -> Image
 def log_matching(
     stage: WalkthroughStage,
     selected: FramesMeta,
-    matching: MatchingStageResult,
+    matching: MatchReport,
     database_path: Path,
     input_dir: Path,
     console: str,
@@ -1011,13 +1004,13 @@ def log_matching(
     Args:
         stage: This stage's timeline slot and prose.
         selected: The collection keyframe selection kept.
-        matching: What `run_matching_stage` returned.
+        matching: The report `run_matching_stage` returned.
         database_path: The database holding the keypoints and geometries.
         input_dir: The dataset's raw image root.
         console: What the stage printed.
     """
     rr.set_time(STAGE_TIMELINE, sequence=stage.index)
-    stats: dict[ImagePair, PairMatchStats] = matching.report.pair_stats
+    stats: dict[ImagePair, PairMatchStats] = matching.pair_stats
     inliers: Int64[ndarray, "n"] = np.asarray([stats[pair].inlier_matches for pair in sorted(stats)], dtype=np.int64)
     rr.log(f"{stage.entity_root}/inliers_per_pair", rr.BarChart(inliers, color=SELECTED_COLOR))
     histogram: Int64[ndarray, "bins"] = np.histogram(inliers, bins=INLIER_HISTOGRAM_BINS)[0].astype(np.int64)
@@ -1025,11 +1018,11 @@ def log_matching(
 
     rows: MarkdownRows = [
         ("pairs matched", str(len(stats))),
-        ("pairs with no verified geometry", str(matching.report.empty_pairs)),
-        ("median inliers per pair", f"{matching.report.median_inliers:.1f}"),
-        ("median inlier retention", f"{100.0 * matching.report.median_retention:.1f} %"),
-        ("device", matching.report.device),
-        ("seconds", f"{matching.report.elapsed_seconds:.2f}"),
+        ("pairs with no verified geometry", str(matching.empty_pairs)),
+        ("median inliers per pair", f"{matching.median_inliers:.1f}"),
+        ("median inlier retention", f"{100.0 * matching.median_retention:.1f} %"),
+        ("device", matching.device),
+        ("seconds", f"{matching.elapsed_seconds:.2f}"),
     ]
     chosen: ImagePair | None = _pair_for_display(stats)
     if chosen is not None:
@@ -1304,16 +1297,16 @@ def log_pose_graph(stage: WalkthroughStage, pose_graph: PoseGraphStageResult, co
     )
 
 
-def log_reconstruction(stage: WalkthroughStage, reconstruction: ReconstructionStageResult, console: str) -> None:
+def log_reconstruction(stage: WalkthroughStage, mapping: MappingResult, console: str) -> None:
     """Stage 7: the mapped cloud, plus every bundle-adjustment round's statistics.
 
     Args:
         stage: This stage's timeline slot and prose.
-        reconstruction: What `run_reconstruction_stage` returned.
+        mapping: The result `run_reconstruction_stage` returned, read before the
+            extrinsic refinement may adjust the same reconstruction in place.
         console: What it printed — the per-pass triangulation counts live here.
     """
     rr.set_time(STAGE_TIMELINE, sequence=stage.index)
-    mapping: MappingResult = reconstruction.mapping
     positions: Float64[ndarray, "n 3"] = np.asarray(
         [point.xyz for point in mapping.reconstruction.points3D.values()], dtype=np.float64
     ).reshape(-1, 3)
@@ -1700,17 +1693,37 @@ def build_blueprint(stages: Sequence[WalkthroughStage], samples: Sequence[Sample
 
 
 @dataclass(slots=True)
-class StageClock:
-    """Times each stage, captures its console output, and appends it to `runtime.csv`."""
+class WalkthroughObserver(PipelineObserver):
+    """Draws each stage of one `colsfm.pipeline` run into the active recording.
 
-    output_dir: Path
-    """Workspace root holding `runtime.csv`."""
+    An observer, not a second runner: `colsfm.pipeline.run_pipeline` sequences the
+    stages, resolves the options, times them into `runtime.csv` and writes
+    `summary.json`; this object is handed each stage's typed result *after* its
+    timing window has closed. Nothing drawn here is timed, and no drawing can
+    change what the run computes — which is what keeps the walkthrough's workspace
+    byte-comparable with a plain `python -m colsfm run`.
+
+    `stage_scope` is the one hook inside the timing window, and it only redirects
+    stdout: the loop-closure funnel and the Ceres termination are *printed* by the
+    stage functions rather than returned, and each notes panel quotes them verbatim.
+    """
+
+    config: WalkthroughConfig
+    """The parsed command line: the sample count, the arrow scale and the reference runs."""
+    options: PipelineOptions
+    """The options `run_pipeline` is executing, for the database and image paths."""
     stages: tuple[WalkthroughStage, ...]
-    """The stages this run will record, so the progress line counts the right total."""
+    """The timeline slots this run records, in stage order."""
     console: dict[str, str] = field(default_factory=dict)
     """Whatever each stage printed while it ran, keyed by stage name."""
-    seconds: dict[str, float] = field(default_factory=dict)
-    """Wall-clock seconds per stage, keyed by stage name."""
+    seconds_by_stage: dict[str, float] = field(default_factory=dict)
+    """Wall-clock seconds per stage; filled from the run's own summary, not measured here."""
+    samples: list[SamplePane] = field(default_factory=list)
+    """Stage 2's sample panes. The blueprint needs them and nothing knows them up front."""
+    selection: KeyframeSelectionStageResult | None = None
+    """Stage 1's result; every later stage draws against the collection it selected."""
+    pose_graph_meta: FramesMeta | None = None
+    """Stage 6's re-posed collection, which stage 7b's before/after arrows start from."""
 
     def stage(self, name: StageName) -> WalkthroughStage:
         """Look up a stage's timeline slot by name.
@@ -1729,138 +1742,184 @@ class StageClock:
                 return stage
         raise KeyError(f"{name} is not one of this walkthrough's stages")
 
+    def _selected(self) -> KeyframeSelectionStageResult:
+        """Stage 1's result, which every later panel needs.
 
-@contextlib.contextmanager
-def timed_stage(clock: StageClock, name: StageName) -> Iterator[WalkthroughStage]:
-    """Run one stage, timing it and capturing everything it prints.
+        Returns:
+            What `run_keyframe_selection_stage` produced.
 
-    The capture is what makes the loop-closure funnel and the Ceres termination
-    reportable: `colsfm.pipeline`'s stage functions print those counters rather
-    than returning them.
+        Raises:
+            RuntimeError: When a later stage is observed before stage 1 has run.
+        """
+        if self.selection is None:
+            raise RuntimeError("the walkthrough observed a later stage before keyframe selection")
+        return self.selection
 
-    Args:
-        clock: The clock to record into.
-        name: The stage the block implements.
+    @contextlib.contextmanager
+    def _captured(self, stage: StageName) -> Iterator[None]:
+        """Run the stage with its stdout diverted into `console[stage]`.
 
-    Yields:
-        The stage's timeline slot and prose.
-    """
-    stage: WalkthroughStage = clock.stage(name)
-    print(f"[walkthrough] stage {stage.index}/{len(clock.stages)}: {name}")
-    buffer: io.StringIO = io.StringIO()
-    started: float = time.perf_counter()
-    try:
-        with contextlib.redirect_stdout(buffer):
-            yield stage
-    finally:
-        elapsed: float = time.perf_counter() - started
-        clock.console[name] = buffer.getvalue()
-        clock.seconds[name] = elapsed
-        append_runtime_record(clock.output_dir, RuntimeRecord(command=name, runtime_seconds=elapsed))
-        print(f"[walkthrough] {name} finished in {elapsed:.2f}s")
+        Args:
+            stage: The stage whose output to capture.
 
+        Yields:
+            Nothing; the stage body runs inside the redirection.
+        """
+        buffer: io.StringIO = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buffer):
+                yield
+        finally:
+            self.console[stage] = buffer.getvalue()
 
-def log_walkthrough(config: WalkthroughConfig, clock: StageClock) -> None:
-    """Run every stage and log it, into whichever recording is active.
+    def stage_scope(self, stage: StageName) -> contextlib.AbstractContextManager[None]:
+        """Capture one stage's console output.
 
-    Args:
-        config: The parsed command line.
-        clock: The clock the stages are timed and captured with.
+        Args:
+            stage: The stage about to run.
 
-    Raises:
-        FileNotFoundError: When the input metadata or a config file is missing.
-        ValueError: When a stage cannot proceed.
-    """
-    options: PipelineOptions = config.pipeline_options()
-    rr.log("/", rr.ViewCoordinates.RFU, static=True)
+        Returns:
+            A context manager that redirects stdout for the duration of the stage.
+        """
+        return self._captured(stage)
 
-    with timed_stage(clock, "keyframe_selection") as stage:
-        selection: KeyframeSelectionStageResult = run_keyframe_selection_stage(options)
-        write_frames_meta(options.output_dir / KEYFRAME_DIR_NAME / FRAMES_META_NAME, selection.selected)
-    log_keyframe_selection(stage, selection, clock.console["keyframe_selection"])
-    config_profile: CusfmConfig = selection.config
+    def run_started(self, options: PipelineOptions, stages: tuple[StageName, ...]) -> None:
+        """Set the recording's world axes before stage 1.
 
-    with timed_stage(clock, "feature_extraction") as stage:
-        extraction: FeatureExtractionStageResult = run_feature_extraction_stage(options, selection.selected)
-    samples: list[SamplePane] = log_feature_extraction(
-        stage,
-        selection.selected,
-        extraction,
-        options.database_path,
-        options.input_dir,
-        config.num_sample_keyframes,
-        clock.console["feature_extraction"],
-    )
+        Args:
+            options: The options the run will execute; already held as `options`.
+            stages: The stages it will record; already held as `stages`.
+        """
+        rr.log("/", rr.ViewCoordinates.RFU, static=True)
 
-    with timed_stage(clock, "pair_selection") as stage:
-        pair_selection: PairSelectionStageResult = run_pair_selection_stage(selection.selected, config_profile)
-    log_pair_selection(stage, selection.selected, config_profile, pair_selection, clock.console["pair_selection"])
+    def on_keyframe_selection(self, result: KeyframeSelectionStageResult) -> None:
+        """Draw stage 1.
 
-    matching_options: MatchingOptions = MatchingOptions(
-        max_error_px=config_profile.matching_task_worker.verification.max_pixel_error,
-        confidence=config_profile.matching_task_worker.verification.min_ransac_confidence,
-        num_threads=options.num_threads,
-        device=options.device,
-        max_matches_per_pair=options.max_matches_per_pair,
-    )
-    with timed_stage(clock, "matching") as stage:
-        matching: MatchingStageResult = run_matching_stage(options, pair_selection.pairs, matching_options)
-    log_matching(stage, selection.selected, matching, options.database_path, options.input_dir, clock.console["matching"])
+        Args:
+            result: The configuration read, the input collection and the selection.
+        """
+        self.selection = result
+        log_keyframe_selection(self.stage("keyframe_selection"), result, self.console["keyframe_selection"])
 
-    with timed_stage(clock, "loop_closure") as stage:
-        loops: LoopClosureStageResult = run_loop_closure_stage(
-            selection.selected,
-            options.database_path,
-            config_profile.pose_graph,
-            matching_options,
-            enabled=options.loop_closure,
+    def on_feature_extraction(self, report: ExtractionReport) -> None:
+        """Draw stage 2 and remember the sample panes the blueprint will need.
+
+        Args:
+            report: Per-image keypoint counts, the device used and the wall time.
+        """
+        self.samples = log_feature_extraction(
+            self.stage("feature_extraction"),
+            self._selected().selected,
+            report,
+            self.options.database_path,
+            self.options.input_dir,
+            self.config.num_sample_keyframes,
+            self.console["feature_extraction"],
         )
-    log_loop_closure(stage, loops, config.robocap_loop_run, clock.console["loop_closure"])
 
-    with timed_stage(clock, "pose_graph") as stage:
-        pose_graph: PoseGraphStageResult = run_pose_graph_stage(options, selection.selected, config_profile, loops.edges)
-    log_pose_graph(stage, pose_graph, clock.console["pose_graph"])
+    def on_pair_selection(self, pairs: Sequence[ImagePair]) -> None:
+        """Draw stage 3.
 
-    mapping_options: MappingOptions = MappingOptions(num_threads=options.ba_num_threads, use_gpu=options.ba_use_gpu)
-    with timed_stage(clock, "reconstruction") as stage:
-        reconstruction: ReconstructionStageResult = run_reconstruction_stage(
-            options, pose_graph.frames_meta, config_profile, mapping_options
+        Args:
+            pairs: The consecutive and stereo pairs the matcher will be given.
+        """
+        selection: KeyframeSelectionStageResult = self._selected()
+        log_pair_selection(
+            self.stage("pair_selection"), selection.selected, selection.config, pairs, self.console["pair_selection"]
         )
-    log_reconstruction(stage, reconstruction, clock.console["reconstruction"])
 
-    mapping: MappingResult = reconstruction.mapping
-    mapped_meta: FramesMeta = pose_graph.frames_meta
-    if options.optimize_extrinsics:
-        with timed_stage(clock, "extrinsic_refinement") as stage:
-            refinement: ExtrinsicRefinementStageResult = run_extrinsic_refinement_stage(
-                options, pose_graph.frames_meta, config_profile, mapping_options, mapping
-            )
+    def on_matching(self, report: MatchReport) -> None:
+        """Draw stage 4.
+
+        Args:
+            report: Per-pair raw and inlier counts, the device used and the wall time.
+        """
+        log_matching(
+            self.stage("matching"),
+            self._selected().selected,
+            report,
+            self.options.database_path,
+            self.options.input_dir,
+            self.console["matching"],
+        )
+
+    def on_loop_closure(self, result: LoopClosureStageResult) -> None:
+        """Draw stage 5.
+
+        Args:
+            result: The gated loop edges, the extra pairs matched and the diagnostics.
+        """
+        log_loop_closure(self.stage("loop_closure"), result, self.config.robocap_loop_run, self.console["loop_closure"])
+
+    def on_pose_graph(self, result: PoseGraphStageResult) -> None:
+        """Draw stage 6 and remember the collection it re-posed.
+
+        Args:
+            result: The nodes, the edges, the re-posed collection and the largest move.
+        """
+        self.pose_graph_meta = result.frames_meta
+        log_pose_graph(self.stage("pose_graph"), result, self.console["pose_graph"])
+
+    def on_reconstruction(self, mapping: MappingResult) -> None:
+        """Draw stage 7, before stage 7b may adjust the same reconstruction in place.
+
+        Args:
+            mapping: The triangulated, bundle-adjusted model and its round statistics.
+        """
+        log_reconstruction(self.stage("reconstruction"), mapping, self.console["reconstruction"])
+
+    def on_extrinsic_refinement(self, result: ExtrinsicRefinementStageResult) -> None:
+        """Draw stage 7b.
+
+        Args:
+            result: The refined model, the re-calibrated collection and the movement.
+
+        Raises:
+            RuntimeError: When the refinement is observed before the pose graph.
+        """
+        if self.pose_graph_meta is None:
+            raise RuntimeError("the walkthrough observed the extrinsic refinement before the pose graph")
         log_extrinsic_refinement(
-            stage, pose_graph.frames_meta, refinement, config.extrinsic_arrow_scale, clock.console["extrinsic_refinement"]
+            self.stage("extrinsic_refinement"),
+            self.pose_graph_meta,
+            result,
+            self.config.extrinsic_arrow_scale,
+            self.console["extrinsic_refinement"],
         )
-        mapping = refinement.mapping
-        mapped_meta = refinement.frames_meta
 
-    with timed_stage(clock, "export") as stage:
-        export: ExportStageResult = run_export_stage(options, mapped_meta, mapping)
-    log_export(
-        stage,
-        options,
-        export,
-        mapping,
-        selection.frames_meta,
-        config.reference_run,
-        config.dataset,
-        clock.console["export"],
-    )
+    def on_export(self, result: ExportStageResult, mapping: MappingResult) -> None:
+        """Draw stage 8.
 
-    # Sent last, not first: stage 2's panes name the keyframes the sampler picked,
-    # which nothing knows before the run.
-    rr.send_blueprint(build_blueprint(clock.stages, samples), make_active=True, make_default=True)
+        Args:
+            result: The exported collection and what was written.
+            mapping: The final mapping result the export was made from.
+        """
+        log_export(
+            self.stage("export"),
+            self.options,
+            result,
+            mapping,
+            self._selected().frames_meta,
+            self.config.reference_run,
+            self.config.dataset,
+            self.console["export"],
+        )
+
+    def run_finished(self, summary: PipelineSummary) -> None:
+        """Take the run's timings and send the blueprint.
+
+        Sent last, not first: stage 2's panes name the keyframes the sampler picked,
+        which nothing knows before the run.
+
+        Args:
+            summary: What the run produced and how long each stage took.
+        """
+        self.seconds_by_stage = dict(summary.stage_seconds)
+        rr.send_blueprint(build_blueprint(self.stages, self.samples), make_active=True, make_default=True)
 
 
 def run_walkthrough(config: WalkthroughConfig) -> WalkthroughResult:
-    """Run the dataset through every stage and save the walkthrough recording.
+    """Run the dataset through `colsfm.pipeline` and save the walkthrough recording.
 
     Args:
         config: The parsed command line.
@@ -1872,13 +1931,11 @@ def run_walkthrough(config: WalkthroughConfig) -> WalkthroughResult:
         FileNotFoundError: When the input metadata or a config file is missing.
         ValueError: When a stage cannot proceed.
     """
-    work_dir: Path = config.resolved_work_dir
-    work_dir.mkdir(parents=True, exist_ok=True)
-    (work_dir / RUNTIME_CSV_NAME).unlink(missing_ok=True)
+    options: PipelineOptions = config.pipeline_options()
     config.output.parent.mkdir(parents=True, exist_ok=True)
     stages: tuple[WalkthroughStage, ...] = walkthrough_stages(config.optimize_extrinsics)
-    clock: StageClock = StageClock(output_dir=work_dir, stages=stages)
-    print(f"[walkthrough] input {config.input_dir} | workspace {work_dir} | recording {config.output}")
+    observer: WalkthroughObserver = WalkthroughObserver(config=config, options=options, stages=stages)
+    print(f"[walkthrough] input {config.input_dir} | workspace {options.output_dir} | recording {config.output}")
 
     # A scoped `RecordingStream` rather than `rr.init` + `rr.save`: leaving the
     # `with` block flushes *and* closes the file sink, so the `.rrd` gets its footer.
@@ -1889,11 +1946,14 @@ def run_walkthrough(config: WalkthroughConfig) -> WalkthroughResult:
     recording: rr.RecordingStream = rr.RecordingStream(APPLICATION_ID, recording_id=recording_id)
     recording.save(str(config.output))
     with recording:
-        log_walkthrough(config, clock)
+        run_pipeline(options, observer)
     recording.flush(timeout_sec=60.0)
     print(f"[walkthrough] wrote {config.output} ({config.output.stat().st_size / 1e6:.1f} MB)")
     return WalkthroughResult(
-        rrd_path=config.output, work_dir=work_dir, stages=stages, seconds_by_stage=dict(clock.seconds)
+        rrd_path=config.output,
+        work_dir=options.output_dir,
+        stages=stages,
+        seconds_by_stage=dict(observer.seconds_by_stage),
     )
 
 
