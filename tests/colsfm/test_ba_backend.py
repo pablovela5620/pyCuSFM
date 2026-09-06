@@ -2,8 +2,8 @@
 
 Pure contracts — nothing here needs a GPU, a CASPAR build or a dataset. The one
 function that does measure the build, `detect_caspar_capability`, is exercised
-through a stated `CasparCapability` instead, which is exactly what
-`MappingOptions.caspar_supported_models` is for.
+through a stated `CasparCapability` instead, which every caller can hand to
+`resolve_backend` and `resolve_ba_plan`.
 
 These are the review's confirmed defects, pinned:
 
@@ -21,6 +21,7 @@ import pytest
 
 from colsfm.ba_backend import (
     CASPAR_BUILD_FALLBACK_REASON,
+    CASPAR_PROBE_FAILED_REASON,
     EXTRINSICS_FALLBACK_REASON,
     BaExecutionPlan,
     CasparCapability,
@@ -39,12 +40,12 @@ STOCK_CAPABILITY: CasparCapability = CasparCapability(
 NO_BUILD_CAPABILITY: CasparCapability = CasparCapability(
     availability="unavailable", supported_camera_models=frozenset(), probe_errors=("built without CASPAR_ENABLED",)
 )
-"""A pycolmap with no CASPAR at all; only the solve can report it, so the guard stays quiet."""
+"""A pycolmap with no CASPAR at all; the probe finds this out by solving, so the plan refuses it."""
 
 BROKEN_PROBE_CAPABILITY: CasparCapability = CasparCapability(
     availability="probe_failed", supported_camera_models=frozenset(), probe_errors=("PINHOLE: no CUDA device",)
 )
-"""A build that has CASPAR but could not be measured; a broken environment, not a model fact."""
+"""A build that has CASPAR but could not be measured; nothing has been shown to solve, so Ceres takes it."""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -159,12 +160,23 @@ def test_a_supported_model_keeps_the_gpu_backend() -> None:
     ) == ("caspar", None)
 
 
-@pytest.mark.parametrize("capability", [NO_BUILD_CAPABILITY, BROKEN_PROBE_CAPABILITY])
-def test_an_unmeasurable_build_leaves_the_decision_to_the_solve(capability: CasparCapability) -> None:
-    """There is no half-problem to protect against, so the solve reports the missing build."""
+@pytest.mark.parametrize(
+    ("capability", "expected_reason"),
+    [(NO_BUILD_CAPABILITY, CASPAR_BUILD_FALLBACK_REASON), (BROKEN_PROBE_CAPABILITY, CASPAR_PROBE_FAILED_REASON)],
+)
+def test_a_build_that_cannot_be_used_falls_back_before_the_run_starts(
+    capability: CasparCapability, expected_reason: str
+) -> None:
+    """A CASPAR that has not been shown to solve is refused here, not by a mid-run throw.
+
+    The probe finds this out *by solving*, so the run knows before it writes anything.
+    `colsfm.mapping` used to let the request stand, catch COLMAP's "built without
+    CASPAR_ENABLED" at the first bundle adjustment, rewrite the caller's options object
+    in place and then infer the reason by comparing backends.
+    """
     assert resolve_backend(
         "caspar", optimize_extrinsics=False, camera_model_names=["OPENCV_FISHEYE"], capability=capability
-    ) == ("caspar", None)
+    ) == ("ceres", expected_reason)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

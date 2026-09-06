@@ -598,10 +598,12 @@ Measured on the 5090, one process each:
 
 The probe is `functools.cache`d, so a run pays for it once, and it is reached
 only when `--ba-backend caspar` was asked for.
-`MappingOptions.caspar_supported_models` overrides it with a stated set — that
-is what the unit tests use, so the rule "model not in the set means Ceres" is
-asserted identically on every environment, and it is also how to force a model
-through a build whose adapter is not yet trusted.
+`resolve_ba_plan(..., capability=...)` overrides it with a stated
+`CasparCapability` — that is what the unit tests use, so the rule "model not in
+the set means Ceres" is asserted identically on every environment, and it is also
+how to force a model through a build whose adapter is not yet trusted. The plan
+carries the capability it was resolved against, so the camera check made later
+against the reconstruction honours the same statement.
 
 ### 9.2 What it changes
 

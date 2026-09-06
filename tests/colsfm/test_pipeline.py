@@ -24,7 +24,7 @@ import pycolmap
 import pytest
 from serde.json import from_json, to_json
 
-from colsfm.ba_backend import EXTRINSICS_FALLBACK_REASON
+from colsfm.ba_backend import CASPAR_BUILD_FALLBACK_REASON, EXTRINSICS_FALLBACK_REASON
 from colsfm.benchmark import read_run, rig_rigidity_spread_millimeters
 from colsfm.config import CusfmConfig, read_config_directory
 from colsfm.export import KEYFRAME_METADATA_SUBPATH, RUNTIME_CSV_NAME, RuntimeRecord, read_runtime_records
@@ -474,7 +474,7 @@ def test_the_default_run_is_the_fast_full_pipeline() -> None:
 
 
 def test_the_default_maps_on_caspar_and_refines_the_extrinsics_afterwards(
-    galileo_input_dir: Path, tmp_path: Path
+    galileo_input_dir: Path, tmp_path: Path, caspar_enabled: bool
 ) -> None:
     """The default resolves to a CASPAR mapping pass with `sensor_from_rig` held fixed.
 
@@ -483,6 +483,10 @@ def test_the_default_maps_on_caspar_and_refines_the_extrinsics_afterwards(
     the GPU solve is legal, and stage 7b then moves them in pyceres with the priors
     (`colsfm.extrinsic_refinement`). The plan must therefore say `caspar` with no
     fallback; it said `ceres` while the pipeline was in fact solving on the GPU.
+
+    On a pycolmap without CASPAR the same resolution answers `ceres` and names the
+    missing build, before the run creates anything. That fallback used to be found by
+    a bundle adjustment throwing halfway through stage 7.
     """
     # The two backend fields are the one part of the default this assertion does not
     # want: they would make a bare checkout raise for a missing graph, and they have
@@ -492,8 +496,15 @@ def test_the_default_maps_on_caspar_and_refines_the_extrinsics_afterwards(
     resolved: ResolvedRun = resolve_run(
         replace(default, features_backend="pycolmap", matching_backend="pycolmap")
     )
-    assert resolved.mapping.ba_backend == "caspar"
+    # One decision, carried: the mapper is handed the plan, not the flags it came from.
+    assert resolved.mapping.ba_plan is resolved.ba_plan
+    assert resolved.ba_plan.requested_backend == "caspar"
     assert resolved.mapping.optimize_extrinsics is False, "stage 7 maps with the rig fixed"
+    if not caspar_enabled:
+        assert resolved.ba_plan.backend == "ceres"
+        assert resolved.ba_plan.fallback_reason == CASPAR_BUILD_FALLBACK_REASON
+        assert resolved.ba_plan.ceres_polish is False, "Ceres has converged; nothing to polish"
+        return
     assert resolved.ba_plan.backend == "caspar"
     assert resolved.ba_plan.fallback_reason is None
     assert resolved.ba_plan.ceres_polish is True

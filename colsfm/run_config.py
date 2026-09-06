@@ -279,7 +279,9 @@ class ResolvedRun:
     mapping: MappingOptions
     """Stages 7 and 7b: the mapper's own knobs, with the validated CASPAR overrides."""
     ba_plan: BaExecutionPlan
-    """Which backend the bundle adjustments were planned on, and why, before any solve."""
+    """Which backend the bundle adjustments will run on, and why, decided before any solve.
+
+    The same object `mapping` carries, so the run reports what it executed."""
     device: DeviceChoice
     """Device request the two ONNX stages share; `--use-gpu` resolved exactly once."""
     num_threads: int
@@ -337,6 +339,9 @@ def resolve_run(options: PipelineOptions) -> ResolvedRun:
         # call CASPAR throws on.
         optimize_extrinsics=options.optimize_extrinsics and not options.regularised_extrinsics,
     )
+    # Said once, here, where the decision was made. The only thing left to decide is
+    # the camera-model check, which needs the reconstruction stage 7 builds.
+    ba_plan.announce()
     return ResolvedRun(
         selection=options.selection,
         features=FeatureOptions(
@@ -344,15 +349,10 @@ def resolve_run(options: PipelineOptions) -> ResolvedRun:
         ),
         matching_backend=options.matching_backend,
         match_limit=MatchLimitPolicy.of(options.match_cap_mode, options.max_matches_per_pair),
-        # `ba_backend` stays the *request*: the camera-model fallback needs the
-        # reconstruction, which does not exist until stage 7, so `colsfm.mapping`
-        # makes that call and reports it back as `MappingResult.ba_fallback_reason`.
+        # The mapper receives the plan itself, not the knobs it was made from: there is
+        # one decision about bundle adjustment in a run, and this is it.
         mapping=MappingOptions(
-            num_threads=options.ba_num_threads,
-            use_gpu=options.ba_use_gpu,
-            ba_backend=ba_plan.requested_backend,
-            caspar_ceres_polish=options.caspar_ceres_polish,
-            caspar_options=ba_plan.caspar_options or None,
+            num_threads=options.ba_num_threads, use_gpu=options.ba_use_gpu, ba_plan=ba_plan
         ),
         ba_plan=ba_plan,
         device=options.device,

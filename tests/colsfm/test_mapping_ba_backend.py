@@ -22,6 +22,7 @@ import pytest
 from mapping_helpers import (
     SyntheticRig,
     build_synthetic_rig,
+    caspar_plan,
     match_tracks_to_truth,
     quiet_options,
     synthetic_matches,
@@ -33,14 +34,17 @@ from colsfm.ba_backend import (
     CASPAR_BUILD_FALLBACK_REASON,
     CASPAR_PROBE_CAMERA_MODELS,
     CASPAR_STOCK_CAMERA_MODELS,
+    BaExecutionPlan,
     apply_caspar_options,
     backend_name,
     caspar_supported_camera_models,
     detect_caspar_capability,
+    resolve_ba_plan,
 )
 from colsfm.config import BundleAdjustmentConfig, CusfmConfig, VisionMappingConfig
 from colsfm.mapping import MappingOptions, MappingResult, bundle_adjustment_options, ceres_polish_options, run_mapping
 from colsfm.reconstruction import build_reconstruction
+from colsfm.run_config import PipelineOptions
 from colsfm.run_report import MappingStats
 
 
@@ -61,7 +65,7 @@ def fisheye_database(fisheye_rig: SyntheticRig, tmp_path_factory: pytest.TempPat
 def test_the_caspar_backend_reaches_the_options_the_solver_reads(
     synthetic_rig: SyntheticRig, isaac_config: CusfmConfig
 ) -> None:
-    """A PINHOLE rig under `ba_backend="caspar"` gets CASPAR and the settings it demands.
+    """A PINHOLE rig under a CASPAR plan gets CASPAR and the settings it demands.
 
     CASPAR throws on a free `sensor_from_rig` and on a focal length refined apart
     from the distortion block, so the options builder owes all three: the backend,
@@ -70,17 +74,16 @@ def test_the_caspar_backend_reaches_the_options_the_solver_reads(
     reconstruction: pycolmap.Reconstruction = build_reconstruction(synthetic_rig.frames_meta).reconstruction
     assert {camera.model.name for camera in reconstruction.cameras.values()} == {"PINHOLE"}
 
+    plan: BaExecutionPlan = caspar_plan(supported_camera_models=CASPAR_STOCK_CAMERA_MODELS)
     ba_options: pycolmap.BundleAdjustmentOptions = bundle_adjustment_options(
-        isaac_config.vision_mapping.bundle_adjustment, quiet_options(ba_backend="caspar"), reconstruction
+        isaac_config.vision_mapping.bundle_adjustment, quiet_options(ba_plan=plan)
     )
     assert backend_name(ba_options) == "caspar"
     assert ba_options.refine_sensor_from_rig is False
     assert ba_options.refine_extra_params == ba_options.refine_focal_length
     assert ba_options.caspar.gpu_index == "-1"
     on_gpu: pycolmap.BundleAdjustmentOptions = bundle_adjustment_options(
-        isaac_config.vision_mapping.bundle_adjustment,
-        quiet_options(ba_backend="caspar", use_gpu=True),
-        reconstruction,
+        isaac_config.vision_mapping.bundle_adjustment, quiet_options(ba_plan=plan, use_gpu=True)
     )
     assert on_gpu.caspar.gpu_index == "0"
 
@@ -88,20 +91,20 @@ def test_the_caspar_backend_reaches_the_options_the_solver_reads(
 def test_caspar_solver_options_reach_the_options_object(
     synthetic_rig: SyntheticRig, isaac_config: CusfmConfig
 ) -> None:
-    """`MappingOptions.caspar_options` lands on `BundleAdjustmentOptions.caspar`, cast.
+    """`BaExecutionPlan.caspar_options` lands on `BundleAdjustmentOptions.caspar`, cast.
 
     The convergence sweep of `docs/caspar-build.md` moves CASPAR's stopping rules
     from the command line, so the dict has to arrive at the solver intact — and the
     two iteration counters are C++ ints, which pybind11 will not take a float for.
     """
-    reconstruction: pycolmap.Reconstruction = build_reconstruction(synthetic_rig.frames_meta).reconstruction
     ba_options: pycolmap.BundleAdjustmentOptions = bundle_adjustment_options(
         isaac_config.vision_mapping.bundle_adjustment,
         quiet_options(
-            ba_backend="caspar",
-            caspar_options={"solver_iter_max": 1000, "pcg_iter_max": 80.0, "pcg_rel_error_exit": 1e-6},
+            ba_plan=caspar_plan(
+                caspar_option_items=("solver_iter_max=1000", "pcg_iter_max=80.0", "pcg_rel_error_exit=1e-6"),
+                supported_camera_models=CASPAR_STOCK_CAMERA_MODELS,
+            )
         ),
-        reconstruction,
     )
     assert backend_name(ba_options) == "caspar"
     assert ba_options.caspar.solver_iter_max == 1000
@@ -119,11 +122,12 @@ def test_caspar_solver_options_are_inert_on_ceres_and_reject_unknown_names(
     synthetic_rig: SyntheticRig, isaac_config: CusfmConfig
 ) -> None:
     """Ceres never reads the CASPAR block, and a misspelt knob is an error, not a no-op."""
-    reconstruction: pycolmap.Reconstruction = build_reconstruction(synthetic_rig.frames_meta).reconstruction
+    inert: BaExecutionPlan = resolve_ba_plan(
+        "ceres", ("solver_iter_max=1000",), ceres_polish=True, optimize_extrinsics=False
+    )
+    assert inert.caspar_options == {"solver_iter_max": 1000}
     on_ceres: pycolmap.BundleAdjustmentOptions = bundle_adjustment_options(
-        isaac_config.vision_mapping.bundle_adjustment,
-        quiet_options(caspar_options={"solver_iter_max": 1000.0}),
-        reconstruction,
+        isaac_config.vision_mapping.bundle_adjustment, quiet_options(ba_plan=inert)
     )
     assert backend_name(on_ceres) == "ceres"
     assert on_ceres.caspar.solver_iter_max == pycolmap.BundleAdjustmentOptions().caspar.solver_iter_max
@@ -138,9 +142,8 @@ def test_the_default_backend_is_ceres_and_leaves_caspar_alone(
     synthetic_rig: SyntheticRig, isaac_config: CusfmConfig
 ) -> None:
     """Without the flag nothing about the solve changes: Ceres, as every run before."""
-    reconstruction: pycolmap.Reconstruction = build_reconstruction(synthetic_rig.frames_meta).reconstruction
     ba_options: pycolmap.BundleAdjustmentOptions = bundle_adjustment_options(
-        isaac_config.vision_mapping.bundle_adjustment, quiet_options(), reconstruction
+        isaac_config.vision_mapping.bundle_adjustment, quiet_options()
     )
     assert backend_name(ba_options) == "ceres"
     assert ba_options.caspar.gpu_index == "-1"
@@ -153,23 +156,35 @@ def test_a_camera_model_this_caspar_build_cannot_project_falls_back_to_ceres(
 
     CASPAR skips the observations of a model it has no adapter for with a log line
     and still reports success, so a silent half-problem is what the fallback exists
-    to prevent. The supported set is injected rather than probed, so the test states
+    to prevent. The supported set is stated rather than probed, so the test states
     one rule — model not in the set means Ceres — on every environment.
+
+    This is the one decision resolution cannot make: the camera models arrive with
+    the reconstruction. `for_camera_models` is where it is made, once, and the plan
+    it returns is what the mapper executes and what `summary.json` reports.
     """
     rig: SyntheticRig = build_synthetic_rig(num_frames=4, num_points=50, fisheye=True, seed=3)
     reconstruction: pycolmap.Reconstruction = build_reconstruction(rig.frames_meta).reconstruction
 
+    planned: BaExecutionPlan = caspar_plan(supported_camera_models=CASPAR_STOCK_CAMERA_MODELS)
+    assert planned.backend == "caspar", "nothing is known about the cameras until the model exists"
+    narrowed: BaExecutionPlan = planned.for_camera_models(
+        camera.model.name for camera in reconstruction.cameras.values()
+    )
+    assert narrowed.backend == "ceres"
+    assert not narrowed.ceres_polish, "a Ceres run has converged; there is nothing to polish"
+    assert narrowed.fallback_reason is not None
+    assert "OPENCV_FISHEYE" in narrowed.fallback_reason
+    # The reason has to say what this build *can* do, or the reader cannot tell a
+    # missing adapter from a missing build.
+    assert "SIMPLE_RADIAL" in narrowed.fallback_reason
+    narrowed.announce()
+    assert "OPENCV_FISHEYE" in capsys.readouterr().out
+
     ba_options: pycolmap.BundleAdjustmentOptions = bundle_adjustment_options(
-        isaac_config.vision_mapping.bundle_adjustment,
-        quiet_options(ba_backend="caspar", caspar_supported_models=CASPAR_STOCK_CAMERA_MODELS),
-        reconstruction,
+        isaac_config.vision_mapping.bundle_adjustment, quiet_options(ba_plan=narrowed)
     )
     assert backend_name(ba_options) == "ceres"
-    printed: str = capsys.readouterr().out
-    assert "OPENCV_FISHEYE" in printed
-    # The warning has to say what this build *can* do, or the reader cannot tell a
-    # missing adapter from a missing build.
-    assert "SIMPLE_RADIAL" in printed
 
 
 def test_a_fisheye_rig_stays_on_caspar_when_the_build_has_the_adapter(
@@ -184,12 +199,14 @@ def test_a_fisheye_rig_stays_on_caspar_when_the_build_has_the_adapter(
     rig: SyntheticRig = build_synthetic_rig(num_frames=4, num_points=50, fisheye=True, seed=3)
     reconstruction: pycolmap.Reconstruction = build_reconstruction(rig.frames_meta).reconstruction
 
+    narrowed: BaExecutionPlan = caspar_plan(
+        supported_camera_models=CASPAR_STOCK_CAMERA_MODELS | {"OPENCV_FISHEYE"}
+    ).for_camera_models(camera.model.name for camera in reconstruction.cameras.values())
+    assert narrowed.backend == "caspar"
+    assert narrowed.fallback_reason is None
+    narrowed.announce()
     ba_options: pycolmap.BundleAdjustmentOptions = bundle_adjustment_options(
-        isaac_config.vision_mapping.bundle_adjustment,
-        quiet_options(
-            ba_backend="caspar", caspar_supported_models=CASPAR_STOCK_CAMERA_MODELS | {"OPENCV_FISHEYE"}
-        ),
-        reconstruction,
+        isaac_config.vision_mapping.bundle_adjustment, quiet_options(ba_plan=narrowed)
     )
     assert backend_name(ba_options) == "caspar"
     assert "OPENCV_FISHEYE" not in capsys.readouterr().out
@@ -274,14 +291,16 @@ def test_refining_extrinsics_falls_back_to_ceres(
     refinement moves them outside the bundle adjuster. What lands here is the
     `--no-regularised-extrinsics` ablation, and the message says so.
     """
-    reconstruction: pycolmap.Reconstruction = build_reconstruction(synthetic_rig.frames_meta).reconstruction
+    plan: BaExecutionPlan = caspar_plan(
+        optimize_extrinsics=True, supported_camera_models=CASPAR_STOCK_CAMERA_MODELS
+    )
+    assert plan.backend == "ceres"
     ba_options: pycolmap.BundleAdjustmentOptions = bundle_adjustment_options(
-        isaac_config.vision_mapping.bundle_adjustment,
-        quiet_options(ba_backend="caspar", optimize_extrinsics=True),
-        reconstruction,
+        isaac_config.vision_mapping.bundle_adjustment, quiet_options(ba_plan=plan, optimize_extrinsics=True)
     )
     assert backend_name(ba_options) == "ceres"
     assert ba_options.refine_sensor_from_rig is True
+    plan.announce()
     assert "no-regularised-extrinsics" in capsys.readouterr().out
 
 
@@ -308,7 +327,7 @@ def test_the_mapper_runs_on_caspar_or_reports_the_build_that_cannot(
         build_reconstruction(synthetic_rig.frames_meta),
         synthetic_database,
         mapping_config,
-        quiet_options(ba_backend="caspar"),
+        quiet_options(ba_plan=caspar_plan()),
     )
     printed: str = capsys.readouterr().out
 
@@ -319,7 +338,6 @@ def test_the_mapper_runs_on_caspar_or_reports_the_build_that_cannot(
 
     if not caspar_enabled:
         assert caspar.ba_backend == "ceres"
-        assert "CASPAR_ENABLED" in printed
         assert caspar.num_points3D == ceres.num_points3D
         assert stats.ba_backend == "ceres"
         assert stats.ba_fallback_reason == CASPAR_BUILD_FALLBACK_REASON
@@ -327,7 +345,7 @@ def test_the_mapper_runs_on_caspar_or_reports_the_build_that_cannot(
         return
 
     assert caspar.ba_backend == "caspar"
-    assert "CASPAR_ENABLED" not in printed
+    assert "CASPAR_ENABLED" not in printed, "nothing fell back, so nothing is announced"
     assert stats.ba_backend == "caspar"
     assert stats.ba_fallback_reason is None
     recovered, mixed_tracks, relative_errors = match_tracks_to_truth(caspar.reconstruction, synthetic_rig)
@@ -342,6 +360,38 @@ def test_the_mapper_runs_on_caspar_or_reports_the_build_that_cannot(
     assert caspar.num_points3D == pytest.approx(ceres.num_points3D, rel=0.05)
     assert caspar.mean_reprojection_error_px == pytest.approx(ceres.mean_reprojection_error_px, abs=0.05)
 
+
+
+def test_the_mapping_result_carries_the_plan_its_solves_ran_on(
+    synthetic_rig: SyntheticRig, synthetic_database: Path, isaac_config: CusfmConfig, caspar_enabled: bool
+) -> None:
+    """What `summary.json` reports is the object the solves executed, not a re-derivation.
+
+    `run_mapping` used to resolve the backend three times — once to record it, once
+    per `bundle_adjustment_options` call, and once more by *comparing* the two to
+    guess a fallback reason — while the solve path could still rewrite the backend
+    underneath all three. There is one plan now, and every reported field reads off it.
+    """
+    result: MappingResult = run_mapping(
+        build_reconstruction(synthetic_rig.frames_meta),
+        synthetic_database,
+        isaac_config.vision_mapping,
+        quiet_options(ba_plan=caspar_plan()),
+    )
+    assert result.ba_plan.requested_backend == "caspar"
+    assert result.ba_backend == result.ba_plan.backend
+    assert result.ba_fallback_reason == result.ba_plan.fallback_reason
+    assert (result.polish is not None) is result.ba_plan.ceres_polish
+
+    stats: MappingStats = MappingStats.of(result)
+    assert stats.ba_backend == result.ba_plan.backend
+    assert stats.ba_fallback_reason == result.ba_plan.fallback_reason
+    if caspar_enabled:
+        assert result.ba_plan.backend == "caspar"
+        assert result.ba_plan.fallback_reason is None
+    else:
+        assert result.ba_plan.backend == "ceres"
+        assert result.ba_plan.fallback_reason == CASPAR_BUILD_FALLBACK_REASON
 
 
 def test_a_fisheye_rig_maps_on_caspar_only_where_the_adapter_exists(
@@ -365,7 +415,7 @@ def test_a_fisheye_rig_maps_on_caspar_only_where_the_adapter_exists(
         build_reconstruction(fisheye_rig.frames_meta),
         fisheye_database,
         isaac_config.vision_mapping,
-        quiet_options(ba_backend="caspar"),
+        quiet_options(ba_plan=caspar_plan()),
     )
     printed: str = capsys.readouterr().out
     recovered, mixed_tracks, relative_errors = match_tracks_to_truth(result.reconstruction, fisheye_rig)
@@ -399,11 +449,12 @@ def test_the_polish_option_set_is_the_ceres_one_built_from_the_same_config(
     and the same frozen extrinsics — so the polish has to be that solve and not a
     fresh set of defaults.
     """
-    reconstruction: pycolmap.Reconstruction = build_reconstruction(synthetic_rig.frames_meta).reconstruction
     ba_config: BundleAdjustmentConfig = isaac_config.vision_mapping.bundle_adjustment
-    options: MappingOptions = quiet_options(ba_backend="caspar")
-    rounds: pycolmap.BundleAdjustmentOptions = bundle_adjustment_options(ba_config, options, reconstruction)
-    polish: pycolmap.BundleAdjustmentOptions = ceres_polish_options(ba_config, options, reconstruction)
+    options: MappingOptions = quiet_options(
+        ba_plan=caspar_plan(supported_camera_models=CASPAR_STOCK_CAMERA_MODELS)
+    )
+    rounds: pycolmap.BundleAdjustmentOptions = bundle_adjustment_options(ba_config, options)
+    polish: pycolmap.BundleAdjustmentOptions = ceres_polish_options(ba_config, options)
 
     assert backend_name(rounds) == "caspar"
     assert backend_name(polish) == "ceres"
@@ -419,9 +470,18 @@ def test_the_polish_option_set_is_the_ceres_one_built_from_the_same_config(
 
 
 def test_the_polish_is_on_by_default_and_switches_off() -> None:
-    """The ablation switch is a field, and the default is the shipped behaviour."""
-    assert MappingOptions().caspar_ceres_polish is True
-    assert quiet_options(caspar_ceres_polish=False).caspar_ceres_polish is False
+    """The ablation switch reaches the plan, and the default is the shipped behaviour.
+
+    `ceres_polish` is only ever True on a plan that ended on CASPAR: a Ceres run has
+    already converged, so the plan zeroes the request rather than leaving the mapper
+    to test the backend a second time.
+    """
+    assert PipelineOptions(input_dir=Path(), output_dir=Path()).caspar_ceres_polish is True
+    assert caspar_plan(supported_camera_models=CASPAR_STOCK_CAMERA_MODELS).ceres_polish is True
+    assert not caspar_plan(
+        ceres_polish=False, supported_camera_models=CASPAR_STOCK_CAMERA_MODELS
+    ).ceres_polish
+    assert not MappingOptions().ba_plan.ceres_polish
 
 
 def test_the_ceres_backend_never_polishes(
@@ -461,7 +521,7 @@ def test_the_caspar_run_finishes_with_one_ceres_bundle_adjustment(
         build_reconstruction(synthetic_rig.frames_meta),
         synthetic_database,
         isaac_config.vision_mapping,
-        quiet_options(ba_backend="caspar", verbose=True),
+        quiet_options(ba_plan=caspar_plan(), verbose=True),
     )
     printed: str = capsys.readouterr().out
 
@@ -486,14 +546,14 @@ def test_the_polish_can_be_switched_off_for_an_ablation(
     isaac_config: CusfmConfig,
     caspar_enabled: bool,
 ) -> None:
-    """`caspar_ceres_polish=False` leaves a CASPAR run exactly where CASPAR stopped."""
+    """A plan with `ceres_polish=False` leaves a CASPAR run exactly where CASPAR stopped."""
     if not caspar_enabled:
         pytest.skip("this pycolmap is built without CASPAR_ENABLED; run under `pixi run -e colsfm-caspar`")
     result: MappingResult = run_mapping(
         build_reconstruction(synthetic_rig.frames_meta),
         synthetic_database,
         isaac_config.vision_mapping,
-        quiet_options(ba_backend="caspar", caspar_ceres_polish=False),
+        quiet_options(ba_plan=caspar_plan(ceres_polish=False)),
     )
     assert result.ba_backend == "caspar"
     assert result.polish is None

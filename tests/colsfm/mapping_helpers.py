@@ -30,6 +30,7 @@ from jaxtyping import Bool, Float64, Int, UInt32
 from numpy import ndarray
 from scipy.spatial.transform import Rotation
 
+from colsfm.ba_backend import BaExecutionPlan, CasparCapability, resolve_ba_plan
 from colsfm.cameras import colmap_cameras
 from colsfm.config import VisionMappingConfig
 from colsfm.frames_meta import FramesMeta, parse_message, write_rigid_transform
@@ -351,6 +352,49 @@ def synthetic_matches(rig: SyntheticRig, min_matches: int = 20) -> dict[tuple[in
             [np.searchsorted(left, common), np.searchsorted(right, common)], axis=1
         ).astype(np.uint32)
     return matches
+
+
+def caspar_plan(
+    *,
+    caspar_option_items: tuple[str, ...] = (),
+    ceres_polish: bool = True,
+    optimize_extrinsics: bool = False,
+    supported_camera_models: frozenset[str] | None = None,
+) -> BaExecutionPlan:
+    """A `--ba-backend caspar` execution plan, for a test that wants the GPU backend.
+
+    `MappingOptions` carries the plan rather than the knobs it was made from, so a
+    test states what it wants here and hands the result to `quiet_options`. Stating a
+    capability is how a test says "a build whose adapters stop here" without needing
+    that build: the probe is skipped and every later decision — the pre-flight and
+    `BaExecutionPlan.for_camera_models` — honours what was stated.
+
+    Args:
+        caspar_option_items: `--caspar-option name=value` strings, validated as a run
+            would validate them.
+        ceres_polish: Whether a closing Ceres bundle adjustment finishes a CASPAR run.
+        optimize_extrinsics: Whether the *bundle adjustment* frees `sensor_from_rig`,
+            which CASPAR cannot honour.
+        supported_camera_models: The camera models to treat as CASPAR-supported, or
+            None to measure this build.
+
+    Returns:
+        The plan.
+    """
+    capability: CasparCapability | None = (
+        None
+        if supported_camera_models is None
+        else CasparCapability(
+            availability="available", supported_camera_models=supported_camera_models, probe_errors=()
+        )
+    )
+    return resolve_ba_plan(
+        "caspar",
+        caspar_option_items,
+        ceres_polish=ceres_polish,
+        optimize_extrinsics=optimize_extrinsics,
+        capability=capability,
+    )
 
 
 def quiet_options(**overrides: object) -> MappingOptions:

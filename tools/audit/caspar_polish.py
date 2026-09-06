@@ -206,8 +206,9 @@ def polish(config: PolishConfig) -> SolveReport:
     ba_config: BundleAdjustmentConfig = cusfm_config.vision_mapping.bundle_adjustment
     if config.loss_type is not None:
         ba_config = replace(ba_config, loss_type=config.loss_type)
-    options: MappingOptions = MappingOptions(ba_backend="ceres", num_threads=config.num_threads, verbose=False)
-    ba_options: pycolmap.BundleAdjustmentOptions = bundle_adjustment_options(ba_config, options, reconstruction)
+    # The default plan is Ceres with no polish, which is exactly what this tool solves.
+    options: MappingOptions = MappingOptions(num_threads=config.num_threads, verbose=False)
+    ba_options: pycolmap.BundleAdjustmentOptions = bundle_adjustment_options(ba_config, options)
 
     before_reprojection_px: float = reconstruction.compute_mean_reprojection_error()
     before_track: RigTrack = rig_track_of(reconstruction, template)

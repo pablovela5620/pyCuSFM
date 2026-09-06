@@ -27,17 +27,20 @@ The module answers three questions, in order:
    backend and the reason reach `summary.json`.
 
 The fallbacks themselves are unchanged and deliberate. CASPAR *silently drops*
-the observations of a camera model it has no adapter for, and *throws* when asked
-to refine `sensor_from_rig`; both make Ceres take the solve, loudly. A build
-without CASPAR is only discovered when a solve is attempted, so that fallback
-still happens inside `colsfm.mapping` — but it now names itself in the plan the
-run reports rather than only on stdout.
+the observations of a camera model it has no adapter for, *throws* when asked to
+refine `sensor_from_rig`, and cannot solve at all in a build without it; all three
+make Ceres take the solve, loudly. All three are decided here, before the run
+writes anything: the capability probe finds out about the missing build by
+solving, so `colsfm.mapping` never has to discover it mid-run. The camera models
+are the one fact that arrives late — the reconstruction does not exist at
+resolution — and `BaExecutionPlan.for_camera_models` narrows the plan with them
+exactly once, which is the plan the mapper then executes and reports.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cache
 from typing import Final, Literal, TypeAlias
 
@@ -49,7 +52,7 @@ from numpy import ndarray
 from colsfm.reconstruction import RIG_ID, camera_sensor_id
 
 BaBackend: TypeAlias = Literal["ceres", "caspar"]
-"""Which implementation solves the global bundle adjustment; `MappingOptions.ba_backend`."""
+"""Which implementation solves the global bundle adjustment; `BaExecutionPlan.backend`."""
 
 BUNDLE_ADJUSTMENT_BACKEND: Final[dict[BaBackend, pycolmap.BundleAdjustmentBackend]] = {
     "ceres": pycolmap.BundleAdjustmentBackend.CERES,
@@ -291,6 +294,17 @@ class CasparCapability:
         return frozenset(name for name in camera_model_names if name not in self.supported_camera_models)
 
 
+CASPAR_NOT_MEASURED: Final[CasparCapability] = CasparCapability(
+    availability="unavailable", supported_camera_models=frozenset(), probe_errors=()
+)
+"""What a plan carries when nothing asked the build anything.
+
+A `--ba-backend ceres` run never probes: the probe costs five GPU solves and no
+decision in the plan would read the answer. `unavailable` is the honest value —
+nothing has been shown to work — and it is unreachable, because every path that
+reads a capability first checks that the backend is `caspar`."""
+
+
 @cache
 def detect_caspar_capability() -> CasparCapability:
     """Measure what this build's CASPAR projects, once for the life of the process.
@@ -481,7 +495,17 @@ CASPAR_BUILD_FALLBACK_REASON: Final[str] = (
     "this pycolmap is built without CASPAR_ENABLED, so the GPU backend cannot solve "
     "(the `colsfm-caspar` environments have the build that can)"
 )
-"""Why a `caspar` request ends up on Ceres at solve time; discovered only by solving."""
+"""Why a `caspar` request ends up on Ceres when the build has no CASPAR.
+
+`detect_caspar_capability` already discovers this -- its probe *is* a CASPAR solve --
+so the run knows it before it creates anything, and no bundle adjustment ever has to
+catch `CASPAR_DISABLED_MARKER` mid-run to find out."""
+
+CASPAR_PROBE_FAILED_REASON: Final[str] = (
+    "this build has CASPAR but every probe model raised, so it cannot be trusted with "
+    "the run; `CasparCapability.probe_errors` carries what it said"
+)
+"""Why a `caspar` request ends up on Ceres when the probe could not run a single model."""
 
 
 def unsupported_models_reason(supported: Iterable[str], unsupported: Iterable[str]) -> str:
@@ -509,9 +533,11 @@ def resolve_backend(
 ) -> tuple[BaBackend, str | None]:
     """The backend that will actually run, and why it is not the requested one.
 
-    Neither fallback is an error: CASPAR would *silently* drop the observations of a
-    camera model this build has no adapter for, and would hold `sensor_from_rig`
-    fixed where the caller asked for it to move. Both hand the solve to Ceres.
+    No fallback is an error: CASPAR would *silently* drop the observations of a camera
+    model this build has no adapter for, would hold `sensor_from_rig` fixed where the
+    caller asked for it to move, and cannot solve at all in a build without it. All
+    three hand the solve to Ceres, and all three are decided here — there is no
+    mid-run discovery left, because the capability probe finds out by solving.
 
     Args:
         requested: The backend the caller asked for.
@@ -529,6 +555,10 @@ def resolve_backend(
     if optimize_extrinsics:
         return "ceres", EXTRINSICS_FALLBACK_REASON
     measured: CasparCapability = detect_caspar_capability() if capability is None else capability
+    if measured.availability == "unavailable":
+        return "ceres", CASPAR_BUILD_FALLBACK_REASON
+    if measured.availability == "probe_failed":
+        return "ceres", CASPAR_PROBE_FAILED_REASON
     if camera_model_names is not None:
         unsupported: frozenset[str] = measured.unsupported(camera_model_names)
         if unsupported:
@@ -559,8 +589,13 @@ class BaExecutionPlan:
     """Why `backend` is not `requested_backend`, or None when it is.
 
     The record the run keeps of a decision that used to exist only as a line on
-    stdout. A solve-time fallback — a pycolmap without CASPAR — is discovered later
-    and replaces this with `CASPAR_BUILD_FALLBACK_REASON`."""
+    stdout, and the one `summary.json` reports."""
+    capability: CasparCapability
+    """What the build was measured to do when this plan was made.
+
+    Carried so that `for_camera_models` narrows against the same measurement the rest
+    of the plan was decided on, and so that a caller — a test, a sweep — can state a
+    capability once and have every later decision honour it."""
 
     @property
     def fell_back(self) -> bool:
@@ -570,6 +605,56 @@ class BaExecutionPlan:
             True when `backend` differs from `requested_backend`.
         """
         return self.backend != self.requested_backend
+
+    def for_camera_models(self, camera_model_names: Iterable[str]) -> BaExecutionPlan:
+        """The same plan, narrowed by the camera models the reconstruction turned out to hold.
+
+        The one fact resolution cannot have: the reconstruction is built in stage 7,
+        long after the plan is made. Everything else is already decided, so this can
+        only move `caspar` to `ceres`, never the other way.
+
+        Args:
+            camera_model_names: `pycolmap.CameraModelId` member names in the model
+                about to be adjusted.
+
+        Returns:
+            This plan when nothing changes, or the Ceres plan with the camera-model
+            reason when CASPAR would drop a model's observations.
+        """
+        if self.backend != "caspar":
+            return self
+        unsupported: frozenset[str] = self.capability.unsupported(camera_model_names)
+        if not unsupported:
+            return self
+        return replace(
+            self,
+            backend="ceres",
+            ceres_polish=False,
+            fallback_reason=unsupported_models_reason(self.capability.supported_camera_models, unsupported),
+        )
+
+    def announce(self) -> None:
+        """Print the fallback, once, wherever it was decided.
+
+        A `--ba-backend caspar` run that solves on Ceres has to say so: the reason is
+        recorded in `summary.json`, but somebody watching the run needs it now.
+        """
+        if self.fallback_reason is not None:
+            print(f"[colsfm] {self.fallback_reason}; using Ceres")
+
+
+CERES_ONLY_PLAN: Final[BaExecutionPlan] = BaExecutionPlan(
+    requested_backend="ceres",
+    backend="ceres",
+    caspar_options={},
+    ceres_polish=False,
+    fallback_reason=None,
+    capability=CASPAR_NOT_MEASURED,
+)
+"""The plan of a caller who said nothing about bundle adjustment: Ceres, no polish.
+
+`MappingOptions.ba_plan`'s default, and what every solve outside a `--ba-backend
+caspar` run executes. Nothing fell back, so there is no reason to report."""
 
 
 def resolve_ba_plan(
@@ -610,11 +695,19 @@ def resolve_ba_plan(
             fractional value.
     """
     options: CasparOptions = parse_caspar_options(caspar_option_items)
+    # Measured here rather than inside `resolve_backend`, so the plan carries the same
+    # answer into `for_camera_models` instead of asking the build a second time. A
+    # `ceres` request never probes: nothing in the plan will consult the answer.
+    measured: CasparCapability = CASPAR_NOT_MEASURED
+    if capability is not None:
+        measured = capability
+    elif requested == "caspar":
+        measured = detect_caspar_capability()
     backend, reason = resolve_backend(
         requested,
         optimize_extrinsics=optimize_extrinsics,
         camera_model_names=camera_model_names,
-        capability=capability,
+        capability=measured,
     )
     return BaExecutionPlan(
         requested_backend=requested,
@@ -622,4 +715,5 @@ def resolve_ba_plan(
         caspar_options=options,
         ceres_polish=ceres_polish and backend == "caspar",
         fallback_reason=reason,
+        capability=measured,
     )

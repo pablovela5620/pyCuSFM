@@ -18,7 +18,9 @@ from typing import TypeAlias
 import pycolmap
 
 from colsfm.ba_backend import (
+    CERES_ONLY_PLAN,
     BaBackend,
+    BaExecutionPlan,
 )
 from colsfm.correspondences import registered_image_ids
 from colsfm.reconstruction import (
@@ -131,23 +133,42 @@ class MappingResult:
     extrinsics_refined: bool = False
     """Whether this pass refined `sensor_from_rig`; what makes `refined_extrinsics`
     something other than the input calibration read back out of the rig."""
-    ba_backend: BaBackend = "ceres"
-    """Which backend the solves actually ran on — `ceres` whenever one of the three
-    fallbacks of `MappingOptions.ba_backend` fired, so this is evidence rather than a
-    request."""
-    ba_fallback_reason: str | None = None
-    """Why `ba_backend` is not what was asked for, or None when it is.
+    ba_plan: BaExecutionPlan = CERES_ONLY_PLAN
+    """The plan these solves executed, narrowed by this model's camera models.
 
-    The three sentences of `colsfm.ba_backend`: an unsupported camera model, a solve
-    asked to free `sensor_from_rig`, or a pycolmap built without CASPAR_ENABLED. Recorded
-    rather than only printed, so `summary.json` says why a run that asked for the
-    GPU backend solved on the CPU."""
+    Evidence, not a request: `run_mapping` receives the run's plan, narrows it once
+    against the reconstruction it is about to adjust, and returns the object it
+    actually solved on. `ba_backend` and `ba_fallback_reason` read off it, so the two
+    cannot disagree with each other or with what ran."""
     polish: PolishStats | None = None
     """The closing Ceres solve of a CASPAR run, or None when none ran.
 
-    None means either `ba_backend == "ceres"` — a fallback included, since a Ceres
-    run is already at its own fixed point — or `caspar_ceres_polish` switched off.
+    None means either `ba_plan.backend == "ceres"` — a fallback included, since a
+    Ceres run is already at its own fixed point — or `--no-caspar-ceres-polish`.
     Its seconds are part of `bundle_adjustment_seconds`."""
+
+    @property
+    def ba_backend(self) -> BaBackend:
+        """Which backend the solves actually ran on, fallbacks applied.
+
+        Returns:
+            `ba_plan.backend`, which is `ceres` whenever one of the fallbacks of
+            `colsfm.ba_backend` fired.
+        """
+        return self.ba_plan.backend
+
+    @property
+    def ba_fallback_reason(self) -> str | None:
+        """Why the backend is not what was asked for, or None when it is.
+
+        Returns:
+            `ba_plan.fallback_reason`: an unsupported camera model, a solve asked to
+            free `sensor_from_rig`, a pycolmap built without CASPAR_ENABLED, or a
+            probe that could not run. Recorded rather than only printed, so
+            `summary.json` says why a run that asked for the GPU backend solved on
+            the CPU.
+        """
+        return self.ba_plan.fallback_reason
 
     @property
     def num_registered_images(self) -> int:

@@ -124,7 +124,6 @@ from colsfm.geometry import MILLIMETRES_PER_METRE, relative_rotation_degrees
 from colsfm.mapping import (
     MappingOptions,
     MappingResult,
-    backend_name,
     bundle_adjustment_options,
     registered_image_ids,
     run_mapping,
@@ -357,16 +356,16 @@ def refine_extrinsics(
             regularised=False,
         )
 
-    # `mapping.ba_backend` rather than `mapping_options.ba_backend`: whatever fallback
-    # the mapping pass already resolved holds here too, and re-requesting a backend that
-    # just failed would only repeat its message once per round.
+    # `mapping.ba_plan` rather than `mapping_options.ba_plan`: the mapping pass has
+    # already narrowed the plan against this very reconstruction, so the rounds solve on
+    # exactly what it solved on rather than re-deciding -- and announcing -- per round.
     base_options: MappingOptions = dataclasses.replace(
-        mapping_options, optimize_extrinsics=False, ba_backend=mapping.ba_backend
+        mapping_options, optimize_extrinsics=False, ba_plan=mapping.ba_plan
     )
     # The same gauge `run_mapping` picked for the mapping pass: the frame owning the
     # lowest registered image id, which is cuSFM's own choice (spec §6.3).
     gauge_frame_id: int = reconstruction.image(min(registered_image_ids(reconstruction))).frame_id
-    ba_options: pycolmap.BundleAdjustmentOptions = bundle_adjustment_options(ba_config, base_options, reconstruction)
+    ba_options: pycolmap.BundleAdjustmentOptions = bundle_adjustment_options(ba_config, base_options)
     # Neither of these changes across the rounds: bundle adjustment moves poses and
     # points but adds and removes no observation, so which image saw which point — and
     # therefore which cameras co-observed — is fixed. Only the geometry is re-gathered.
@@ -419,14 +418,14 @@ def refine_extrinsics(
 
     # Only the timings and the "extrinsics moved" flag need replacing: every count on a
     # `MappingResult` is a property over this very reconstruction, so they are already up
-    # to date with the alternation that just finished.
+    # to date with the alternation that just finished. The plan is the mapping pass's own
+    # -- these rounds solved on it -- so it carries through untouched.
     updated: MappingResult = dataclasses.replace(
         mapping,
         bundle_adjustment_seconds=mapping.bundle_adjustment_seconds
         + sum(round_stats.bundle_adjustment_seconds for round_stats in rounds),
         total_seconds=mapping.total_seconds + (time.perf_counter() - started),
         extrinsics_refined=True,
-        ba_backend=backend_name(ba_options),
     )
     return ExtrinsicRefinementResult(
         mapping=updated, rounds=tuple(rounds), converged=converged, regularised=True
