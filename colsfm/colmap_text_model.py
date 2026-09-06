@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from jaxtyping import Float64, Int
+from jaxtyping import Float64, UInt8
 from numpy import ndarray
 from scipy.spatial.transform import Rotation
 
@@ -45,7 +45,7 @@ class ColmapModel:
     """Image name (as written in ``frames_meta.json``) -> camera pose in world."""
     points_xyz: Float64[ndarray, "n_points 3"]
     """Sparse point positions."""
-    points_rgb: Int[ndarray, "n_points 3"]
+    points_rgb: UInt8[ndarray, "n_points 3"]
     """Per-point colour."""
 
 
@@ -105,7 +105,7 @@ def parse_colmap_images_text(text: str) -> list[ColmapImage]:
     return images
 
 
-def parse_colmap_points_text(text: str) -> tuple[Float64[ndarray, "n_points 3"], Int[ndarray, "n_points 3"]]:
+def parse_colmap_points_text(text: str) -> tuple[Float64[ndarray, "n_points 3"], UInt8[ndarray, "n_points 3"]]:
     """Parse the contents of a COLMAP ``points3D.txt`` into positions and colours.
 
     One line per point, so no pairing to get wrong; comments and blank lines are

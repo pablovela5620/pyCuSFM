@@ -295,13 +295,30 @@ def test_publication_renames_a_unique_temporary_and_leaves_none_behind(tmp_path:
     assert sorted(path.name for path in destination.parent.iterdir()) == ["engine.engine"]
 
 
-def test_a_failed_publication_leaves_the_previous_file_intact(tmp_path: Path) -> None:
-    """A build that dies mid-write must not replace a good engine with a stub."""
+def test_a_failed_publication_leaves_the_previous_file_intact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A build that dies mid-write must not replace a good engine, nor leave a temporary.
+
+    The failure is injected at the *rename*, which is the step the whole design is
+    about: the write has already happened into a unique temporary, so this is the
+    one moment at which a bad implementation could clobber the destination. An
+    earlier version of this test passed a `str` payload instead, which fails at the
+    type boundary and so never reaches the write it claims to roll back — and under
+    the beartype claw it did not even raise the exception it asserted.
+    """
     destination: Path = tmp_path / "engine.engine"
     destination.write_bytes(b"a good engine")
 
-    with pytest.raises(TypeError):
-        publish_atomically(destination, "not bytes")  # type: ignore[arg-type]
+    def failing_replace(self: Path, target: str | Path) -> None:
+        """Stand in for `Path.replace`, failing the way a full disk would."""
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(Path, "replace", failing_replace)
+    with pytest.raises(OSError, match="no space left on device"):
+        publish_atomically(destination, b"a better engine")
 
     assert destination.read_bytes() == b"a good engine"
-    assert sorted(path.name for path in tmp_path.iterdir()) == ["engine.engine"]
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["engine.engine"], (
+        "the temporary must be removed on the way out, whatever failed"
+    )
