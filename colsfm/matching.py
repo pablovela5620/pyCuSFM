@@ -94,6 +94,7 @@ from colsfm.database import (
     Keypoints,
     KeypointsXY,
     MatchIndices,
+    database_transaction,
     delete_two_view_geometries,
     pair_inlier_counts,
     raw_match_counts,
@@ -673,6 +674,11 @@ def cap_verified_matches(
     Returns:
         Total inlier matches removed across every pair; 0 when nothing is capped.
     """
+    # Nothing is capped, so nothing needs reading: under `--match-cap-mode off` the
+    # keypoint read below is a whole pass over the database for a loop that would
+    # `continue` on every pair.
+    if not options.match_limit.limits:
+        return 0
     removed: int = 0
     first_image_ids: list[int] = sorted({pair[0] for pair in pairs})
     # `read_keypoints_batch` owns the "leading xy columns" rule; spelling it a second time
@@ -680,21 +686,24 @@ def cap_verified_matches(
     keypoints_by_image_id: dict[int, Keypoints] = read_keypoints_batch(database_path, first_image_ids)
     with pycolmap.Database.open(database_path) as database:
         sizes: dict[int, tuple[int, int]] = _image_sizes(database, first_image_ids)
-        for image_id1, image_id2 in pairs:
-            width, height = sizes[image_id1]
-            cap: int | None = options.match_limit.limit_for(width, height)
-            if cap is None:
-                continue
-            geometry: pycolmap.TwoViewGeometry = database.read_two_view_geometry(image_id1, image_id2)
-            inliers: MatchIndices = np.asarray(geometry.inlier_matches, dtype=np.int64)
-            if len(inliers) <= cap:
-                continue
-            kept: MatchIndices = subsample_matches_by_coverage(
-                keypoints_by_image_id[image_id1], inliers, width, height, cap
-            )
-            removed += len(inliers) - len(kept)
-            geometry.inlier_matches = kept.astype(np.uint32)
-            database.update_two_view_geometry(image_id1, image_id2, geometry)
+        # One transaction for the whole rewrite: SQLite gives an unbatched statement a
+        # transaction of its own, so this used to be one commit per capped pair.
+        with database_transaction(database):
+            for image_id1, image_id2 in pairs:
+                width, height = sizes[image_id1]
+                cap: int | None = options.match_limit.limit_for(width, height)
+                if cap is None:
+                    continue
+                geometry: pycolmap.TwoViewGeometry = database.read_two_view_geometry(image_id1, image_id2)
+                inliers: MatchIndices = np.asarray(geometry.inlier_matches, dtype=np.int64)
+                if len(inliers) <= cap:
+                    continue
+                kept: MatchIndices = subsample_matches_by_coverage(
+                    keypoints_by_image_id[image_id1], inliers, width, height, cap
+                )
+                removed += len(inliers) - len(kept)
+                geometry.inlier_matches = kept.astype(np.uint32)
+                database.update_two_view_geometry(image_id1, image_id2, geometry)
     return removed
 
 

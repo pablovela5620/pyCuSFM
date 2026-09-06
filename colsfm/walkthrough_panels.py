@@ -30,7 +30,7 @@ from colsfm.alignment import RigTrack, rig_track_from_frames_meta
 from colsfm.bench_report import render_markdown_report
 from colsfm.benchmark import AcceptanceBounds, Comparison, RunArtifacts, compare_runs, read_run
 from colsfm.config import CusfmConfig
-from colsfm.database import ImagePair, KeypointsXY, read_keypoints, read_two_view_geometry
+from colsfm.database import ImagePair, Keypoints, read_keypoints_batch, read_two_view_geometry
 from colsfm.features import ExtractionReport
 from colsfm.frames_meta import FRAMES_META_NAME, FramesMeta, KeyframeMeta, RigFrame, read_frames_meta
 from colsfm.mapping import MappingResult, RoundStats
@@ -226,13 +226,19 @@ def log_feature_extraction(
     """
     rr.set_time(STAGE_TIMELINE, sequence=stage.index)
     panes: list[SamplePane] = []
-    for keyframe in sample_keyframes(selected, num_samples):
+    drawable: list[KeyframeMeta] = [
+        keyframe for keyframe in sample_keyframes(selected, num_samples) if image_path_of(input_dir, keyframe).is_file()
+    ]
+    # One database handle for the panel, not one per sample: `read_keypoints` opens and
+    # closes the file every call.
+    keypoints_by_id: dict[int, Keypoints] = read_keypoints_batch(
+        database_path, [keyframe.keyframe_id for keyframe in drawable]
+    )
+    for keyframe in drawable:
         sensor_name: str = selected.cameras[keyframe.camera_params_id].sensor_name
         sample_path: str = f"{stage.entity_root}/samples/{sensor_name}_{keyframe.keyframe_id}"
         image_path: Path = image_path_of(input_dir, keyframe)
-        if not image_path.is_file():
-            continue
-        keypoints_xy: KeypointsXY = read_keypoints(database_path, keyframe.keyframe_id)
+        keypoints_xy: Keypoints = keypoints_by_id[keyframe.keyframe_id]
         rr.log(f"{sample_path}/image", rr.EncodedImage(path=image_path))
         rr.log(
             f"{sample_path}/keypoints",
@@ -404,8 +410,10 @@ def _log_match_pair(
 
     geometry: pycolmap.TwoViewGeometry = read_two_view_geometry(database_path, pair[0], pair[1])
     matches: Int64[ndarray, "m 2"] = np.asarray(geometry.inlier_matches, dtype=np.int64).reshape(-1, 2)
-    left_keypoints: KeypointsXY = read_keypoints(database_path, pair[0])
-    right_keypoints: KeypointsXY = read_keypoints(database_path, pair[1])
+    # Both sides through one handle; `read_keypoints` would open the database twice more.
+    keypoints_by_id: dict[int, Keypoints] = read_keypoints_batch(database_path, pair)
+    left_keypoints: Keypoints = keypoints_by_id[pair[0]]
+    right_keypoints: Keypoints = keypoints_by_id[pair[1]]
     left_matched: Float64[ndarray, "m 2"] = rerun_keypoints(left_keypoints[matches[:, 0]]) if len(matches) else np.zeros((0, 2))
     right_matched: Float64[ndarray, "m 2"] = rerun_keypoints(right_keypoints[matches[:, 1]]) if len(matches) else np.zeros((0, 2))
 

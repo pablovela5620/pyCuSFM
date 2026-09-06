@@ -377,7 +377,9 @@ def delete_two_view_geometries(database_path: Path, pairs: Sequence[ImagePair]) 
         database_path: An existing database.
         pairs: Image pairs whose geometries should be removed.
     """
-    with pycolmap.Database.open(database_path) as database:
+    # One transaction, as `create_database` and the feature writers use: SQLite wraps
+    # each unbatched delete in its own otherwise, which is one commit per pair.
+    with pycolmap.Database.open(database_path) as database, database_transaction(database):
         for image_id1, image_id2 in pairs:
             database.delete_two_view_geometry(image_id1, image_id2)
 

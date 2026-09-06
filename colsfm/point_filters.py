@@ -83,11 +83,14 @@ def filter_degenerate_points(
     Returns:
         Observations removed, i.e. the summed track length of the deleted points.
     """
-    point3D_ids: list[int] = list(reconstruction.points3D)
-    if not point3D_ids:
+    # One walk of the map, not an id list and then a lookup per id: the map is
+    # 210 000 entries on RoboCap and the second pass bought nothing.
+    points: list[tuple[int, pycolmap.Point3D]] = list(reconstruction.points3D.items())
+    if not points:
         return 0
+    point3D_ids: list[int] = [point3D_id for point3D_id, _ in points]
     points_xyz: Float64[ndarray, "num_points 3"] = np.array(
-        [reconstruction.point3D(point3D_id).xyz for point3D_id in point3D_ids], dtype=np.float64
+        [point.xyz for _, point in points], dtype=np.float64
     )
     # `np.abs(nan) > threshold` is False, so the finiteness term has to carry the NaNs.
     out_of_bounds: Bool[ndarray, "num_points"] = ~np.isfinite(points_xyz).all(axis=1) | (
@@ -148,10 +151,12 @@ def filter_projection_failures(
     bound_px: float = projection_sanity_bound_px(reconstruction)
     if bound_px <= 0.0:
         return 0
-    # `filter_points3D` covers reprojection error, cheirality and triangulation angle;
-    # a zero angle threshold switches the last of the three off, leaving the two that
-    # describe a failed projection.
-    return observation_manager.filter_points3D(bound_px, 0.0, set(reconstruction.points3D))
+    # `filter_all_points3D` covers reprojection error, cheirality and triangulation
+    # angle over the whole map; a zero angle threshold switches the last of the three
+    # off, leaving the two that describe a failed projection. `_filter_points` already
+    # calls it this way -- naming every point in a set was the same request, built by
+    # copying 210 000 ids out of the map first.
+    return observation_manager.filter_all_points3D(bound_px, 0.0)
 
 
 def _filter_points(

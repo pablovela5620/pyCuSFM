@@ -130,6 +130,35 @@ class DeviceTensor:
     """Device address, as `cudaMalloc` and `set_tensor_address` both spell it."""
     shape: tuple[int, ...]
     """The shape to declare for the binding this tensor is passed as."""
+    dtype: np.dtype[Any]
+    """Element type of the memory at `pointer`.
+
+    Carried so that `TensorRTSession.run` can check a device input against the
+    binding's dtype exactly as it checks a host array. Without it the device path was
+    the one input the session bound unexamined, and a preprocessor rebuilt at another
+    precision would have been read as whatever the engine expected."""
+    capacity_bytes: int
+    """Bytes the allocation behind `pointer` holds.
+
+    The producer owns a fixed buffer sized for its largest batch and returns a view of
+    the first `count` frames, so `shape` is normally smaller than this. The session
+    checks `nbytes <= capacity_bytes`, which is the device equivalent of the
+    contiguity check a host array gets."""
+    stream: int
+    """The CUDA stream the producing work was queued on.
+
+    A device input is bound with no copy and no synchronisation, so it is only safe
+    when the consumer executes on the same stream. That was a sentence in `run`'s
+    docstring; it is a field the session can check."""
+
+    @property
+    def nbytes(self) -> int:
+        """Bytes `shape` at `dtype` occupies.
+
+        Returns:
+            The size of the view this tensor declares, which the allocation must hold.
+        """
+        return int(np.prod(self.shape)) * self.dtype.itemsize
 
 
 class PinnedHostBuffer:
@@ -731,7 +760,9 @@ class TensorRTSession:
         Raises:
             RuntimeError: When the session is closed, when a profile rejects a
                 shape, or when execution fails.
-            ValueError: When an input is missing, mistyped or not contiguous.
+            ValueError: When an input is missing or mistyped, when a host array is
+                not contiguous, or when a `DeviceTensor` was produced on another
+                stream or declares more bytes than its allocation holds.
         """
         if self.closed:
             raise RuntimeError("This TensorRTSession is closed")
@@ -739,11 +770,17 @@ class TensorRTSession:
             if name not in inputs:
                 raise ValueError(f"TensorRT engine input {name} was not supplied")
             supplied: ndarray | DeviceTensor = inputs[name]
+            if supplied.dtype != self.dtypes[name]:
+                raise ValueError(f"Input {name} must be {self.dtypes[name]}, got {supplied.dtype}")
             if isinstance(supplied, DeviceTensor):
+                if supplied.stream != self.stream:
+                    raise ValueError(f"Device input {name} was produced on another stream; binding it in place is unsafe")
+                if supplied.nbytes > supplied.capacity_bytes:
+                    raise ValueError(
+                        f"Device input {name} declares {supplied.nbytes} bytes but its allocation holds {supplied.capacity_bytes}"
+                    )
                 input_shape: tuple[int, ...] = supplied.shape
             else:
-                if supplied.dtype != self.dtypes[name]:
-                    raise ValueError(f"Input {name} must be {self.dtypes[name]}, got {supplied.dtype}")
                 if not supplied.flags.c_contiguous:
                     raise ValueError(f"Input {name} must be C-contiguous")
                 input_shape = tuple(supplied.shape)
@@ -1007,7 +1044,13 @@ class GpuPreprocessor:
         self.context.set_tensor_address(PREPROCESS_IMAGE_BINDING, self.output_pointer)
         if not self.context.execute_async_v3(self.stream):
             raise RuntimeError("The uint8 preprocessing engine failed to execute")
-        return DeviceTensor(pointer=self.output_pointer, shape=(count, 3, self.height, self.width))
+        return DeviceTensor(
+            pointer=self.output_pointer,
+            shape=(count, 3, self.height, self.width),
+            dtype=np.dtype(np.float32),
+            capacity_bytes=self.output_nbytes,
+            stream=self.stream,
+        )
 
     def close(self) -> None:
         """Free the device buffers and the page-locked staging; safe to call twice.

@@ -397,6 +397,10 @@ def run_loop_closure_stage(
         print("[colsfm] loop closure: the database holds no descriptors; no loop edges")
         return LoopClosureStageResult(edges=[], num_pairs_matched=0)
     index: RetrievalIndex = build_retrieval_index(descriptors)
+    # The index is built; the raw descriptors are not read again. On RoboCap they are
+    # 4.7 GB, which would otherwise stay resident for the whole stage -- through the
+    # keypoint read, the batch match and the measurement.
+    del descriptors
     print(f"[colsfm] loop closure: retrieval index over {len(index.image_ids)} images in {index.build_seconds:.2f}s")
 
     config: LoopClosureConfig = LoopClosureConfig.from_pose_graph(pose_graph_config)

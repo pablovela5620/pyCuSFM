@@ -58,7 +58,7 @@ import pycolmap
 from jaxtyping import Bool, Float32, Int64, UInt8
 from numpy import ndarray
 
-from colsfm.database import Descriptors, KeypointsXY, database_transaction, image_ids_by_name
+from colsfm.database import Descriptors, KeypointsXY, database_transaction
 from colsfm.tensorrt_runtime import DeviceTensor, GpuPreprocessor, TensorRTSession
 
 NetworkBatch: TypeAlias = Float32[ndarray, "batch 3 network_height network_width"]
@@ -383,7 +383,11 @@ def select_keypoints(scores: KeypointScores, *, min_score: float, max_num_featur
     """
     kept: Bool[ndarray, " num_keypoints"] = scores >= np.float32(min_score)
     if max_num_features > 0 and int(kept.sum()) > max_num_features:
-        strongest: Int64[ndarray, " num_selected"] = np.argsort(np.where(kept, scores, -np.inf))[::-1][:max_num_features]
+        # A partition, not a full sort: the answer is a mask, so which order the top
+        # `max_num_features` come back in cannot reach it, and ALIKED offers 20 000
+        # candidates per image where the cap keeps 4096.
+        gated: Float32[ndarray, " num_keypoints"] = np.where(kept, scores, -np.inf)
+        strongest: Int64[ndarray, " num_selected"] = np.argpartition(gated, -max_num_features)[-max_num_features:]
         kept = np.zeros_like(kept)
         kept[strongest] = True
     return kept
@@ -453,16 +457,21 @@ def image_tasks(database_path: Path, image_root: Path, image_names: Sequence[str
         KeyError: When a name has no image row.
         FileNotFoundError: When an image file is missing.
     """
-    name_to_id: dict[str, int] = image_ids_by_name(database_path)
+    # One open and one walk of the image table: `image_ids_by_name` opened the database
+    # to read every row for the names, and this function then opened it again to read
+    # every row for the camera ids.
     with pycolmap.Database.open(database_path) as database:
         cameras: dict[int, pycolmap.Camera] = {camera.camera_id: camera for camera in database.read_all_cameras()}
-        camera_id_by_image_id: dict[int, int] = {image.image_id: image.camera_id for image in database.read_all_images()}
+        camera_by_name: dict[str, tuple[int, pycolmap.Camera]] = {
+            image.name: (image.image_id, cameras[image.camera_id]) for image in database.read_all_images()
+        }
     tasks: list[ImageTask] = []
     for name in image_names:
-        if name not in name_to_id:
+        if name not in camera_by_name:
             raise KeyError(f"The database holds no image named {name}")
-        image_id: int = name_to_id[name]
-        camera: pycolmap.Camera = cameras[camera_id_by_image_id[image_id]]
+        image_id: int
+        camera: pycolmap.Camera
+        image_id, camera = camera_by_name[name]
         tasks.append(
             ImageTask(
                 image_id=image_id,

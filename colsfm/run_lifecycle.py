@@ -264,10 +264,13 @@ def read_run_state(run_dir: Path) -> RunState | None:
         The state, or None when the directory holds no `run_state.json` — which is
         what a `pycusfm` reference run looks like, and is not an error.
     """
-    state_path: Path = run_dir / RUN_STATE_NAME
-    if not state_path.is_file():
+    # Read it and handle its absence, rather than asking first: between an `is_file`
+    # and the read the file can be renamed away, which is exactly what `publish` does
+    # to a directory somebody else is reading.
+    try:
+        return from_json(RunState, (run_dir / RUN_STATE_NAME).read_text())
+    except FileNotFoundError:
         return None
-    return from_json(RunState, state_path.read_text())
 
 
 @dataclass(frozen=True, slots=True)
