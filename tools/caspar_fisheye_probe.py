@@ -98,6 +98,37 @@ class ProbeConfig:
     """Run only the synthetic checks, for a fast smoke test."""
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class FisheyeScenePlan:
+    """The geometry one synthetic OPENCV_FISHEYE scene is built from.
+
+    `build_scene_from_plan` turns a plan into a reconstruction whose every
+    observation is the projection of a known point, so a scene starts at (or,
+    with `pixel_noise_px`, near) zero reprojection error.  `default_scene_plan`
+    is the plan this probe's own §5.2 case uses; `tests/colsfm_probes/
+    test_caspar_fisheye_hypothesis.py` draws random ones.
+
+    Equality is off because a plan holds an array; nothing compares plans.
+    """
+
+    cameras: tuple[pycolmap.Camera, ...]
+    """One OPENCV_FISHEYE camera per rig sensor, with `camera_id` 1, 2, ... in order."""
+    sensor_from_rig: tuple[pycolmap.Rigid3d, ...]
+    """Extrinsics per sensor, ordered as `cameras`; entry 0 is the reference sensor's."""
+    rig_from_world: tuple[pycolmap.Rigid3d, ...]
+    """One rig pose per frame, in trajectory order."""
+    points_xyz: Float[ndarray, "n_points 3"]
+    """World-space point positions in metres."""
+    pixel_noise_px: float = 0.0
+    """Standard deviation of the Gaussian noise added to every kept observation.
+
+    Zero reproduces the exact-projection scene the probe's own cases use; anything
+    above it makes the ground-truth geometry no longer the least-squares optimum,
+    which is what a real rig looks like."""
+    noise_seed: int = 0
+    """PRNG seed for `pixel_noise_px`, so one plan always builds the same scene."""
+
+
 @dataclass(slots=True)
 class SolveResult:
     """What one bundle-adjustment run cost and where it ended up."""
@@ -112,6 +143,11 @@ class SolveResult:
     """Sum of squared reprojection residuals, i.e. what CASPAR minimises."""
     termination: str
     """`BundleAdjustmentSummary.termination_type`, as a string."""
+    num_residuals: int
+    """`BundleAdjustmentSummary.num_residuals`; two per observation the solve took.
+
+    Exactly zero when CASPAR skipped every image for lack of an adapter, which is
+    the signal `colsfm.mapping.caspar_supported_camera_models` reads."""
     frame_translations: Float[ndarray, "n_frames 3"]
     """Per-frame `rig_from_world` translation, ordered by frame id."""
     frame_rotations: Float[ndarray, "n_frames 3 3"]
@@ -140,12 +176,23 @@ class HazardResult:
     """The iteration cap at which `worst_increase` was measured."""
 
 
-def _fisheye_camera(camera_id: int, distortion: tuple[float, float, float, float]) -> pycolmap.Camera:
-    """Create an OPENCV_FISHEYE camera with the probe's canonical intrinsics.
+def fisheye_camera(
+    camera_id: int,
+    distortion: tuple[float, float, float, float],
+    focal_length_px: float = FOCAL_LENGTH_PX,
+    image_size_px: int = IMAGE_SIZE_PX,
+    principal_point_px: tuple[float, float] | None = None,
+    focal_length_y_px: float | None = None,
+) -> pycolmap.Camera:
+    """Create a square OPENCV_FISHEYE camera, by default with the probe's intrinsics.
 
     Args:
         camera_id: Identifier to assign to the camera.
         distortion: The `k1..k4` Kannala-Brandt coefficients.
+        focal_length_px: `fx`, and `fy` too unless `focal_length_y_px` says otherwise.
+        image_size_px: Width and height of the sensor, in pixels.
+        principal_point_px: `(cx, cy)`, or None for the exact image centre.
+        focal_length_y_px: `fy`, or None to make the pixels square.
 
     Returns:
         A `pycolmap.Camera` with params `[fx, fy, cx, cy, k1, k2, k3, k4]`.
@@ -153,12 +200,14 @@ def _fisheye_camera(camera_id: int, distortion: tuple[float, float, float, float
     camera: pycolmap.Camera = pycolmap.Camera.create_from_model_id(
         camera_id,
         pycolmap.CameraModelId.OPENCV_FISHEYE,
-        FOCAL_LENGTH_PX,
-        IMAGE_SIZE_PX,
-        IMAGE_SIZE_PX,
+        focal_length_px,
+        image_size_px,
+        image_size_px,
     )
-    centre: float = IMAGE_SIZE_PX / 2.0
-    camera.params = [FOCAL_LENGTH_PX, FOCAL_LENGTH_PX, centre, centre, *distortion]
+    centre: float = image_size_px / 2.0
+    cx, cy = (centre, centre) if principal_point_px is None else principal_point_px
+    fy: float = focal_length_px if focal_length_y_px is None else focal_length_y_px
+    camera.params = [focal_length_px, fy, cx, cy, *distortion]
     return camera
 
 
@@ -232,14 +281,10 @@ def _world_points(seed: int) -> Float[ndarray, "n_points 3"]:
     return grid + rng.normal(0.0, 0.08, grid.shape)
 
 
-def build_fisheye_scene(
+def default_scene_plan(
     num_frames: int, distortion: tuple[float, float, float, float], seed: int = 0
-) -> pycolmap.Reconstruction:
-    """Build a 4-camera OPENCV_FISHEYE rig sequence with exact projections.
-
-    Every observation is the exact image of a known 3D point, so the model
-    starts at zero reprojection error and any residual a solve leaves behind
-    comes from the solver, not the data.
+) -> FisheyeScenePlan:
+    """The probe's own scene: four identical fisheye cameras on a straight slide.
 
     Args:
         num_frames: Number of rig frames along the trajectory.
@@ -247,40 +292,70 @@ def build_fisheye_scene(
         seed: PRNG seed for the point-cloud jitter.
 
     Returns:
-        A reconstruction with cameras, rig, frames, images, tracks and points.
+        The plan `build_fisheye_scene` builds from.
     """
+    return FisheyeScenePlan(
+        cameras=tuple(
+            fisheye_camera(index + 1, distortion) for index in range(NUM_RIG_CAMERAS)
+        ),
+        sensor_from_rig=tuple(_sensor_from_rig(index) for index in range(NUM_RIG_CAMERAS)),
+        rig_from_world=tuple(_rig_from_world_at(index) for index in range(num_frames)),
+        points_xyz=_world_points(seed),
+    )
+
+
+def build_scene_from_plan(plan: FisheyeScenePlan) -> pycolmap.Reconstruction:
+    """Build a rig sequence in which every observation is a projection of a known point.
+
+    With `plan.pixel_noise_px == 0` the model starts at zero reprojection error,
+    so any residual a solve leaves behind comes from the solver and not from the
+    data.  With noise, the plan's own geometry is no longer the optimum -- which
+    is the point: two solvers can then be compared on where they actually land
+    rather than on how fast they return to a known answer.
+
+    Args:
+        plan: Cameras, extrinsics, trajectory, points and observation noise.
+
+    Returns:
+        A reconstruction with cameras, rig, frames, images, tracks and points.
+        Points seen by fewer than two images are left out.
+    """
+    num_cameras: int = len(plan.cameras)
     reconstruction: pycolmap.Reconstruction = pycolmap.Reconstruction()
-    for camera_index in range(NUM_RIG_CAMERAS):
-        reconstruction.add_camera(_fisheye_camera(camera_index + 1, distortion))
+    for camera in plan.cameras:
+        reconstruction.add_camera(camera)
 
     rig: pycolmap.Rig = pycolmap.Rig()
     rig.rig_id = RIG_ID
-    rig.add_ref_sensor(pycolmap.sensor_t(pycolmap.SensorType.CAMERA, 1))
-    for camera_index in range(1, NUM_RIG_CAMERAS):
+    rig.add_ref_sensor(pycolmap.sensor_t(pycolmap.SensorType.CAMERA, plan.cameras[0].camera_id))
+    for camera_index in range(1, num_cameras):
         rig.add_sensor(
-            pycolmap.sensor_t(pycolmap.SensorType.CAMERA, camera_index + 1),
-            _sensor_from_rig(camera_index),
+            pycolmap.sensor_t(
+                pycolmap.SensorType.CAMERA, plan.cameras[camera_index].camera_id
+            ),
+            plan.sensor_from_rig[camera_index],
         )
     reconstruction.add_rig(rig)
 
     next_image_id: int = 0
-    for frame_index in range(num_frames):
+    for frame_index, rig_from_world in enumerate(plan.rig_from_world):
         frame: pycolmap.Frame = pycolmap.Frame()
         frame.frame_id = frame_index + 1
         frame.rig_id = RIG_ID
-        frame.rig_from_world = _rig_from_world_at(frame_index)
+        frame.rig_from_world = rig_from_world
         pending: list[tuple[int, int]] = []
-        for camera_index in range(NUM_RIG_CAMERAS):
+        for camera in plan.cameras:
             next_image_id += 1
             # A frame must own its data ids before `add_image` accepts the
             # matching image, or COLMAP aborts in `Check failed:
             # frame.HasDataId(image.DataId())`.
             frame.add_data_id(
                 pycolmap.data_t(
-                    pycolmap.sensor_t(pycolmap.SensorType.CAMERA, camera_index + 1), next_image_id
+                    pycolmap.sensor_t(pycolmap.SensorType.CAMERA, camera.camera_id),
+                    next_image_id,
                 )
             )
-            pending.append((next_image_id, camera_index + 1))
+            pending.append((next_image_id, camera.camera_id))
         reconstruction.add_frame(frame)
         reconstruction.register_frame(frame.frame_id)
         for image_id, camera_id in pending:
@@ -292,25 +367,34 @@ def build_fisheye_scene(
             image.frame_id = frame.frame_id
             reconstruction.add_image(image)
 
-    points_xyz: Float[ndarray, "n_points 3"] = _world_points(seed)
+    points_xyz: Float[ndarray, "n_points 3"] = plan.points_xyz
+    rng: np.random.Generator = np.random.default_rng(plan.noise_seed)
     observations: dict[int, list[tuple[int, int]]] = {
         index: [] for index in range(len(points_xyz))
     }
     for image_id in sorted(reconstruction.images):
         image = reconstruction.image(image_id)
-        camera: pycolmap.Camera = reconstruction.camera(image.camera_id)
+        camera = reconstruction.camera(image.camera_id)
         cam_from_world: pycolmap.Rigid3d = image.cam_from_world()
         points_in_cam: Float[ndarray, "n_points 3"] = (
             points_xyz @ cam_from_world.rotation.matrix().T + cam_from_world.translation
         )
         projected: Float[ndarray, "n_points 2"] = camera.img_from_cam(points_in_cam)
+        sensor_size_px: Float[ndarray, " 2"] = np.array(
+            [camera.width, camera.height], dtype=np.float64
+        )
         visible: np.ndarray = (
             np.isfinite(projected).all(axis=1)
             & (points_in_cam[:, 2] > 0.1)
             & (projected >= 0.0).all(axis=1)
-            & (projected < IMAGE_SIZE_PX).all(axis=1)
+            & (projected < sensor_size_px).all(axis=1)
         )
+        # Noise is added after the visibility test, not before, so that the set
+        # of tracks a plan produces depends on the geometry alone -- otherwise
+        # a half-pixel of noise could silently change the problem's size.
         kept: Float[ndarray, "n_obs 2"] = projected[visible]
+        if plan.pixel_noise_px > 0.0:
+            kept = kept + rng.normal(0.0, plan.pixel_noise_px, kept.shape)
         image.points2D = pycolmap.Point2DList([pycolmap.Point2D(xy) for xy in kept])
         for observation_index, point_index in enumerate(np.flatnonzero(visible)):
             observations[int(point_index)].append((image_id, observation_index))
@@ -331,7 +415,23 @@ def build_fisheye_scene(
     return reconstruction
 
 
-def _perturb(
+def build_fisheye_scene(
+    num_frames: int, distortion: tuple[float, float, float, float], seed: int = 0
+) -> pycolmap.Reconstruction:
+    """Build the probe's 4-camera OPENCV_FISHEYE rig sequence with exact projections.
+
+    Args:
+        num_frames: Number of rig frames along the trajectory.
+        distortion: The `k1..k4` coefficients shared by all four cameras.
+        seed: PRNG seed for the point-cloud jitter.
+
+    Returns:
+        A reconstruction with cameras, rig, frames, images, tracks and points.
+    """
+    return build_scene_from_plan(default_scene_plan(num_frames, distortion, seed))
+
+
+def perturb_model(
     reconstruction: pycolmap.Reconstruction,
     config: ProbeConfig,
     seed: int = 7,
@@ -380,7 +480,7 @@ def _perturb(
         point.xyz = point.xyz + rng.normal(0.0, config.point_perturbation_m, 3)
 
 
-def _ba_config(reconstruction: pycolmap.Reconstruction) -> pycolmap.BundleAdjustmentConfig:
+def bundle_adjustment_config(reconstruction: pycolmap.Reconstruction) -> pycolmap.BundleAdjustmentConfig:
     """Build a global BA config: every image free, one gauge frame, fixed intrinsics.
 
     Args:
@@ -398,7 +498,7 @@ def _ba_config(reconstruction: pycolmap.Reconstruction) -> pycolmap.BundleAdjust
     return config
 
 
-def _options(
+def bundle_adjustment_options(
     backend: Backend, gpu_index: str, solver_iter_max: int | None = None
 ) -> pycolmap.BundleAdjustmentOptions:
     """Build options both backends accept, so only the solver differs.
@@ -406,6 +506,13 @@ def _options(
     CASPAR rejects `refine_sensor_from_rig` on multi-sensor frames and requires
     `refine_focal_length == refine_extra_params`, so Ceres is held to the same
     constraints; otherwise the two runs would not be solving the same problem.
+
+    The Ceres loss is pinned to TRIVIAL rather than left implicit. CASPAR solves
+    plain least squares whatever loss is asked for (`colsfm.mapping` module
+    docstring), so any robust loss on the Ceres side would make the two backends
+    minimise different functions and turn this comparison into a comparison of
+    loss functions. TRIVIAL is pycolmap's default too, so nothing here changes;
+    the point is that it is now stated rather than inherited.
 
     Args:
         backend: Implementation to select.
@@ -424,6 +531,8 @@ def _options(
     options.refine_principal_point = False
     options.refine_rig_from_world = True
     options.refine_points3D = True
+    options.ceres.loss_function_type = pycolmap.LossFunctionType.TRIVIAL
+    options.ceres.loss_function_scale = 1.0
     options.caspar.gpu_index = gpu_index
     if solver_iter_max is not None:
         options.caspar.solver_iter_max = solver_iter_max
@@ -447,11 +556,18 @@ def _score(reconstruction: pycolmap.Reconstruction) -> float:
     per-iteration `iterations` vector, so the only score visible from Python is
     one recomputed from the model.
 
+    The sum is a plain `np.sum`, deliberately. An earlier version used
+    `np.nansum`, which silently dropped any observation whose projection came
+    back NaN -- exactly the failure this probe exists to catch, hidden inside
+    the statistic that was supposed to catch it. A non-finite projection now
+    poisons the score and every comparison drawn from it.
+
     Args:
         reconstruction: The model to score.
 
     Returns:
-        The sum over all observations of the squared pixel residual.
+        The sum over all observations of the squared pixel residual, or NaN when
+        any observation failed to project.
     """
     total: float = 0.0
     for image_id in sorted(reconstruction.images):
@@ -472,7 +588,7 @@ def _score(reconstruction: pycolmap.Reconstruction) -> float:
         )
         projected: Float[ndarray, "n_obs 2"] = camera.img_from_cam(points_in_cam)
         residual: Float[ndarray, "n_obs 2"] = projected - np.asarray(observed)
-        total += float(np.nansum(residual**2))
+        total += float(np.sum(residual**2))
     return total
 
 
@@ -502,7 +618,7 @@ def _snapshot(
     return translations, rotations, points
 
 
-def _solve(
+def solve_with_backend(
     reconstruction: pycolmap.Reconstruction,
     config: pycolmap.BundleAdjustmentConfig,
     backend: Backend,
@@ -522,7 +638,7 @@ def _solve(
         The timing, final error and geometry of the run.
     """
     adjuster: pycolmap.BundleAdjuster = pycolmap.create_default_bundle_adjuster(
-        _options(backend, gpu_index, solver_iter_max), config, reconstruction
+        bundle_adjustment_options(backend, gpu_index, solver_iter_max), config, reconstruction
     )
     start: float = time.perf_counter()
     summary: pycolmap.BundleAdjustmentSummary = adjuster.solve()
@@ -536,6 +652,7 @@ def _solve(
         reprojection_error_px=float(reconstruction.compute_mean_reprojection_error()),
         score=_score(reconstruction),
         termination=str(summary.termination_type),
+        num_residuals=int(summary.num_residuals),
         frame_translations=translations,
         frame_rotations=rotations,
         points_xyz=points,
@@ -559,7 +676,7 @@ def run_hazard_check(config: ProbeConfig) -> HazardResult:
     baseline: pycolmap.Reconstruction = build_fisheye_scene(
         config.synthetic_frames, config.distortion
     )
-    _perturb(baseline, config)
+    perturb_model(baseline, config)
     initial_score: float = _score(baseline)
     initial_translations, _, _ = _snapshot(baseline)
 
@@ -569,9 +686,9 @@ def run_hazard_check(config: ProbeConfig) -> HazardResult:
         reconstruction: pycolmap.Reconstruction = build_fisheye_scene(
             config.synthetic_frames, config.distortion
         )
-        _perturb(reconstruction, config)
-        result: SolveResult = _solve(
-            reconstruction, _ba_config(reconstruction), "caspar", config.gpu_index, cap
+        perturb_model(reconstruction, config)
+        result: SolveResult = solve_with_backend(
+            reconstruction, bundle_adjustment_config(reconstruction), "caspar", config.gpu_index, cap
         )
         scores.append(result.score)
         final_translations = result.frame_translations
@@ -708,11 +825,11 @@ def _run_synthetic(config: ProbeConfig) -> None:
             config.synthetic_frames, config.distortion
         )
         truth_translations, _, truth_points = _snapshot(reconstruction)
-        _perturb(reconstruction, config)
+        perturb_model(reconstruction, config)
         reconstruction.update_point_3d_errors()
         before: float = reconstruction.compute_mean_reprojection_error()
-        result: SolveResult = _solve(
-            reconstruction, _ba_config(reconstruction), backend, config.gpu_index
+        result: SolveResult = solve_with_backend(
+            reconstruction, bundle_adjustment_config(reconstruction), backend, config.gpu_index
         )
         pose_error: float = float(
             np.linalg.norm(result.frame_translations - truth_translations, axis=1).max()
@@ -751,7 +868,7 @@ def _load_galileo(
     solvers on it measures divergence, not the adapter.  So the observations
     are re-rendered through the new model from the existing 3D points, which
     makes the converted model exactly self-consistent -- the same property the
-    synthetic scene has.  `_perturb` then supplies the residual to remove.
+    synthetic scene has.  `perturb_model` then supplies the residual to remove.
 
     Args:
         sparse_dir: Directory holding cameras/images/points3D/rigs/frames .txt.
@@ -768,12 +885,14 @@ def _load_galileo(
             fx, fy, cx, cy = (float(v) for v in camera.params[:4])
             camera.model = pycolmap.CameraModelId.OPENCV_FISHEYE
             camera.params = [fx, fy, cx, cy, *distortion]
-    _drop_degenerate_points(reconstruction)
+    drop_degenerate_points(reconstruction)
     _rerender_observations(reconstruction)
     return reconstruction
 
 
-def _drop_degenerate_points(reconstruction: pycolmap.Reconstruction) -> int:
+def drop_degenerate_points(
+    reconstruction: pycolmap.Reconstruction, min_depth_m: float = 0.2
+) -> int:
     """Delete tracks that project pathologically in any image that sees them.
 
     The Galileo model, like any real reconstruction, carries a handful of points
@@ -785,8 +904,18 @@ def _drop_degenerate_points(reconstruction: pycolmap.Reconstruction) -> int:
     the shipped PINHOLE model.  Removing them makes the problem well-posed for
     both backends instead of special-casing one.
 
+    The same prune is what makes a *perturbed* synthetic scene comparable: a
+    centimetre of point noise on a point already at a grazing angle can push it
+    through a camera's principal plane, after which Ceres' cost function returns
+    zero for the failed projection while CASPAR projects it anyway through its
+    `z + eps sign(z)` guard. The two backends then minimise different functions.
+
     Args:
         reconstruction: The model to prune, modified in place.
+        min_depth_m: Depth below which an observation counts as degenerate. The
+            default is the value the Galileo conversion has always used; a
+            perturbed synthetic scene wants a wider margin, because the
+            perturbation itself is what moves points towards the plane.
 
     Returns:
         The number of tracks deleted.
@@ -810,7 +939,7 @@ def _drop_degenerate_points(reconstruction: pycolmap.Reconstruction) -> int:
         projected: Float[ndarray, "n_obs 2"] = camera.img_from_cam(in_cam)
         bad: np.ndarray = (
             ~np.isfinite(projected).all(axis=1)
-            | (in_cam[:, 2] < 0.2)
+            | (in_cam[:, 2] < min_depth_m)
             | (np.abs(projected[:, 0] - camera.width / 2.0) > 2.0 * camera.width)
             | (np.abs(projected[:, 1] - camera.height / 2.0) > 2.0 * camera.height)
         )
@@ -870,7 +999,7 @@ def _run_galileo(config: ProbeConfig) -> None:
             reconstruction: pycolmap.Reconstruction = _load_galileo(
                 config.galileo_sparse, distortion
             )
-            _perturb(reconstruction, config)
+            perturb_model(reconstruction, config)
             reconstruction.update_point_3d_errors()
             before: float = reconstruction.compute_mean_reprojection_error()
             print(
@@ -878,8 +1007,8 @@ def _run_galileo(config: ProbeConfig) -> None:
                 f"{reconstruction.num_frames()} frames, "
                 f"{reconstruction.num_points3D()} points, reproj in {before:.6f} px"
             )
-            results[backend] = _solve(
-                reconstruction, _ba_config(reconstruction), backend, config.gpu_index
+            results[backend] = solve_with_backend(
+                reconstruction, bundle_adjustment_config(reconstruction), backend, config.gpu_index
             )
         model_name: str = "PINHOLE" if distortion is None else f"OPENCV_FISHEYE, k={distortion}"
         _report_comparison(f"{label} ({model_name})", results)
@@ -897,9 +1026,9 @@ def main(config: ProbeConfig) -> None:
     # happens inside the first solve.  Burn it on a throwaway problem so that
     # whichever CASPAR run goes first is not timed against a GPU boot.
     warmup: pycolmap.Reconstruction = build_fisheye_scene(2, config.distortion)
-    _perturb(warmup, config)
-    warmup_result: SolveResult = _solve(
-        warmup, _ba_config(warmup), "caspar", config.gpu_index
+    perturb_model(warmup, config)
+    warmup_result: SolveResult = solve_with_backend(
+        warmup, bundle_adjustment_config(warmup), "caspar", config.gpu_index
     )
     print(
         f"[warmup] first CASPAR solve (CUDA context + kernel load): "

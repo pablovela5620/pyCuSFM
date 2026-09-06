@@ -185,6 +185,7 @@ setuptools = "<78"
 # PyPI solve then has no solution.  Declared conda-side, exactly as the default
 # feature does, so that one solver owns the constraint.
 typing-extensions = ">=4.1,<4.16"
+hypothesis = ">=6.167.1,<7"
 
 [feature.colsfm.pypi-dependencies]
 # Gotcha 1: `10.13.3.9` (no `.post1`) depends on the retired
@@ -265,6 +266,7 @@ libcublas = "*"
 cudnn = "9.*"
 setuptools = "<78"
 typing-extensions = ">=4.1,<4.16"
+hypothesis = ">=6.167.1,<7"
 
 [feature.colsfm-caspar.pypi-dependencies]
 tensorrt-cu13 = "==10.13.3.9.post1"
@@ -328,6 +330,7 @@ libcublas = "*"
 cudnn = "9.*"
 setuptools = "<78"
 typing-extensions = ">=4.1,<4.16"
+hypothesis = ">=6.167.1,<7"
 
 [feature.colsfm-caspar64.pypi-dependencies]
 tensorrt-cu13 = "==10.13.3.9.post1"
@@ -433,6 +436,7 @@ libcublas = "*"
 cudnn = "9.*"
 setuptools = "<78"
 typing-extensions = ">=4.1,<4.16"
+hypothesis = ">=6.167.1,<7"
 
 [feature.colsfm-caspar-fisheye.pypi-dependencies]
 tensorrt-cu13 = "==10.13.3.9.post1"

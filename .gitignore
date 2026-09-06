@@ -62,3 +62,4 @@ data/kitti/dataset/
 data/kitti/06
 data/kitti/*_result/
 data/kitti/06_*/
+.hypothesis/
