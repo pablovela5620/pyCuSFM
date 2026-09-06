@@ -49,7 +49,7 @@ from serde import serde
 from colsfm.benchmark import ReconstructionMetrics, RigTrack, write_json_report
 from colsfm.frames_meta import FramesMeta, KeyframeMeta
 from colsfm.reconstruction import RigReference, gauge_camera_params_id, rig_reference
-from colsfm.rig_calibration import ExtrinsicDelta, extrinsic_deltas, rig_config
+from colsfm.rig_calibration import ExtrinsicChange, extrinsic_deltas, rig_config
 from colsfm.trajectory import TrajectoryScore, image_center_score, rig_track_from_reconstruction, score_track_against_ground_truth
 from tools.audit.colmap_baseline_galileo import (
     EXTRACTOR_BY_CHOICE,
@@ -131,7 +131,7 @@ class ColmapRigBaselineResult:
     """Rig-frame ATE under a further scale-free fit."""
     num_rig_frames_scored: int
     """Rig frames the largest model covers."""
-    extrinsic_deltas: tuple[ExtrinsicDelta, ...]
+    extrinsic_deltas: tuple[ExtrinsicChange, ...]
     """Recovered rig extrinsics against the calibration, per non-reference camera."""
 
 
@@ -293,7 +293,7 @@ def main(config: ColmapRigBaselineConfig) -> None:
     center_score, alignment = image_center_score(largest, reference.gt_center_by_image_name)
     rig_track: RigTrack = rig_track_from_reconstruction(largest, frames_meta, alignment)
     rig_score: TrajectoryScore = score_track_against_ground_truth(rig_track, reference.ground_truth)
-    deltas: tuple[ExtrinsicDelta, ...] = extrinsic_deltas(largest, frames_meta, rig_ref)
+    deltas: tuple[ExtrinsicChange, ...] = extrinsic_deltas(largest, frames_meta, rig_ref)
 
     result: ColmapRigBaselineResult = ColmapRigBaselineResult(
         features=config.features,
@@ -334,7 +334,7 @@ def main(config: ColmapRigBaselineConfig) -> None:
         f"SIM(3) {rig_score.similarity_rmse_millimeters:.2f} mm"
     )
     for delta in deltas:
-        print(f"[audit-rig] extrinsic {delta.sensor_name:<28} {delta.translation_millimeters:8.2f} mm  {delta.rotation_degrees:7.3f} deg")
+        print(f"[audit-rig] extrinsic {delta.sensor_name:<28} {delta.translation_change_mm:8.2f} mm  {delta.rotation_change_deg:7.3f} deg")
     print(f"[audit-rig] wrote {output_json}")
 
 

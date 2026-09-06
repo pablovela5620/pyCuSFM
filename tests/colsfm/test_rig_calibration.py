@@ -17,7 +17,7 @@ from conftest import build_reconstruction
 from colsfm.frames_meta import FramesMeta
 from colsfm.reconstruction import RigReference, gauge_camera_params_id, rig_reference
 from colsfm.rig_calibration import (
-    ExtrinsicDelta,
+    ExtrinsicChange,
     calibrated_cam_from_rig,
     camera_params_id_by_camera_id,
     extrinsic_deltas,
@@ -121,14 +121,14 @@ def test_a_model_built_from_the_calibration_has_no_extrinsic_delta(three_samples
     """The comparison is against the same composition the model was built with."""
     reconstruction: pycolmap.Reconstruction = build_reconstruction(three_samples, error_px=0.0)
 
-    deltas: tuple[ExtrinsicDelta, ...] = extrinsic_deltas(reconstruction, three_samples, galileo_reference)
+    deltas: tuple[ExtrinsicChange, ...] = extrinsic_deltas(reconstruction, three_samples, galileo_reference)
 
     assert [delta.camera_params_id for delta in deltas] == sorted(set(three_samples.cameras) - {galileo_reference.camera_params_id})
     assert [delta.sensor_name for delta in deltas] == [
         three_samples.cameras[delta.camera_params_id].sensor_name for delta in deltas
     ]
-    assert max(delta.translation_millimeters for delta in deltas) == pytest.approx(0.0, abs=1e-9)
-    assert max(delta.rotation_degrees for delta in deltas) == pytest.approx(0.0, abs=1e-9)
+    assert max(delta.translation_change_mm for delta in deltas) == pytest.approx(0.0, abs=1e-9)
+    assert max(delta.rotation_change_deg for delta in deltas) == pytest.approx(0.0, abs=1e-9)
 
 
 def test_a_moved_sensor_shows_up_in_millimetres_and_degrees(three_samples: FramesMeta, galileo_reference: RigReference) -> None:
@@ -141,13 +141,13 @@ def test_a_moved_sensor_shows_up_in_millimetres_and_degrees(three_samples: Frame
     nudge: pycolmap.Rigid3d = pycolmap.Rigid3d(pycolmap.Rotation3d(), np.array([0.005, 0.0, 0.0]))
     rig.set_sensor_from_rig(sensor_id, nudge * original)
 
-    by_params_id: dict[int, ExtrinsicDelta] = {
+    by_params_id: dict[int, ExtrinsicChange] = {
         delta.camera_params_id: delta for delta in extrinsic_deltas(reconstruction, three_samples, galileo_reference)
     }
 
-    assert by_params_id[moved_params_id].translation_millimeters == pytest.approx(5.0, abs=1e-6)
-    assert by_params_id[moved_params_id].rotation_degrees == pytest.approx(0.0, abs=1e-9)
+    assert by_params_id[moved_params_id].translation_change_mm == pytest.approx(5.0, abs=1e-6)
+    assert by_params_id[moved_params_id].rotation_change_deg == pytest.approx(0.0, abs=1e-9)
     others: list[float] = [
-        delta.translation_millimeters for params_id, delta in by_params_id.items() if params_id != moved_params_id
+        delta.translation_change_mm for params_id, delta in by_params_id.items() if params_id != moved_params_id
     ]
     assert max(others) == pytest.approx(0.0, abs=1e-9)

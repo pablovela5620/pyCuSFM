@@ -113,8 +113,8 @@ import pycolmap
 
 from colsfm.config import BundleAdjustmentConfig, VisionMappingConfig
 from colsfm.extrinsic_observations import (
-    CameraObservationIndex,
     CameraPairKey,
+    ObservationIndex,
     build_observation_index,
     camera_observations,
     co_observed_camera_pairs,
@@ -369,7 +369,7 @@ def refine_extrinsics(
     # Neither of these changes across the rounds: bundle adjustment moves poses and
     # points but adds and removes no observation, so which image saw which point — and
     # therefore which cameras co-observed — is fixed. Only the geometry is re-gathered.
-    observation_index: dict[int, CameraObservationIndex] = build_observation_index(reconstruction)
+    observation_index: ObservationIndex = build_observation_index(reconstruction)
     pair_counts: dict[CameraPairKey, int] = co_observed_camera_pairs(reconstruction)
 
     rounds: list[ExtrinsicRefinementRound] = []

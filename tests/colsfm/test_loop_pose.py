@@ -33,9 +33,11 @@ from loop_helpers import ProjectedPoints, matcher_from_point_indices, project_an
 from numpy import ndarray
 from scipy.spatial.transform import Rotation
 
+from colsfm import loop_pose
 from colsfm.geometry import rigid3d_from_matrix
 from colsfm.loop_pose import (
     AnchorLandmarks,
+    Bearings,
     Keypoints,
     Matches,
     MatchFunction,
@@ -456,3 +458,27 @@ def test_an_anchors_landmarks_are_packed_for_the_join(scene: FourCameraScene) ->
     assert anchor.keypoint_indices.shape == (len(anchor),)
     assert anchor.points_in_rig.shape == (len(anchor), 3)
     assert np.all(np.diff(anchor.keypoint_indices) > 0)
+
+
+def test_the_bearing_memo_is_bounded_and_still_answers(
+    scene: FourCameraScene, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The memo is an LRU, not a growing dict, and evicting from it changes no bearing.
+
+    An unbounded memo held one float64 `[num_keypoints, 3]` array per image for the
+    whole stage — 4528 of them on RoboCap — for a measurement that only ever reads a
+    source rig frame, its temporal neighbours and one target. The cache is a speed
+    device, so the only thing that must survive a smaller one is the answer.
+    """
+    wanted: dict[int, Bearings] = {
+        image_id: make_estimator(scene).bearings(image_id) for image_id in sorted(scene.keypoints)
+    }
+    monkeypatch.setattr(loop_pose, "BEARING_CACHE_IMAGES", 2)
+    estimator: RigPoseEstimator = make_estimator(scene)
+
+    for image_id, expected in wanted.items():
+        np.testing.assert_array_equal(estimator.bearings(image_id), expected)
+    assert len(estimator._bearings) <= 2, "the memo holds the working set, not the sequence"
+    # Re-asking after every eviction has to give the same arrays, in either direction.
+    for image_id, expected in reversed(list(wanted.items())):
+        np.testing.assert_array_equal(estimator.bearings(image_id), expected)

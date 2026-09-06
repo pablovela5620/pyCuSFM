@@ -194,7 +194,7 @@ class StageLedger:
         append_runtime_record(self.output_dir, RuntimeRecord(command=stage, runtime_seconds=seconds))
 
     @property
-    def seconds_by_stage(self) -> dict[str, float]:
+    def seconds_by_stage(self) -> dict[StageName, float]:
         """Wall-clock seconds per completed stage, in completion order.
 
         Returns:
@@ -246,9 +246,9 @@ class RunState:
     git_sha: str
     """`git rev-parse HEAD` of the tree that ran, so a mixed directory is impossible
     to mistake for a coherent one even by hand."""
-    stages_planned: tuple[str, ...]
+    stages_planned: tuple[StageName, ...]
     """The stages the run set out to record."""
-    stages_completed: tuple[str, ...]
+    stages_completed: tuple[StageName, ...]
     """The stages it actually completed, in completion order."""
     failure: str | None = None
     """The exception that stopped the run, or None."""
@@ -299,7 +299,7 @@ class RunWorkspace:
         """
         return self.ledger.stages
 
-    def record_state(self, status: RunStatus, completed: tuple[str, ...], failure: str | None = None) -> None:
+    def record_state(self, status: RunStatus, completed: tuple[StageName, ...], failure: str | None = None) -> None:
         """Overwrite the staging directory's `run_state.json`.
 
         Public because `open_workspace` writes the opening `running` state through

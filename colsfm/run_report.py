@@ -28,24 +28,9 @@ from colsfm.frames_meta import CameraParams, FramesMeta
 from colsfm.geometry import MILLIMETRES_PER_METRE, relative_rotation_degrees
 from colsfm.mapping import MappingResult, PolishStats
 from colsfm.pose_graph import EdgeKind, PoseGraphEdge
+from colsfm.rig_calibration import ExtrinsicChange
 from colsfm.run_config import PipelineOptions
-
-
-@serde
-@dataclass(frozen=True, slots=True)
-class ExtrinsicChange:
-    """How far the refinement moved one camera's `sensor_to_vehicle_transform`."""
-
-    camera_params_id: int
-    """The camera, as `camera_params_id_to_camera_params` keys it."""
-    sensor_name: str
-    """The camera folder name, e.g. `front_stereo_camera_left`."""
-    translation_change_mm: float
-    """Distance between the input and refined extrinsic origins, in millimetres."""
-    rotation_change_deg: float
-    """Angle between the input and refined extrinsic rotations, in degrees."""
-    is_reference: bool
-    """Whether this is the rig origin and fixed camera, whose change is exactly zero."""
+from colsfm.run_lifecycle import StageName
 
 
 @serde
@@ -145,7 +130,7 @@ class PipelineSummary:
     """Largest rig position change the pose-graph solve produced, in metres."""
     mapping: MappingStats
     """The final model's counters, after the extrinsic refinement when one ran."""
-    stage_seconds: dict[str, float]
+    stage_seconds: dict[StageName, float]
     """Wall-clock seconds per stage, in stage order; the same rows as `runtime.csv`."""
     total_seconds: float
     """Wall-clock seconds for the whole run."""

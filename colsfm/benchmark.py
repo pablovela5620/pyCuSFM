@@ -88,6 +88,7 @@ from colsfm.geometry import MILLIMETRES_PER_METRE
 from colsfm.reconstruction import num_registered_images, registered_image_names
 from colsfm.run_lifecycle import RunState, read_run_state
 from colsfm.runtime import STAGE_PATTERNS, STAGES, Stage, classify_stage, latest_run_records, read_stage_runtimes, stage_runtime_seconds
+from colsfm.trajectory import MIN_ALIGNMENT_SAMPLES, TrajectoryScore, score_positions
 
 __all__ = [
     "DEGENERATE_VARIANCE",
@@ -457,29 +458,30 @@ def reconstruction_metrics(reconstruction: pycolmap.Reconstruction) -> Reconstru
 def _trajectory_metrics(
     reference_name: TrajectoryReference, track: RigTrack, reference: RigTrack, tolerance_microseconds: int
 ) -> TrajectoryMetrics:
-    """Join two trajectories on timestamp and align the run onto the reference."""
+    """Join two trajectories on timestamp and align the run onto the reference.
+
+    The join and the fit are `colsfm.trajectory`'s: `score_positions` owns the rigid
+    alignment, the millimetre conversion and the too-few-samples answer, and this
+    function used to carry its own copy of all three. Only the reference path length
+    is local, because only the benchmark's report has a column for it.
+    """
     track_indices, reference_indices = match_timestamps(
         track.timestamps_microseconds, reference.timestamps_microseconds, tolerance_microseconds
     )
-    if len(track_indices) < 3:
-        return TrajectoryMetrics(
-            reference=reference_name,
-            num_matched=len(track_indices),
-            rmse_millimeters=float("nan"),
-            max_millimeters=float("nan"),
-            would_be_scale=float("nan"),
-            reference_path_length_meters=0.0,
-        )
     source_xyz: Positions = track.world_t_rig[track_indices]
     target_xyz: Positions = reference.world_t_rig[reference_indices]
-    alignment: RigidAlignment = align_rigid(source_xyz, target_xyz)
+    score: TrajectoryScore = score_positions(source_xyz, target_xyz)
     return TrajectoryMetrics(
         reference=reference_name,
-        num_matched=len(track_indices),
-        rmse_millimeters=MILLIMETRES_PER_METRE * alignment.rmse_meters,
-        max_millimeters=MILLIMETRES_PER_METRE * alignment.max_error_meters,
-        would_be_scale=alignment.would_be_scale,
-        reference_path_length_meters=path_length_meters(target_xyz),
+        num_matched=score.num_matched,
+        rmse_millimeters=score.rigid_rmse_millimeters,
+        max_millimeters=score.rigid_max_millimeters,
+        would_be_scale=score.would_be_scale,
+        # 0.0 rather than a path along too few points: an unfitted row has no reference
+        # length to report, which is what the NaN residuals above already say.
+        reference_path_length_meters=(
+            path_length_meters(target_xyz) if score.num_matched >= MIN_ALIGNMENT_SAMPLES else 0.0
+        ),
     )
 
 

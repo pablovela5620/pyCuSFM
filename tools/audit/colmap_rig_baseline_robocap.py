@@ -78,7 +78,7 @@ from colsfm.cameras import COLMAP_MODEL_BY_PROJECTION_MODEL, colmap_camera_param
 from colsfm.export import KEYFRAME_METADATA_SUBPATH, colour_points_from_images, write_colmap_model, write_optimised_frames_meta, write_pose_files
 from colsfm.frames_meta import FRAMES_META_NAME, FramesMeta, KeyframeMeta, read_frames_meta
 from colsfm.reconstruction import RigReference, gauge_camera_params_id, rig_reference
-from colsfm.rig_calibration import ExtrinsicDelta, extrinsic_deltas, rig_config
+from colsfm.rig_calibration import ExtrinsicChange, extrinsic_deltas, rig_config
 from tools.audit.colmap_baseline_galileo import (
     EXTRACTOR_BY_CHOICE,
     MATCHER_BY_CHOICE,
@@ -213,7 +213,7 @@ class ColmapRigBaselineRobocapResult:
     """Registered images of the largest model over `total_images`."""
     num_rig_frames_registered: int
     """Rig frames the largest model gave a pose to."""
-    extrinsic_deltas: tuple[ExtrinsicDelta, ...]
+    extrinsic_deltas: tuple[ExtrinsicChange, ...]
     """Recovered rig extrinsics against the calibration, per non-reference camera."""
 
 
@@ -609,7 +609,7 @@ def main(config: ColmapRigBaselineRobocapConfig) -> None:
     largest: pycolmap.Reconstruction = models[summaries[0].model_index]
 
     keyframe_id_by_image_id: dict[int, int] = rename_to_dataset_names(largest, staged)
-    deltas: tuple[ExtrinsicDelta, ...] = extrinsic_deltas(largest, frames_meta, reference)
+    deltas: tuple[ExtrinsicChange, ...] = extrinsic_deltas(largest, frames_meta, reference)
     with clock.stage("export"):
         num_coloured: int = write_cusfm_run(cusfm_dir, largest, frames_meta, keyframe_id_by_image_id, config.input_dir)
     clock.write_csv(cusfm_dir)
@@ -660,7 +660,7 @@ def main(config: ColmapRigBaselineRobocapConfig) -> None:
         f"unsupported-model warnings: {result.caspar_unsupported_model_warnings}"
     )
     for delta in deltas:
-        print(f"[audit-robocap] extrinsic {delta.sensor_name:<14} {delta.translation_millimeters:8.2f} mm  {delta.rotation_degrees:7.3f} deg")
+        print(f"[audit-robocap] extrinsic {delta.sensor_name:<14} {delta.translation_change_mm:8.2f} mm  {delta.rotation_change_deg:7.3f} deg")
     print(f"[audit-robocap] wrote {output_json}")
     print(f"[audit-robocap] optimised metadata at {cusfm_dir / KEYFRAME_METADATA_SUBPATH}")
 

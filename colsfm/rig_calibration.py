@@ -33,17 +33,33 @@ from colsfm.reconstruction import RigReference
 
 @serde
 @dataclass(frozen=True)
-class ExtrinsicDelta:
-    """How far a mapper moved one camera's `cam_from_rig` off the calibration."""
+class ExtrinsicChange:
+    """How far one camera's rig extrinsic moved, whatever moved it.
+
+    Two producers, one record. `extrinsic_deltas` here measures a mapper against the
+    calibration — `sensor_from_rig` as COLMAP left it against
+    `calibrated_cam_from_rig` — and `colsfm.run_report.extrinsic_changes` measures the
+    regularised refinement against its input — `vehicle_T_cam` after the alternation
+    against the `frames_meta.json` it started from. The transforms are inverses of one
+    another and the pair of numbers is the same pair: millimetres between the origins,
+    degrees between the rotations. They were two `@serde` records with four fields
+    each under two spellings.
+    """
 
     camera_params_id: int
     """The camera, by its `frames_meta.json` id."""
     sensor_name: str
     """The camera folder name, for reading the table."""
-    translation_millimeters: float
-    """Norm of the translation difference between recovered and calibrated `cam_from_rig`."""
-    rotation_degrees: float
-    """Geodesic angle between recovered and calibrated `cam_from_rig` rotations."""
+    translation_change_mm: float
+    """Distance between the two extrinsics' origins, in millimetres."""
+    rotation_change_deg: float
+    """Geodesic angle between the two extrinsics' rotations, in degrees."""
+    is_reference: bool = False
+    """Whether this is the rig origin and fixed camera, whose change is exactly zero.
+
+    `extrinsic_deltas` never emits one — the reference camera's `cam_from_rig` is the
+    identity by construction, so there is nothing to compare — and the refinement
+    reports it so that a reader can see the gauge was held."""
 
 
 def calibrated_cam_from_rig(frames_meta: FramesMeta, reference: RigReference) -> dict[int, pycolmap.Rigid3d]:
@@ -128,7 +144,9 @@ def camera_params_id_by_camera_id(reconstruction: pycolmap.Reconstruction, frame
     return {image.camera_id: camera_params_id_by_folder[image.name.split("/")[0]] for image in reconstruction.images.values()}
 
 
-def extrinsic_deltas(reconstruction: pycolmap.Reconstruction, frames_meta: FramesMeta, reference: RigReference) -> tuple[ExtrinsicDelta, ...]:
+def extrinsic_deltas(
+    reconstruction: pycolmap.Reconstruction, frames_meta: FramesMeta, reference: RigReference
+) -> tuple[ExtrinsicChange, ...]:
     """Compare a model's recovered rig extrinsics against the calibration.
 
     `IncrementalPipelineOptions.ba_refine_sensor_from_rig` defaults to on, so a
@@ -142,12 +160,12 @@ def extrinsic_deltas(reconstruction: pycolmap.Reconstruction, frames_meta: Frame
         reference: The rig origin used to build the config.
 
     Returns:
-        One delta per non-reference camera the model kept, ordered by `camera_params_id`.
+        One change per non-reference camera the model kept, ordered by `camera_params_id`.
     """
     calibrated: dict[int, pycolmap.Rigid3d] = calibrated_cam_from_rig(frames_meta, reference)
     params_id_by_camera_id: dict[int, int] = camera_params_id_by_camera_id(reconstruction, frames_meta)
     rig: pycolmap.Rig = next(iter(reconstruction.rigs.values()))
-    deltas: list[ExtrinsicDelta] = []
+    deltas: list[ExtrinsicChange] = []
     for camera_id, camera_params_id in sorted(params_id_by_camera_id.items(), key=lambda item: item[1]):
         if camera_params_id == reference.camera_params_id:
             continue
@@ -156,11 +174,11 @@ def extrinsic_deltas(reconstruction: pycolmap.Reconstruction, frames_meta: Frame
             continue
         difference: pycolmap.Rigid3d = rig.sensor_from_rig(sensor_id) * calibrated[camera_params_id].inverse()
         deltas.append(
-            ExtrinsicDelta(
+            ExtrinsicChange(
                 camera_params_id=camera_params_id,
                 sensor_name=frames_meta.cameras[camera_params_id].sensor_name,
-                translation_millimeters=MILLIMETRES_PER_METRE * float(np.linalg.norm(np.asarray(difference.translation, dtype=np.float64))),
-                rotation_degrees=rotation_degrees(difference),
+                translation_change_mm=MILLIMETRES_PER_METRE * float(np.linalg.norm(np.asarray(difference.translation, dtype=np.float64))),
+                rotation_change_deg=rotation_degrees(difference),
             )
         )
     return tuple(deltas)

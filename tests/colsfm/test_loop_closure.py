@@ -34,8 +34,10 @@ from colsfm.database import read_keypoints_batch
 from colsfm.frames_meta import FramesMeta, parse_message, read_frames_meta
 from colsfm.geometry import rigid3d_from_matrix
 from colsfm.loop_closure import (
+    FunnelCounters,
     LoopCandidate,
     LoopClosureConfig,
+    LoopClosureDiagnostics,
     LoopClosureResult,
     LoopSearchPlan,
     MatchFunction,
@@ -501,7 +503,7 @@ def test_the_score_gate_is_one_constant_and_can_be_overridden(
         scene.frames_meta, scene.database_path, scene.index, LoopClosureConfig(good_score_threshold=0.99), match_fn
     )
     assert strict.diagnostics.good_score_threshold == 0.99
-    assert strict.diagnostics.rejected_by_score > 0
+    assert strict.diagnostics.counters.rejected_by_score > 0
     assert strict.edges == []
 
 
@@ -512,24 +514,25 @@ def test_the_funnel_counters_reconcile(loop_result: LoopClosureResult) -> None:
     `candidates_retrieved` and `rejected_by_time` described different candidate sets and the
     printed funnel did not compose. They now come from the same ranking walk.
     """
-    diagnostics = loop_result.diagnostics
-    assert diagnostics.queries > 0
-    assert diagnostics.candidates_retrieved > 0
-    assert diagnostics.rejected_by_time > 0
+    diagnostics: LoopClosureDiagnostics = loop_result.diagnostics
+    counters: FunnelCounters = diagnostics.counters
+    assert counters.queries > 0
+    assert counters.candidates_retrieved > 0
+    assert counters.rejected_by_time > 0
     survivors: int = (
-        diagnostics.candidates_retrieved - diagnostics.rejected_by_time - diagnostics.rejected_by_score - diagnostics.rejected_by_same_rig
+        counters.candidates_retrieved - counters.rejected_by_time - counters.rejected_by_score - counters.rejected_by_same_rig
     )
-    assert survivors >= diagnostics.after_banding >= diagnostics.after_deduplication
+    assert survivors >= counters.after_banding >= counters.after_deduplication
     measured: int = (
-        diagnostics.rejected_no_matches
-        + diagnostics.rejected_by_geometry
-        + diagnostics.rejected_by_is_good
-        + diagnostics.rejected_by_direction
-        + diagnostics.verified
+        counters.rejected_no_matches
+        + counters.rejected_by_geometry
+        + counters.rejected_by_is_good
+        + counters.rejected_by_direction
+        + counters.verified
     )
-    assert measured == diagnostics.after_deduplication
-    assert diagnostics.verified == len(loop_result.candidates)
-    assert diagnostics.edges == len(loop_result.edges) <= diagnostics.verified
+    assert measured == counters.after_deduplication
+    assert counters.verified == len(loop_result.candidates)
+    assert diagnostics.edges == len(loop_result.edges) <= counters.verified
 
 
 def test_loop_edges_recover_the_ground_truth_relative_rig_pose(scene: SquareRigScene, loop_result: LoopClosureResult) -> None:
@@ -610,7 +613,7 @@ def test_the_thread_count_does_not_reach_the_result(scene: SquareRigScene, clean
     threaded: LoopClosureResult = find_loop_edges(
         scene.frames_meta, scene.database_path, scene.index, LoopClosureConfig(num_threads=8), clean_match_fn
     )
-    assert threaded.diagnostics.after_deduplication == serial_result.diagnostics.after_deduplication
+    assert threaded.diagnostics.counters.after_deduplication == serial_result.diagnostics.counters.after_deduplication
     for result in (serial_result, threaded):
         keys: list[tuple[int, tuple[int, int]]] = [
             (
@@ -647,7 +650,7 @@ def test_reading_the_keypoints_once_and_passing_them_in_replaces_the_database_re
     reused: LoopClosureResult = find_loop_edges(
         scene.frames_meta, absent, scene.index, LoopClosureConfig(num_threads=1), clean_match_fn, keypoints=keypoints
     )
-    assert reused.diagnostics.after_deduplication == serial_result.diagnostics.after_deduplication
+    assert reused.diagnostics.counters.after_deduplication == serial_result.diagnostics.counters.after_deduplication
     shared: set[tuple[int, int]] = set(_poses_by_rig_pair(reused)) & set(_poses_by_rig_pair(serial_result))
     assert len(shared) >= 0.8 * len(serial_result.edges)
     with pytest.raises(FileNotFoundError):

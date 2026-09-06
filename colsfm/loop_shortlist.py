@@ -17,7 +17,7 @@ from the same walk.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -26,47 +26,6 @@ from colsfm.geometry import MICROSECONDS_PER_SECOND
 from colsfm.loop_pose import RigPoseRejection, RigPoseRejectionReason
 from colsfm.pairs import normalise_pair
 from colsfm.retrieval import RetrievalIndex, RetrievalQuery
-
-
-@dataclass(frozen=True, slots=True)
-class LoopClosureDiagnostics:
-    """Where the candidates went, so a run can be explained without re-running it."""
-
-    session_duration_seconds: float
-    """`max(timestamp) - min(timestamp)` over the keyframes, in seconds."""
-    min_time_gap_seconds: float
-    """The temporal gap actually applied: `max(fixed threshold, ratio * session duration)`."""
-    good_score_threshold: float
-    """The retrieval score gate actually applied."""
-    queries: int
-    """Query keyframes the stage issued a retrieval for."""
-    candidates_retrieved: int
-    """Retrieval hits the index examined across all queries, before any gate. The gate
-    counters below split exactly this number, because they all come from the same walk."""
-    rejected_by_score: int
-    """Hits dropped by `good_score_threshold`."""
-    rejected_by_time: int
-    """Hits dropped by the temporal gate."""
-    rejected_by_same_rig: int
-    """Hits whose rig frame is the query's own; an intra-rig pair is an extrinsic edge."""
-    after_banding: int
-    """Hits left after `select_best_candidates` over every query."""
-    after_deduplication: int
-    """Rig pairs left after keeping the best-scoring hit per unordered rig pair; this is
-    what the metric estimator is actually run on."""
-    rejected_no_matches: int
-    """Rig pairs whose local map and loop matches yielded too few 2-D-3-D observations."""
-    rejected_by_geometry: int
-    """Rig pairs the generalized PnP failed on outright."""
-    rejected_by_is_good: int
-    """Rig pairs that failed `inliers > min_inliers and inliers / observations > min_inlier_ratio`."""
-    rejected_by_direction: int
-    """Rig pairs whose refined translation direction disagreed with the generalized
-    essential matrix's by more than `RigPoseConfig.max_direction_disagreement_deg`."""
-    verified: int
-    """Rig pairs that produced a metric relative pose."""
-    edges: int
-    """Edges left after `gate_loop_edges`, i.e. what the caller receives."""
 
 
 @dataclass(slots=True)
@@ -130,16 +89,39 @@ class FunnelCounters:
             edges: Edges left after `gate_loop_edges`.
 
         Returns:
-            The frozen diagnostics.
+            The frozen diagnostics, carrying a copy of the counters as they stand.
         """
         return LoopClosureDiagnostics(
+            counters=replace(self),
             session_duration_seconds=duration_seconds,
             min_time_gap_seconds=gap_seconds,
             good_score_threshold=score_threshold,
             edges=edges,
-            **asdict(self),
         )
 
+
+@dataclass(frozen=True, slots=True)
+class LoopClosureDiagnostics:
+    """Where the candidates went, so a run can be explained without re-running it.
+
+    The counters themselves are `FunnelCounters`, held whole rather than copied out
+    field by field: the twelve names were declared here as well, and `freeze` spliced
+    them across with `**asdict(...)`, so adding a gate meant editing three places and
+    a reader could not tell which numbers came from the same walk. What is added here
+    is what the counters cannot know — the gates the run actually resolved, and the
+    edges left after `gate_loop_edges`.
+    """
+
+    counters: FunnelCounters
+    """The funnel itself: queries, hits, and where every hit went."""
+    session_duration_seconds: float
+    """`max(timestamp) - min(timestamp)` over the keyframes, in seconds."""
+    min_time_gap_seconds: float
+    """The temporal gap actually applied: `max(fixed threshold, ratio * session duration)`."""
+    good_score_threshold: float
+    """The retrieval score gate actually applied."""
+    edges: int
+    """Edges left after `gate_loop_edges`, i.e. what the caller receives."""
 
 @dataclass(frozen=True, slots=True)
 class RetrievalHit:

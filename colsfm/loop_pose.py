@@ -109,9 +109,10 @@ production. `test_every_needed_image_pair_is_requested_even_when_nothing_matches
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Literal, TypeAlias
+from typing import Final, Literal, TypeAlias
 
 import numpy as np
 import pycolmap
@@ -208,6 +209,14 @@ class RigPoseConfig:
     Measured on RoboCap it costs 66 of 921 pairs and buys 10 mm of trajectory RMSE
     (418.4 mm without it, 408.1 mm with it), so it is on by default."""
 
+
+BEARING_CACHE_IMAGES: Final[int] = 512
+"""Images whose unprojected bearings one estimator keeps resident.
+
+The same number `colsfm.matching_trt.FEATURE_CACHE_IMAGES` uses, and for the same
+reason: a measurement reads a source rig frame, its temporal neighbours and one
+target rig frame, so a few hundred entries hold every group's working set while a
+whole RoboCap sequence's would be 4528 float64 arrays of tens of thousands of rows."""
 
 DEFAULT_RIG_POSE_CONFIG: RigPoseConfig = RigPoseConfig()
 """Shared immutable default, so the signatures below hold no constructor call."""
@@ -437,7 +446,8 @@ class RigPoseEstimator:
 
     Build one per run and call `measure_group` once per source rig frame. The estimator is
     safe to share between threads: the only mutated state is the bearing memo, whose entries
-    are idempotent (two threads racing on the same image recompute the same array).
+    are idempotent (two threads racing on the same image recompute the same array) and whose
+    eviction can only cost a recomputation.
     """
 
     index: RigFrameIndex
@@ -454,8 +464,13 @@ class RigPoseEstimator:
     """`camera_params_id` per image id, inverted from the rig-frame index."""
     _rig_of_image: dict[int, int] = field(init=False, repr=False)
     """`synced_sample_id` per image id, inverted from the rig-frame index."""
-    _bearings: dict[int, Bearings] = field(init=False, repr=False, default_factory=dict)
-    """Memoised unit bearings per image id; one camera-model unprojection per keypoint."""
+    _bearings: OrderedDict[int, Bearings] = field(init=False, repr=False, default_factory=OrderedDict)
+    """Memoised unit bearings per image id, most recently used last.
+
+    An LRU of `BEARING_CACHE_IMAGES`, as `colsfm.matching_trt.FeatureCache` is over
+    keypoints and descriptors: the memo used to be an unbounded dict, so a RoboCap run
+    ended it holding a `[num_keypoints, 3]` float64 array for every one of 4528 images
+    at once, for a measurement that only ever reads a few rig frames' worth."""
 
     def __post_init__(self) -> None:
         """Invert the rig-frame index into the per-image lookups every step needs."""
@@ -486,10 +501,14 @@ class RigPoseEstimator:
             Float64 unit bearings with shape `[n_keypoints, 3]`.
         """
         cached: Bearings | None = self._bearings.get(image_id)
-        if cached is None:
-            cached = bearings_of(self.camera_of(image_id), self.keypoints[image_id])
-            self._bearings[image_id] = cached
-        return cached
+        if cached is not None:
+            self._bearings.move_to_end(image_id)
+            return cached
+        computed: Bearings = bearings_of(self.camera_of(image_id), self.keypoints[image_id])
+        self._bearings[image_id] = computed
+        if len(self._bearings) > BEARING_CACHE_IMAGES:
+            self._bearings.popitem(last=False)
+        return computed
 
     def focal_length_px(self, image_id: int) -> float:
         """Mean focal length in pixels of the camera that took one image.

@@ -435,11 +435,11 @@ def run_loop_closure_stage(
     # Print the counters, not just the edge count: zero edges is the normal outcome on a
     # short or a low-recall sequence, and only the rejection breakdown says which it was.
     print(
-        f"[colsfm] loop closure: {len(edges)} loop edges | {result.diagnostics.queries} queries, "
-        f"{result.diagnostics.candidates_retrieved} retrieved, {result.diagnostics.rejected_by_score} below score, "
-        f"{result.diagnostics.rejected_by_time} inside the {result.diagnostics.min_time_gap_seconds:.2f}s gap, "
-        f"{result.diagnostics.rejected_by_geometry} failed geometry, {result.diagnostics.rejected_by_is_good} not good, "
-        f"{result.diagnostics.verified} verified over {len(plan.image_pairs)} image pairs"
+        f"[colsfm] loop closure: {len(edges)} loop edges | {result.diagnostics.counters.queries} queries, "
+        f"{result.diagnostics.counters.candidates_retrieved} retrieved, {result.diagnostics.counters.rejected_by_score} below score, "
+        f"{result.diagnostics.counters.rejected_by_time} inside the {result.diagnostics.min_time_gap_seconds:.2f}s gap, "
+        f"{result.diagnostics.counters.rejected_by_geometry} failed geometry, {result.diagnostics.counters.rejected_by_is_good} not good, "
+        f"{result.diagnostics.counters.verified} verified over {len(plan.image_pairs)} image pairs"
     )
     return LoopClosureStageResult(
         edges=edges, num_pairs_matched=len(missing_pairs), diagnostics=result.diagnostics

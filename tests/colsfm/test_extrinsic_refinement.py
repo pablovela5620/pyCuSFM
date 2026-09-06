@@ -27,7 +27,13 @@ from scipy.spatial.transform import Rotation
 
 from colsfm.config import BundleAdjustmentConfig, CusfmConfig, read_config_directory
 from colsfm.extrinsic_costs import RepeatedCauchyLoss, RigReprojectionCost, cauchy_square_root_scale
-from colsfm.extrinsic_observations import camera_observations, co_observed_camera_pairs
+from colsfm.extrinsic_observations import (
+    CameraObservations,
+    ObservationIndex,
+    build_observation_index,
+    camera_observations,
+    co_observed_camera_pairs,
+)
 from colsfm.extrinsic_refinement import (
     ExtrinsicRefinementOptions,
     apply_extrinsics,
@@ -391,6 +397,42 @@ def test_camera_observations_cover_every_camera(rig_scene: RigScene) -> None:
     assert total == rig_scene.reconstruction.compute_num_observations()
     for entry in observations.values():
         assert entry.points_in_vehicle.shape[0] == entry.observed_px.shape[0]
+
+
+def test_a_prebuilt_index_gathers_exactly_what_building_one_would(rig_scene: RigScene) -> None:
+    """The alternation reuses one index across its rounds; that must change no number.
+
+    `build_observation_index` now resolves every observation to a row of the sorted
+    point array and keeps the sort, because neither changes while the alternation runs
+    — bundle adjustment inside it moves points but adds and removes no observation.
+    The per-round pass used to redo the sort and one `searchsorted` per image.
+    """
+    fresh: dict[int, CameraObservations] = camera_observations(rig_scene.reconstruction, rig_scene.rig_reference)
+    index: ObservationIndex = build_observation_index(rig_scene.reconstruction)
+    reused: dict[int, CameraObservations] = camera_observations(
+        rig_scene.reconstruction, rig_scene.rig_reference, index
+    )
+
+    assert sorted(reused) == sorted(fresh)
+    for camera_params_id, entry in fresh.items():
+        np.testing.assert_array_equal(reused[camera_params_id].points_in_vehicle, entry.points_in_vehicle)
+        np.testing.assert_array_equal(reused[camera_params_id].observed_px, entry.observed_px)
+
+
+def test_an_index_outlived_by_its_points_is_refused(rig_scene: RigScene) -> None:
+    """Reusing an index across a filter would silently reproject the wrong points.
+
+    Every row of the index names a position by its place in the sorted point array, so
+    a model that has lost a point makes every later row mean a different point. The old
+    per-round `searchsorted` dropped the missing observations instead, which changed
+    the size of the problem without saying so.
+    """
+    index: ObservationIndex = build_observation_index(rig_scene.reconstruction)
+    reconstruction: pycolmap.Reconstruction = rig_scene.reconstruction
+    reconstruction.delete_point3D(next(iter(reconstruction.points3D)))
+
+    with pytest.raises(ValueError, match="rebuild it with `build_observation_index`"):
+        camera_observations(reconstruction, rig_scene.rig_reference, index)
 
 
 def test_camera_observations_reproject_exactly_at_the_true_extrinsics(rig_scene: RigScene) -> None:
