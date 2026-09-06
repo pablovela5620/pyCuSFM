@@ -27,11 +27,17 @@ re-exported here, because `tools/audit` reaches for them through this name:
    `points3D.txt` is not a measurement. `pycolmap.Reconstruction.update_point_3d_errors`
    followed by `compute_mean_reprojection_error` re-derives it from the tracks.
 2. **The model is read with `pycolmap.Reconstruction.read_text`,** not
-   `demo_rerun.read_colmap_model`. The hand-rolled parser mis-parses
-   `images.txt` when an image has zero observations (pycolmap-capabilities.md §10).
+   `colsfm.colmap_text_model.read_colmap_model`. The text reader exists so the
+   demo need not carry pycolmap's dependency stack; where pycolmap is already
+   present, its own reader is the one to use.
 3. **The rig trajectory comes from `kpmap/keyframes/frames_meta.json`,** through
    `FramesMeta.rig_frames()` — see `colsfm.alignment` for why.
 4. **`runtime.csv` is cut down to its last run** — see `colsfm.runtime`.
+5. **An unfinished run is refused.** `read_run` reads `run_state.json` and
+   raises unless it says `succeeded`, so a staging directory or a run that
+   died halfway cannot be benchmarked as if it were whole
+   (`colsfm.run_lifecycle`). A blob reference run has no such file and is
+   read exactly as before.
 
 ## Acceptance is data-driven
 
@@ -80,6 +86,7 @@ from colsfm.export import KEYFRAME_METADATA_SUBPATH, RUNTIME_CSV_NAME, SPARSE_DI
 from colsfm.frames_meta import FRAMES_META_NAME, FramesMeta, read_frames_meta
 from colsfm.geometry import MILLIMETRES_PER_METRE
 from colsfm.reconstruction import num_registered_images, registered_image_names
+from colsfm.run_lifecycle import RunState, read_run_state
 from colsfm.runtime import STAGE_PATTERNS, STAGES, Stage, classify_stage, latest_run_records, read_stage_runtimes, stage_runtime_seconds
 
 __all__ = [
@@ -197,7 +204,19 @@ def read_run(run_dir: Path, name: str) -> RunArtifacts:
 
     Raises:
         FileNotFoundError: When the sparse model or the optimised metadata is missing.
+        ValueError: When the directory says it holds an unfinished run.
     """
+    state: RunState | None = read_run_state(run_dir)
+    # A `pycusfm` reference run has no `run_state.json` at all, and is read as it
+    # always was. A colsfm run has one, and a published one always says `succeeded`
+    # -- `colsfm.run_lifecycle` publishes by rename, so anything else here is a
+    # staging directory being read directly.
+    if state is not None and state.status != "succeeded":
+        raise ValueError(
+            f"{run_dir} holds a run that {state.status}"
+            + (f" ({state.failure})" if state.failure else "")
+            + f"; it completed {list(state.stages_completed)} of {list(state.stages_planned)}"
+        )
     sparse_dir: Path = run_dir / SPARSE_DIR_NAME
     meta_path: Path = run_dir / KEYFRAME_METADATA_SUBPATH
     if not (sparse_dir / "images.txt").is_file() and not (sparse_dir / "images.bin").is_file():

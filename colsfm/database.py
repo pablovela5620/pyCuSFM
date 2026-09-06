@@ -28,7 +28,8 @@ Keypoints written by COLMAP are Nx6 (xy plus a 2x2 affine block), so
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping, Sequence
+import contextlib
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Final, TypeAlias
 
@@ -65,6 +66,34 @@ KEYPOINT_XY_COLUMNS: Final[int] = 2
 
 MatchIndices: TypeAlias = Int64[ndarray, "num_matches 2"]
 """One row per match: the keypoint index in the pair's first image, then in its second."""
+
+
+@contextlib.contextmanager
+def database_transaction(database: pycolmap.Database) -> Iterator[None]:
+    """Commit everything the block writes as one transaction.
+
+    SQLite wraps each unbatched statement in its own transaction, so a batch of
+    keypoint and descriptor writes used to reach the file one column at a time: an
+    interrupted extraction could leave an image with keypoints and no descriptors,
+    which every reader downstream takes as a contradiction rather than as damage.
+    Inside this block they land together.
+
+    `pycolmap.DatabaseTransaction` is an RAII object with no `close()`: COLMAP
+    commits it in its destructor, so the block ends by dropping the last reference
+    to it. That means it commits on the way out of an exception too -- it makes the
+    write coherent, it is not a rollback.
+
+    Args:
+        database: An open COLMAP database.
+
+    Yields:
+        Nothing; the block runs inside the transaction.
+    """
+    transaction: pycolmap.DatabaseTransaction = pycolmap.DatabaseTransaction(database)
+    try:
+        yield
+    finally:
+        del transaction
 
 
 def create_database(database_path: Path, frames_meta: FramesMeta, *, overwrite: bool = False) -> None:

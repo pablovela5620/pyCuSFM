@@ -122,12 +122,11 @@ from colsfm.pipeline import (
     PipelineOptions,
     PipelineSummary,
     PoseGraphStageResult,
-    StageName,
     run_pipeline,
-    stage_names,
 )
 from colsfm.pose_graph import PoseGraphEdge, RigNode
 from colsfm.rerun_log import IMAGE_PLANE_DISTANCE, POINT_RADIUS, TIMELINE, Rgb, build_rig
+from colsfm.run_lifecycle import StageName, stage_names
 
 # ══════════════════════════════════════════════════════════════════════════════════════
 # constants
@@ -1711,7 +1710,12 @@ class WalkthroughObserver(PipelineObserver):
     config: WalkthroughConfig
     """The parsed command line: the sample count, the arrow scale and the reference runs."""
     options: PipelineOptions
-    """The options `run_pipeline` is executing, for the database and image paths."""
+    """The options `run_pipeline` is executing, for the database and image paths.
+
+    Replaced in `run_started` by the ones the stages actually run with, whose
+    `output_dir` is the run's staging directory: mid-run, that is where the
+    database and the exported artifacts are, and reading the destination would
+    read the *previous* run."""
     stages: tuple[WalkthroughStage, ...]
     """The timeline slots this run records, in stage order."""
     console: dict[str, str] = field(default_factory=dict)
@@ -1724,6 +1728,8 @@ class WalkthroughObserver(PipelineObserver):
     """Stage 1's result; every later stage draws against the collection it selected."""
     pose_graph_meta: FramesMeta | None = None
     """Stage 6's re-posed collection, which stage 7b's before/after arrows start from."""
+    export: tuple[ExportStageResult, MappingResult] | None = None
+    """Stage 8's result, held until the run is published; see `on_export`."""
 
     def stage(self, name: StageName) -> WalkthroughStage:
         """Look up a stage's timeline slot by name.
@@ -1784,12 +1790,14 @@ class WalkthroughObserver(PipelineObserver):
         return self._captured(stage)
 
     def run_started(self, options: PipelineOptions, stages: tuple[StageName, ...]) -> None:
-        """Set the recording's world axes before stage 1.
+        """Take the staged options and set the recording's world axes before stage 1.
 
         Args:
-            options: The options the run will execute; already held as `options`.
+            options: The options the stages will execute, rebased onto the run's
+                staging directory. Everything this observer opens mid-run is there.
             stages: The stages it will record; already held as `stages`.
         """
+        self.options = options
         rr.log("/", rr.ViewCoordinates.RFU, static=True)
 
     def on_keyframe_selection(self, result: KeyframeSelectionStageResult) -> None:
@@ -1888,15 +1896,40 @@ class WalkthroughObserver(PipelineObserver):
         )
 
     def on_export(self, result: ExportStageResult, mapping: MappingResult) -> None:
-        """Draw stage 8.
+        """Hold stage 8's result until the run is published.
+
+        Its notes panel closes with a benchmark table, and `colsfm.benchmark`
+        refuses a run that has not finished — rightly, since mid-run the artifacts
+        are still in the staging directory. So the drawing waits for
+        `run_finished`; the entities still land at the export stage's own index,
+        because the `stage` timeline is set by the stage, not by the call order.
 
         Args:
             result: The exported collection and what was written.
             mapping: The final mapping result the export was made from.
         """
+        self.export = (result, mapping)
+
+    def run_finished(self, summary: PipelineSummary) -> None:
+        """Draw stage 8 against the published run, take the timings, send the blueprint.
+
+        The blueprint is sent last, not first: stage 2's panes name the keyframes
+        the sampler picked, which nothing knows before the run.
+
+        Args:
+            summary: What the run produced and how long each stage took.
+
+        Raises:
+            RuntimeError: When the run finished without an export stage.
+        """
+        if self.export is None:
+            raise RuntimeError("the walkthrough finished a run that never exported")
+        result, mapping = self.export
         log_export(
             self.stage("export"),
-            self.options,
+            # `summary.options` names the *published* directory; `self.options`
+            # still names the staging one the stages wrote into.
+            summary.options,
             result,
             mapping,
             self._selected().frames_meta,
@@ -1904,16 +1937,6 @@ class WalkthroughObserver(PipelineObserver):
             self.config.dataset,
             self.console["export"],
         )
-
-    def run_finished(self, summary: PipelineSummary) -> None:
-        """Take the run's timings and send the blueprint.
-
-        Sent last, not first: stage 2's panes name the keyframes the sampler picked,
-        which nothing knows before the run.
-
-        Args:
-            summary: What the run produced and how long each stage took.
-        """
         self.seconds_by_stage = dict(summary.stage_seconds)
         rr.send_blueprint(build_blueprint(self.stages, self.samples), make_active=True, make_default=True)
 

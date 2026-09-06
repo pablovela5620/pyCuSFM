@@ -76,12 +76,11 @@ Ordering notes worth knowing before reading the code:
 from __future__ import annotations
 
 import contextlib
-import subprocess
 import time
-from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Final, Literal, TypeAlias, get_args
+from typing import Final
 
 import numpy as np
 import pycolmap
@@ -103,9 +102,6 @@ from colsfm.database import (
     read_keypoints_batch,
 )
 from colsfm.export import (
-    RUNTIME_CSV_NAME,
-    RuntimeRecord,
-    append_runtime_record,
     colour_points_from_images,
     write_colmap_model,
     write_optimised_frames_meta,
@@ -139,76 +135,27 @@ from colsfm.pairs import select_pairs
 from colsfm.pose_graph import PoseGraphEdge, PoseGraphResult, RigNode, sequential_edges, solve_pose_graph
 from colsfm.reconstruction import PosedModel, build_reconstruction, gauge_camera_params_id
 from colsfm.retrieval import RetrievalIndex, build_retrieval_index
-
-StageName: TypeAlias = Literal[
-    "keyframe_selection",
-    "feature_extraction",
-    "pair_selection",
-    "matching",
-    "loop_closure",
-    "pose_graph",
-    "reconstruction",
-    "extrinsic_refinement",
-    "export",
-]
-"""The stages, in the order `CusfmRunner.run_all` runs their blob equivalents."""
-
-EXTRINSIC_REFINEMENT_STAGE: Final[StageName] = "extrinsic_refinement"
-"""The second mapping pass `--optimize-extrinsics` adds, mirroring the blob.
-
-`CusfmRunner` runs `keypoints_mapper_main` twice: once with the extrinsics fixed
-and once with `--optimize_extrinsics=True`, both over the same matches and the
-same `pose_graph/frames_meta.json` poses (`pycusfm/cusfm_runner.py`,
-`run_mapping` then `refine_extrinsics`). The second pass overwrites `kpmap/`."""
-
-ALL_STAGE_NAMES: Final[tuple[StageName, ...]] = get_args(StageName)
-"""Every stage, in `StageName`'s own order; what an `--optimize-extrinsics` run records."""
-
-STAGE_NAMES: Final[tuple[StageName, ...]] = tuple(
-    stage for stage in ALL_STAGE_NAMES if stage != EXTRINSIC_REFINEMENT_STAGE
+from colsfm.run_lifecycle import (
+    DATABASE_NAME,
+    EXTRINSIC_REFINEMENT_STAGE,
+    KEYFRAME_DIR_NAME,
+    LOOP_EDGES_NAME,
+    POSE_GRAPH_DIR_NAME,
+    SUMMARY_NAME,
+    VEHICLE_POSE_TUM_NAME,
+    CheapStageName,
+    RunWorkspace,
+    StageLedger,
+    StageName,
+    git_sha,
+    open_workspace,
+    stage_names,
+    timed_stage,
 )
-"""The stages a default run records: every stage but the second mapping pass."""
-
-
-def stage_names(optimize_extrinsics: bool) -> tuple[StageName, ...]:
-    """The stages a run will record, in order.
-
-    Args:
-        optimize_extrinsics: Whether the run makes the second mapping pass.
-
-    Returns:
-        `ALL_STAGE_NAMES` when the flag is set, `STAGE_NAMES` otherwise.
-    """
-    return ALL_STAGE_NAMES if optimize_extrinsics else STAGE_NAMES
-
-
-CheapStageName: TypeAlias = Literal["keyframe_selection", "pair_selection"]
-"""The stages the `stage` subcommand can run on their own: metadata only, no GPU."""
 
 DEFAULT_CONFIG_DIR: Final[Path] = REPO_ROOT / "data" / "cusfm_configs" / "loop-closure-fixed"
 """`isaac` with loop closure repaired; what the blob reference runs used."""
 
-KEYFRAME_DIR_NAME: Final[str] = "keyframes"
-"""`pycusfm.constants.kKEYFRAME_DIR`: where the selected metadata lands."""
-
-POSE_GRAPH_DIR_NAME: Final[str] = "pose_graph"
-"""`pycusfm.constants.kPOSE_GRAPH_DIR`: where the optimised rig trajectory lands."""
-
-DATABASE_NAME: Final[str] = "database.db"
-"""The COLMAP database, which has no cuSFM equivalent (the blob writes keyframe protos)."""
-
-VEHICLE_POSE_TUM_NAME: Final[str] = "vehicle_pose.tum"
-"""`pose_graph_main`'s own rig trajectory file name."""
-
-LOOP_EDGES_NAME: Final[str] = "loop_edges.json"
-"""The gated loop constraints, written beside the rig trajectory.
-
-No cuSFM equivalent — the blob keeps its edges inside `vehicle_pose_graph.pb.txt`
-— but a viewer that wants to draw the loops needs them as data rather than as a
-log line. See `write_loop_edges`."""
-
-SUMMARY_NAME: Final[str] = "summary.json"
-"""Machine-readable run report, written by this pipeline and by nothing in cuSFM."""
 
 @serde
 @dataclass(frozen=True, slots=True)
@@ -495,73 +442,6 @@ class PipelineSummary:
     """Per-camera extrinsic movement the refinement produced; empty when the flag is off."""
     extrinsic_refinement_rounds_run: int = 0
     """Rounds the regularised refinement actually took before it converged."""
-
-
-@dataclass(slots=True)
-class StageClock:
-    """Times stages, appends each to `runtime.csv` and keeps them for the summary."""
-
-    output_dir: Path
-    """Workspace root holding `runtime.csv`."""
-    stages: tuple[StageName, ...] = STAGE_NAMES
-    """The stages this run will record, so the progress line counts the right total."""
-    seconds_by_stage: dict[str, float] = field(default_factory=dict)
-    """Wall-clock seconds per stage, in completion order."""
-
-    def record(self, stage: StageName, seconds: float) -> None:
-        """Store one stage's runtime and append it to the log.
-
-        Args:
-            stage: The stage that just finished.
-            seconds: Its wall-clock duration.
-        """
-        self.seconds_by_stage[stage] = seconds
-        append_runtime_record(self.output_dir, RuntimeRecord(command=stage, runtime_seconds=seconds))
-
-
-@contextlib.contextmanager
-def timed_stage(clock: StageClock, stage: StageName) -> Iterator[None]:
-    """Time the enclosed block and record it as one stage, only when it succeeds.
-
-    A stage that raises records nothing: `runtime.csv` and the summary's
-    `stage_seconds` are the run's evidence of what completed, and a half-run stage
-    completed nothing. The exception propagates unchanged.
-
-    Args:
-        clock: The clock to record into.
-        stage: The stage the block implements.
-
-    Yields:
-        Nothing; the block runs inside the timing window.
-    """
-    started: float = time.perf_counter()
-    print(f"[colsfm] stage {clock.stages.index(stage) + 1}/{len(clock.stages)}: {stage}")
-    yield
-    elapsed: float = time.perf_counter() - started
-    clock.record(stage, elapsed)
-    print(f"[colsfm] {stage} finished in {elapsed:.2f}s")
-
-
-def git_sha(repo_root: Path = REPO_ROOT) -> str:
-    """Read the working tree's commit, for the summary's provenance field.
-
-    Args:
-        repo_root: Directory inside the repository.
-
-    Returns:
-        The 40-character SHA, or `"unknown"` when git is unavailable or the
-        directory is not a checkout.
-    """
-    try:
-        completed: subprocess.CompletedProcess[str] = subprocess.run(
-            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-    except (OSError, subprocess.CalledProcessError):
-        return "unknown"
-    return completed.stdout.strip()
 
 
 def rig_nodes(frames_meta: FramesMeta) -> list[RigNode]:
@@ -1400,7 +1280,10 @@ class PipelineObserver:
         """Announce the run before stage 1.
 
         Args:
-            options: The options the run will execute.
+            options: The options the stages will execute, with `output_dir` already
+                rebased onto the run's staging directory — so an observer that opens
+                the database or reads an artifact mid-run looks where the run is
+                actually writing. `summary.options` keeps the caller's own paths.
             stages: The stages it will record, in order.
         """
 
@@ -1521,17 +1404,59 @@ def run_pipeline(options: PipelineOptions, observer: PipelineObserver | None = N
     # matching and loop closure had already been paid for and the previous run's
     # database had already been deleted.
     resolved: ResolvedRun = resolve_run(options)
-    options.output_dir.mkdir(parents=True, exist_ok=True)
-    (options.output_dir / RUNTIME_CSV_NAME).unlink(missing_ok=True)
     stages: tuple[StageName, ...] = stage_names(options.optimize_extrinsics)
-    clock: StageClock = StageClock(output_dir=options.output_dir, stages=stages)
+    workspace: RunWorkspace = open_workspace(options.output_dir, stages)
+    # Every stage writes into the staging directory, the database included, because
+    # the stages take an options object whose `output_dir` is that directory. The
+    # summary below reports `options`, i.e. the paths the caller asked for.
+    staged: PipelineOptions = replace(options, output_dir=workspace.staging_dir)
+    ledger: StageLedger = StageLedger(output_dir=workspace.staging_dir, stages=stages)
     print(f"[colsfm] config {options.config_dir} | input {options.input_dir} | output {options.output_dir}")
-    watcher.run_started(options, stages)
+    watcher.run_started(staged, stages)
+    try:
+        summary: PipelineSummary = _run_stages(options, staged, resolved, ledger, watcher, started)
+    except BaseException as error:
+        workspace.fail(ledger, f"{type(error).__name__}: {error}")
+        raise
+    workspace.publish(ledger)
+    watcher.run_finished(summary)
+    return summary
+
+
+def _run_stages(
+    options: PipelineOptions,
+    staged: PipelineOptions,
+    resolved: ResolvedRun,
+    ledger: StageLedger,
+    watcher: PipelineObserver,
+    started: float,
+) -> PipelineSummary:
+    """Run every stage into the staging workspace and write its summary there.
+
+    Split out of `run_pipeline` so that the publication boundary is one `try` around
+    one call rather than a `finally` wrapped around nine stages.
+
+    Args:
+        options: The caller's own options, which the summary reports.
+        staged: The same options with `output_dir` on the staging directory, which
+            every stage writes into.
+        resolved: The per-stage settings, resolved once.
+        ledger: The run's stage ledger.
+        watcher: The observer, told about each stage as it completes.
+        started: `time.perf_counter()` at the start of the run.
+
+    Returns:
+        The summary, already written to the staging directory.
+
+    Raises:
+        FileNotFoundError: When a config file is missing.
+        ValueError: When a stage cannot proceed.
+    """
 
     # ── 1. keyframe selection ────────────────────────────────────────────────────────
-    with timed_stage(clock, "keyframe_selection"), watcher.stage_scope("keyframe_selection"):
+    with timed_stage(ledger, "keyframe_selection"), watcher.stage_scope("keyframe_selection"):
         selection: KeyframeSelectionStageResult = run_keyframe_selection_stage(resolved.selection)
-        write_frames_meta(options.output_dir / KEYFRAME_DIR_NAME / FRAMES_META_NAME, selection.selected)
+        write_frames_meta(staged.output_dir / KEYFRAME_DIR_NAME / FRAMES_META_NAME, selection.selected)
         print(
             f"[colsfm] selected {len(selection.selected.keyframes)}/{len(selection.frames_meta.keyframes)} keyframes "
             f"in {len(selection.rig_frames)} rig frames over {len(selection.selected.cameras)} cameras"
@@ -1540,12 +1465,12 @@ def run_pipeline(options: PipelineOptions, observer: PipelineObserver | None = N
     config: CusfmConfig = selection.config
 
     # ── 2. feature extraction ────────────────────────────────────────────────────────
-    with timed_stage(clock, "feature_extraction"), watcher.stage_scope("feature_extraction"):
-        extraction: ExtractionReport = run_feature_extraction_stage(options, selection.selected, resolved.features)
+    with timed_stage(ledger, "feature_extraction"), watcher.stage_scope("feature_extraction"):
+        extraction: ExtractionReport = run_feature_extraction_stage(staged, selection.selected, resolved.features)
     watcher.on_feature_extraction(extraction)
 
     # ── 3. pair selection ────────────────────────────────────────────────────────────
-    with timed_stage(clock, "pair_selection"), watcher.stage_scope("pair_selection"):
+    with timed_stage(ledger, "pair_selection"), watcher.stage_scope("pair_selection"):
         pairs: list[ImagePair] = run_pair_selection_stage(selection.selected, config)
     watcher.on_pair_selection(pairs)
 
@@ -1553,28 +1478,28 @@ def run_pipeline(options: PipelineOptions, observer: PipelineObserver | None = N
     # One object for stage 4 and stage 5's batch match: the loop stage matching its
     # candidates with settings of its own is exactly the drift this prevents.
     matching_options: MatchingOptions = resolved.matching_options(config)
-    with timed_stage(clock, "matching"), watcher.stage_scope("matching"):
-        matching: MatchReport = run_matching_stage(options, pairs, matching_options)
+    with timed_stage(ledger, "matching"), watcher.stage_scope("matching"):
+        matching: MatchReport = run_matching_stage(staged, pairs, matching_options)
     watcher.on_matching(matching)
 
     # ── 5. loop closure ──────────────────────────────────────────────────────────────
-    with timed_stage(clock, "loop_closure"), watcher.stage_scope("loop_closure"):
+    with timed_stage(ledger, "loop_closure"), watcher.stage_scope("loop_closure"):
         loops: LoopClosureStageResult = run_loop_closure_stage(
-            selection.selected, options.database_path, config.pose_graph, matching_options, enabled=options.loop_closure
+            selection.selected, staged.database_path, config.pose_graph, matching_options, enabled=options.loop_closure
         )
     watcher.on_loop_closure(loops)
 
     # ── 6. pose graph ────────────────────────────────────────────────────────────────
-    with timed_stage(clock, "pose_graph"), watcher.stage_scope("pose_graph"):
-        pose_graph: PoseGraphStageResult = run_pose_graph_stage(options, selection.selected, config, loops.edges)
+    with timed_stage(ledger, "pose_graph"), watcher.stage_scope("pose_graph"):
+        pose_graph: PoseGraphStageResult = run_pose_graph_stage(staged, selection.selected, config, loops.edges)
     watcher.on_pose_graph(pose_graph)
 
     mapping_options: MappingOptions = resolved.mapping
 
     # ── 7. triangulation and bundle adjustment ───────────────────────────────────────
-    with timed_stage(clock, "reconstruction"), watcher.stage_scope("reconstruction"):
+    with timed_stage(ledger, "reconstruction"), watcher.stage_scope("reconstruction"):
         reconstruction: MappingResult = run_reconstruction_stage(
-            options, pose_graph.frames_meta, config, mapping_options
+            staged, pose_graph.frames_meta, config, mapping_options
         )
     # Before 7b: the refinement adjusts this very reconstruction in place.
     watcher.on_reconstruction(reconstruction)
@@ -1585,9 +1510,9 @@ def run_pipeline(options: PipelineOptions, observer: PipelineObserver | None = N
     changes: tuple[ExtrinsicChange, ...] = ()
     rounds_run: int = 0
     if options.optimize_extrinsics:
-        with timed_stage(clock, EXTRINSIC_REFINEMENT_STAGE), watcher.stage_scope(EXTRINSIC_REFINEMENT_STAGE):
+        with timed_stage(ledger, EXTRINSIC_REFINEMENT_STAGE), watcher.stage_scope(EXTRINSIC_REFINEMENT_STAGE):
             refinement: ExtrinsicRefinementStageResult = run_extrinsic_refinement_stage(
-                options, pose_graph.frames_meta, config, mapping_options, mapping
+                staged, pose_graph.frames_meta, config, mapping_options, mapping
             )
         watcher.on_extrinsic_refinement(refinement)
         mapping = refinement.mapping
@@ -1596,8 +1521,8 @@ def run_pipeline(options: PipelineOptions, observer: PipelineObserver | None = N
         rounds_run = refinement.rounds_run
 
     # ── 8. export ────────────────────────────────────────────────────────────────────
-    with timed_stage(clock, "export"), watcher.stage_scope("export"):
-        export: ExportStageResult = run_export_stage(options, mapped_meta, mapping)
+    with timed_stage(ledger, "export"), watcher.stage_scope("export"):
+        export: ExportStageResult = run_export_stage(staged, mapped_meta, mapping)
     watcher.on_export(export, mapping)
 
     summary: PipelineSummary = PipelineSummary(
@@ -1612,19 +1537,18 @@ def run_pipeline(options: PipelineOptions, observer: PipelineObserver | None = N
         num_pose_graph_edges=len(pose_graph.edges),
         pose_graph_translation_change_m=pose_graph.translation_change_m,
         mapping=MappingStats.of(mapping),
-        stage_seconds=dict(clock.seconds_by_stage),
+        stage_seconds=ledger.seconds_by_stage,
         total_seconds=time.perf_counter() - started,
         extrinsic_changes=changes,
         extrinsic_refinement_rounds_run=rounds_run,
     )
-    (options.output_dir / SUMMARY_NAME).write_text(to_json(summary) + "\n")
+    (staged.output_dir / SUMMARY_NAME).write_text(to_json(summary) + "\n")
     print(
         f"[colsfm] done in {summary.total_seconds:.2f}s | "
         f"{summary.mapping.num_images_with_observations} images, {summary.mapping.num_points3D} points, "
         f"{summary.mapping.mean_reprojection_error_px:.4f} px | extraction on {extraction.device}, "
         f"{matching.empty_pairs} empty pairs"
     )
-    watcher.run_finished(summary)
     return summary
 
 

@@ -58,7 +58,7 @@ import pycolmap
 from jaxtyping import Bool, Float32, Int64, UInt8
 from numpy import ndarray
 
-from colsfm.database import Descriptors, KeypointsXY, image_ids_by_name
+from colsfm.database import Descriptors, KeypointsXY, database_transaction, image_ids_by_name
 from colsfm.tensorrt_runtime import DeviceTensor, GpuPreprocessor, TensorRTSession
 
 NetworkBatch: TypeAlias = Float32[ndarray, "batch 3 network_height network_width"]
@@ -414,20 +414,28 @@ def store_feature_batch(
             the gate left.
         descriptor_type: The label the stored descriptor blob carries.
     """
-    for index, item in enumerate(batch):
-        scores: KeypointScores = features.scores_bn[index].reshape(-1)
-        kept: Bool[ndarray, " num_keypoints"] = select_keypoints(
-            scores, min_score=min_score, max_num_features=max_num_features
-        )
-        keypoints_xy: KeypointsXY = normalized_to_pixels(
-            features.keypoints_bn2[index].reshape(-1, 2)[kept], item.task.image_width, item.task.image_height
-        )
-        descriptors: Descriptors = np.ascontiguousarray(features.descriptors_bnd[index].reshape(len(scores), -1)[kept])
-        database.write_keypoints(item.task.image_id, keypoints_xy)
-        database.write_descriptors(
-            item.task.image_id,
-            pycolmap.FeatureDescriptorsFloat(data=descriptors, type=descriptor_type).to_bytes(),
-        )
+    # One transaction for the batch: an image's keypoints and its descriptors describe
+    # each other, and an interrupted extraction that had left one without the other
+    # would be a contradiction to every reader downstream rather than damage it could
+    # see. `colsfm.database.database_transaction` documents what it does and does not
+    # promise.
+    with database_transaction(database):
+        for index, item in enumerate(batch):
+            scores: KeypointScores = features.scores_bn[index].reshape(-1)
+            kept: Bool[ndarray, " num_keypoints"] = select_keypoints(
+                scores, min_score=min_score, max_num_features=max_num_features
+            )
+            keypoints_xy: KeypointsXY = normalized_to_pixels(
+                features.keypoints_bn2[index].reshape(-1, 2)[kept], item.task.image_width, item.task.image_height
+            )
+            descriptors: Descriptors = np.ascontiguousarray(
+                features.descriptors_bnd[index].reshape(len(scores), -1)[kept]
+            )
+            database.write_keypoints(item.task.image_id, keypoints_xy)
+            database.write_descriptors(
+                item.task.image_id,
+                pycolmap.FeatureDescriptorsFloat(data=descriptors, type=descriptor_type).to_bytes(),
+            )
 
 
 def image_tasks(database_path: Path, image_root: Path, image_names: Sequence[str]) -> list[ImageTask]:

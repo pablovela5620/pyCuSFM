@@ -22,8 +22,6 @@ from typing import Annotated, TypeAlias
 import tyro
 
 from colsfm.pipeline import (
-    SUMMARY_NAME,
-    CheapStageName,
     PipelineOptions,
     PipelineSummary,
     SelectionOptions,
@@ -31,6 +29,7 @@ from colsfm.pipeline import (
     run_pipeline,
     run_stage,
 )
+from colsfm.run_lifecycle import SUMMARY_NAME, CheapStageName
 
 
 @dataclass(frozen=True, slots=True)

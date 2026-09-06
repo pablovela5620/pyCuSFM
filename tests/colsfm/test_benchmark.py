@@ -66,7 +66,7 @@ from colsfm.benchmark import (
 )
 from colsfm.export import append_runtime_record, read_runtime_records
 from colsfm.frames_meta import FramesMeta, KeyframeMeta, read_frames_meta
-from colsfm.pipeline import StageName
+from colsfm.run_lifecycle import StageName
 from colsfm.runtime import STAGE_BY_PIPELINE_STAGE
 
 RunPair: TypeAlias = tuple[RunArtifacts, RunArtifacts]
