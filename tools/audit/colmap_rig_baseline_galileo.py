@@ -50,6 +50,7 @@ from colsfm.benchmark import ReconstructionMetrics, RigTrack, write_json_report
 from colsfm.frames_meta import FramesMeta, KeyframeMeta
 from colsfm.reconstruction import RigReference, rig_reference
 from colsfm.rig_calibration import ExtrinsicDelta, extrinsic_deltas, reference_camera_params_id, rig_config
+from colsfm.trajectory import TrajectoryScore, image_center_score, rig_track_from_reconstruction, score_track_against_ground_truth
 from tools.audit.colmap_baseline_galileo import (
     EXTRACTOR_BY_CHOICE,
     MATCHER_BY_CHOICE,
@@ -60,14 +61,7 @@ from tools.audit.colmap_baseline_galileo import (
     _pinhole_params,
     _summarise,
 )
-from tools.audit.galileo_metrics import (
-    GalileoReference,
-    TrajectoryScore,
-    image_center_score,
-    read_galileo_reference,
-    rig_track_from_reconstruction,
-    score_track_against_ground_truth,
-)
+from tools.audit.galileo_metrics import GalileoReference, read_galileo_reference
 
 STAGED_IMAGE_DIR_NAME: str = "images"
 """Symlink tree written inside the run directory; see the module docstring."""
@@ -296,7 +290,7 @@ def main(config: ColmapRigBaselineConfig) -> None:
         raise RuntimeError("incremental_mapping returned no reconstruction")
     largest: pycolmap.Reconstruction = models[summaries[0].model_index]
 
-    center_score, alignment = image_center_score(largest, reference)
+    center_score, alignment = image_center_score(largest, reference.gt_center_by_image_name)
     rig_track: RigTrack = rig_track_from_reconstruction(largest, frames_meta, alignment)
     rig_score: TrajectoryScore = score_track_against_ground_truth(rig_track, reference.ground_truth)
     deltas: tuple[ExtrinsicDelta, ...] = extrinsic_deltas(largest, frames_meta, rig_ref)
