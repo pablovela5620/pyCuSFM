@@ -558,9 +558,7 @@ def _polish_with_ceres(
     report: SolverReport = parse_brief_report(summary.brief_report())
     stats: PolishStats = PolishStats(
         num_observations=reconstruction.compute_num_observations(),
-        ba_num_iterations=report.num_iterations,
-        ba_initial_cost=report.initial_cost,
-        ba_final_cost=report.final_cost,
+        report=report,
         ba_termination=summary.termination_type.name,
         mean_reprojection_error_before_px=before_px,
         mean_reprojection_error_after_px=reconstruction.compute_mean_reprojection_error(),
@@ -735,9 +733,7 @@ def run_mapping(
                 observation_change=observation_change,
                 num_points3D=reconstruction.num_points3D(),
                 mean_reprojection_error_px=reconstruction.compute_mean_reprojection_error(),
-                ba_num_iterations=report.num_iterations,
-                ba_initial_cost=report.initial_cost,
-                ba_final_cost=report.final_cost,
+                report=report,
                 ba_termination=summary.termination_type.name,
                 seconds=time.perf_counter() - round_started,
             )

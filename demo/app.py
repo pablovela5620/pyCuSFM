@@ -23,10 +23,11 @@ from simplecv.rerun_log_utils import RerunTyroConfig
 from simplecv.rig import Rig
 
 from colsfm.colmap_text_model import ColmapModel, read_colmap_model
+from colsfm.rigid_fit import RigidAlignment, align_rigid
 from demo.cusfm import CUSFM_POSE_GRAPH_DIR, RunConfig, run_cusfm
 from demo.galileo import GalileoConfig, prepare_galileo
 from demo.model_io import cusfm_rig_trajectory, read_cusfm_vehicle_poses, read_loop_closures, refined_extrinsics
-from demo.poses import compose, umeyama_rigid
+from demo.poses import compose
 from demo.robocap import RobocapConfig, prepare_robocap
 from demo.schema import CUSFM_RIG_INDEX, INPUT_RIG_INDEX
 from demo.sequence import PreparedSequence
@@ -93,10 +94,10 @@ def main(config: Config) -> None:
         raise RuntimeError(f"only {len(sample_indices)} samples registered — reconstruction failed")
 
     input_world_T_rig: Float64[ndarray, "m 4 4"] = sequence.world_T_rig[sample_indices]
-    rotation, translation, rmse, would_be_scale = umeyama_rigid(
-        cusfm_world_T_rig[:, :3, 3], input_world_T_rig[:, :3, 3]
-    )
-    alignment: Float64[ndarray, "4 4"] = compose(rotation, translation)
+    fit: RigidAlignment = align_rigid(cusfm_world_T_rig[:, :3, 3], input_world_T_rig[:, :3, 3])
+    rmse: float = fit.rmse_meters
+    would_be_scale: float = fit.would_be_scale
+    alignment: Float64[ndarray, "4 4"] = compose(fit.target_R_source, fit.target_t_source)
     aligned_world_T_rig: Float64[ndarray, "m 4 4"] = alignment @ cusfm_world_T_rig
     trajectory_length: float = float(
         np.linalg.norm(np.diff(input_world_T_rig[:, :3, 3], axis=0), axis=1).sum()

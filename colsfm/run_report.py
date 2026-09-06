@@ -96,7 +96,7 @@ class MappingStats:
             mean_track_length=mapping.mean_track_length,
             ba_backend=mapping.ba_backend,
             polish_seconds=None if polish is None else polish.seconds,
-            polish_iterations=None if polish is None else polish.ba_num_iterations,
+            polish_iterations=None if polish is None else polish.report.num_iterations,
             ba_fallback_reason=mapping.ba_fallback_reason,
         )
 

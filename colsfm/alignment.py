@@ -5,13 +5,14 @@ built either from a `frames_meta.json` or from a TUM `ground_truth.txt`) and *ho
 far apart are two answers* (`match_timestamps` to join them, `align_rigid` to fit
 one onto the other).
 
-Alignment defaults to rigid, with the scale **held at 1.0** and the scale a
-similarity fit would have chosen reported separately, which is `umeyama_rigid`'s
-contract in `demo_rerun.py`; `align_rigid(..., estimate_scale=True)` is the same
-fit with the scale let in, for callers asking whether the *shape* is right rather
-than the size. Reimplemented here rather than imported: `demo_rerun` is a
-2000-line script in the *default* pixi environment that imports `pycusfm` at call
-time, and `colsfm` may not depend on it.
+The fit itself lives in `colsfm.rigid_fit` and is re-exported here, which is the
+import path every caller already uses. It is a separate module because the `demo`
+package runs in the *default* pixi environment, which has no pycolmap, and
+`demo.poses` used to carry its own copy of the same SVD under the name
+`umeyama_rigid`. Alignment defaults to rigid, with the scale **held at 1.0** and
+the scale a similarity fit would have chosen reported separately;
+`align_rigid(..., estimate_scale=True)` is the same fit with the scale let in, for
+callers asking whether the *shape* is right rather than the size.
 
 The rig trajectory comes from `FramesMeta.rig_frames()` rather than being
 re-derived from COLMAP camera poses and the *input* `rig_T_cam` the way
@@ -31,173 +32,52 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, TypeAlias
+from typing import Final
 
 import numpy as np
-import pycolmap
-from jaxtyping import Bool, Float64, Int64
+from jaxtyping import Bool, Int64
 from numpy import ndarray
 from scipy.spatial.transform import Rotation
 
 from colsfm.frames_meta import FramesMeta, KeyframeMeta, RigFrame
-from colsfm.geometry import MILLIMETRES_PER_METRE, Matrix3, TumPose, Vector3, parse_tum_line, rigid3d_from_matrix
+from colsfm.geometry import MILLIMETRES_PER_METRE, TumPose, parse_tum_line
+from colsfm.rigid_fit import (
+    DEGENERATE_VARIANCE,
+    Positions,
+    RigidAlignment,
+    Rotations,
+    Timestamps,
+    align_rigid,
+    path_length_meters,
+)
 
-Positions: TypeAlias = Float64[ndarray, "n 3"]
-"""A trajectory as one world-frame position per sample, in metres."""
+__all__ = [
+    "DEGENERATE_VARIANCE",
+    "GROUND_TRUTH_FILE_NAME",
+    "GROUND_TRUTH_TOLERANCE_MICROSECONDS",
+    "Positions",
+    "RigTrack",
+    "RigidAlignment",
+    "Rotations",
+    "Timestamps",
+    "align_rigid",
+    "match_timestamps",
+    "path_length_meters",
+    "read_ground_truth",
+    "rig_rigidity_spread_millimeters",
+    "rig_track_from_frames_meta",
+]
+"""What this module offers, its own and `colsfm.rigid_fit`'s.
 
-Rotations: TypeAlias = Float64[ndarray, "n 3 3"]
-"""World-frame rotation matrices, one per sample."""
-
-Timestamps: TypeAlias = Int64[ndarray, "n"]
-"""Capture times in integer microseconds since the Unix epoch."""
+The fit is re-exported rather than moved out of reach: `colsfm.alignment` is the
+import path the benchmark, the audits and the tests already use, and which module
+a name is defined in is not their business."""
 
 GROUND_TRUTH_FILE_NAME: Final[str] = "ground_truth.txt"
 """TUM ground truth shipped beside `frames_meta.json`; only r2b_galileo has one."""
 
 GROUND_TRUTH_TOLERANCE_MICROSECONDS: Final[int] = 20
 """0.02 ms, the join window NOTES.md uses to match keyframes to `ground_truth.txt`."""
-
-DEGENERATE_VARIANCE: Final[float] = 1e-15
-"""Below this the source cloud is a point and the would-be scale is undefined."""
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Rigid alignment
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-@dataclass(frozen=True, slots=True)
-class RigidAlignment:
-    """A least-squares fit of one trajectory onto another: SE(3), or SIM(3) on request."""
-
-    target_R_source: Matrix3
-    """Rotation taking source positions into the target frame."""
-    target_t_source: Vector3
-    """Translation taking source positions into the target frame, in metres."""
-    rmse_meters: float
-    """Root-mean-square residual after the fit."""
-    max_error_meters: float
-    """Largest single residual after the fit."""
-    would_be_scale: float
-    """Scale a *similarity* fit would have chosen; 1.0 means metric scale survived.
-
-    Reported whether or not the fit took it: for a rigid fit it is the diagnostic
-    the benchmark prints, and for a similarity fit it equals `scale`."""
-    scale: float = 1.0
-    """Scale the fit actually applied — 1.0 for a rigid fit, `would_be_scale` for a
-    similarity one. `apply` and `apply_pose` both honour it, so a caller never has
-    to remember which kind of fit it holds."""
-
-    def apply(self, positions: Positions) -> Positions:
-        """Map source-frame positions into the target frame.
-
-        Args:
-            positions: Float64 source positions with shape `[n, 3]`.
-
-        Returns:
-            Float64 positions with shape `[n, 3]` in the target frame.
-        """
-        return self.scale * (positions @ self.target_R_source.T) + self.target_t_source
-
-    def apply_rotations(self, rotations: Rotations) -> Rotations:
-        """Map source-frame rotation matrices into the target frame.
-
-        The scale does not touch a rotation, so this is the same for both fits.
-
-        Args:
-            rotations: Float64 rotation matrices with shape `[n, 3, 3]`.
-
-        Returns:
-            Float64 rotation matrices with shape `[n, 3, 3]` in the target frame.
-        """
-        return np.einsum("ij,njk->nik", self.target_R_source, rotations)
-
-    def apply_pose(self, world_T_body: pycolmap.Rigid3d) -> pycolmap.Rigid3d:
-        """Map a whole source-frame pose into the target frame.
-
-        Args:
-            world_T_body: A pose in the source world frame.
-
-        Returns:
-            The same pose expressed in the target world frame: the rotation
-            composed with the fit's, the translation through `apply`.
-        """
-        world_R_body: Matrix3 = np.asarray(world_T_body.rotation.matrix(), dtype=np.float64)
-        world_t_body: Positions = np.asarray(world_T_body.translation, dtype=np.float64).reshape(1, 3)
-        return rigid3d_from_matrix(self.target_R_source @ world_R_body, self.apply(world_t_body).reshape(3))
-
-
-def align_rigid(source_xyz: Positions, target_xyz: Positions, *, estimate_scale: bool = False) -> RigidAlignment:
-    """Fit `target ~ s * R @ source + t`, with `s` held at 1.0 unless asked otherwise.
-
-    The benchmark holds the scale at 1.0 so that a reconstruction which shrank the
-    trajectory shows up as alignment error rather than disappearing into the fit;
-    the scale the same fit *would* have chosen comes back as `would_be_scale`
-    either way. This is `demo_rerun.umeyama_rigid`'s contract, in float64 for
-    millimetre work. `estimate_scale=True` is the SIM(3) fit the audits want when
-    the question is "is the *shape* right", with the residuals measured after the
-    scaling; it changes nothing about the default path.
-
-    Args:
-        source_xyz: Float64 positions to move, shape `[n, 3]`.
-        target_xyz: Float64 positions to move onto, shape `[n, 3]`.
-        estimate_scale: Let the fit absorb a scale change instead of holding it at 1.0.
-
-    Returns:
-        The fitted transform plus its residual statistics.
-
-    Raises:
-        ValueError: When the two trajectories differ in length or are empty.
-    """
-    if source_xyz.shape != target_xyz.shape:
-        raise ValueError(f"alignment needs matched trajectories, got {source_xyz.shape} and {target_xyz.shape}")
-    if len(source_xyz) == 0:
-        raise ValueError("alignment needs at least one sample")
-
-    source_mean: Vector3 = source_xyz.mean(axis=0)
-    target_mean: Vector3 = target_xyz.mean(axis=0)
-    source_centred: Positions = source_xyz - source_mean
-    target_centred: Positions = target_xyz - target_mean
-
-    covariance: Matrix3 = target_centred.T @ source_centred / len(source_xyz)
-    u_matrix, singular_values, vt_matrix = np.linalg.svd(covariance)
-    sign_fix: Matrix3 = np.eye(3)
-    if np.linalg.det(u_matrix) * np.linalg.det(vt_matrix) < 0:
-        sign_fix[2, 2] = -1.0
-    target_R_source: Matrix3 = u_matrix @ sign_fix @ vt_matrix
-
-    source_variance: float = float((source_centred**2).sum() / len(source_xyz))
-    would_be_scale: float = (
-        float((singular_values * np.diag(sign_fix)).sum() / source_variance) if source_variance > DEGENERATE_VARIANCE else 1.0
-    )
-
-    scale: float = would_be_scale if estimate_scale else 1.0
-    target_t_source: Vector3 = target_mean - scale * (target_R_source @ source_mean)
-    residual: Positions = (scale * (source_xyz @ target_R_source.T) + target_t_source) - target_xyz
-    distances: Float64[ndarray, "n"] = np.linalg.norm(residual, axis=1)
-    return RigidAlignment(
-        target_R_source=target_R_source,
-        target_t_source=target_t_source,
-        rmse_meters=float(np.sqrt((distances**2).mean())),
-        max_error_meters=float(distances.max()),
-        would_be_scale=would_be_scale,
-        scale=scale,
-    )
-
-
-def path_length_meters(positions: Positions) -> float:
-    """Total distance travelled along a trajectory.
-
-    Args:
-        positions: Float64 positions with shape `[n, 3]`.
-
-    Returns:
-        The summed segment length in metres; 0.0 for fewer than two samples.
-    """
-    if len(positions) < 2:
-        return 0.0
-    return float(np.linalg.norm(np.diff(positions, axis=0), axis=1).sum())
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Trajectories

@@ -534,7 +534,7 @@ def test_the_caspar_run_finishes_with_one_ceres_bundle_adjustment(
     assert result.bundle_adjustment_seconds >= result.polish.seconds
     assert "polish" in printed
     print(
-        f"[colsfm] caspar polish: {result.polish.ba_num_iterations} iterations, "
+        f"[colsfm] caspar polish: {result.polish.report.num_iterations} iterations, "
         f"{result.polish.mean_reprojection_error_before_px:.4f} px -> "
         f"{result.polish.mean_reprojection_error_after_px:.4f} px in {result.polish.seconds:.2f} s"
     )

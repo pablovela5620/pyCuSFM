@@ -27,7 +27,7 @@ from colsfm.reconstruction import (
     RigReference,
 )
 from colsfm.reconstruction import num_registered_images as num_observing_images
-from colsfm.solver_report import CeresTermination
+from colsfm.solver_report import CeresTermination, SolverReport
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,17 +55,14 @@ class RoundStats:
     """Points left after this round's bundle adjustment."""
     mean_reprojection_error_px: float
     """Mean reprojection error after this round, in pixels."""
-    ba_num_iterations: int | None
-    """Ceres iterations the solver reported, or None when it reported none.
+    report: SolverReport
+    """What the round's bundle adjustment said about its own progress.
 
-    None is the normal outcome on the CASPAR backend, which writes no Ceres-shaped
-    report at all. It used to be recorded as 0 iterations at 0.0 cost, which reads
-    as a solve that converged instantly (`colsfm.solver_report`)."""
-    ba_initial_cost: float | None
-    """Ceres cost before the solve, or None. Not cuSFM's logged `Initial cost`,
-    which is a normalised RMS."""
-    ba_final_cost: float | None
-    """Ceres cost after the solve, or None."""
+    The iterations and the two costs, held as the one record `colsfm.solver_report`
+    owns rather than spliced into three fields here and three more on `PolishStats`.
+    Every field of it is optional because every one is: the CASPAR backend writes no
+    Ceres-shaped report at all, and this used to be recorded as 0 iterations at 0.0
+    cost, which reads as a solve that converged instantly."""
     ba_termination: CeresTermination
     """How the solve ended; the solver reports this whatever its report says, so it is
     not optional."""
@@ -84,14 +81,10 @@ class PolishStats:
 
     num_observations: int
     """Observations the solve parameterised; unchanged by it, since nothing filters."""
-    ba_num_iterations: int | None
-    """Ceres iterations, from `brief_report()`. 22 on KITTI 06 from CASPAR's answer;
-    None if the polish somehow published no report."""
-    ba_initial_cost: float | None
-    """Ceres cost of the model the rounds left behind, or None."""
-    ba_final_cost: float | None
-    """Ceres cost after the polish; 3.4 % below the initial one on KITTI 06. None when
-    the solve published no report."""
+    report: SolverReport
+    """What the polish said about its own progress: 22 iterations on KITTI 06 from
+    CASPAR's answer, ending 3.4 % below the initial cost. Optional throughout for the
+    same reason as `RoundStats.report`."""
     ba_termination: CeresTermination
     """How the polish ended."""
     mean_reprojection_error_before_px: float

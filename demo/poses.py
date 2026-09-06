@@ -5,10 +5,11 @@ is the layer that translates between three representations of the same rigid
 motion — a homogeneous matrix, the axis-plus-degrees form `frames_meta.json`
 stores, and a scipy `Rotation` stream sampled at arbitrary times.
 
-`umeyama_rigid` stays local rather than calling `colsfm.alignment.align_rigid`:
-that module reaches for pycolmap, which this environment deliberately does not
-carry, and simplecv's canonical `umeyama_transform` returns float32, which loses
-the millimetre-scale diagnostics the demo prints.
+The Umeyama fit is `colsfm.rigid_fit.align_rigid`, imported rather than copied:
+`colsfm.alignment` reaches for pycolmap, which this environment deliberately does
+not carry, so the fit itself lives in a module that does not. simplecv's canonical
+`umeyama_transform` returns float32 and would lose the millimetre-scale
+diagnostics the demo prints, which is why neither side uses it.
 """
 
 from __future__ import annotations
@@ -52,43 +53,6 @@ def to_axis_angle_dict(transform: Float[ndarray, "4 4"]) -> dict[str, dict[str, 
             "z": float(transform[2, 3]),
         },
     }
-
-
-def umeyama_rigid(
-    source: Float[ndarray, "n 3"], target: Float[ndarray, "n 3"]
-) -> tuple[Float64[ndarray, "3 3"], Float64[ndarray, "3"], float, float]:
-    """Least-squares rigid (SE3, **no scale**) fit mapping ``source`` onto ``target``.
-
-    Kept local to preserve a float64 transform for millimetre-scale diagnostics;
-    simplecv's canonical ``umeyama_transform`` returns float32.
-
-    Scale is deliberately held at 1: if cuSFM rescales the trajectory we want to
-    see that as alignment error, not absorb it into the fit. The scale that
-    *would* have been fitted is returned as a diagnostic.
-
-    Returns ``(rotation, translation, rmse, would_be_scale)``.
-    """
-    source_mean: Float64[ndarray, "3"] = source.mean(axis=0)
-    target_mean: Float64[ndarray, "3"] = target.mean(axis=0)
-    source_centred: Float64[ndarray, "n 3"] = source - source_mean
-    target_centred: Float64[ndarray, "n 3"] = target - target_mean
-
-    covariance: Float64[ndarray, "3 3"] = target_centred.T @ source_centred / len(source)
-    u_matrix, singular_values, vt_matrix = np.linalg.svd(covariance)
-    sign_fix: Float64[ndarray, "3 3"] = np.eye(3)
-    if np.linalg.det(u_matrix) * np.linalg.det(vt_matrix) < 0:
-        sign_fix[2, 2] = -1.0
-    rotation: Float64[ndarray, "3 3"] = u_matrix @ sign_fix @ vt_matrix
-
-    source_variance: float = float((source_centred**2).sum() / len(source))
-    would_be_scale: float = (
-        float((singular_values * np.diag(sign_fix)).sum() / source_variance) if source_variance > 1e-15 else 1.0
-    )
-
-    translation: Float64[ndarray, "3"] = target_mean - rotation @ source_mean
-    residual: Float64[ndarray, "n 3"] = (source @ rotation.T + translation) - target
-    rmse: float = float(np.sqrt((residual**2).sum(axis=1).mean()))
-    return rotation, translation, rmse, would_be_scale
 
 
 def interpolate_poses(
