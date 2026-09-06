@@ -61,13 +61,15 @@ against the blob's 8 (2.4 %). The default here is COLMAP's own 0.1, measured at
 13 empty pairs (3.9 %) with a 10th-percentile match count of 116 against the
 blob's 118. `BLOB_MATCH_THRESHOLD` is kept for parity runs.
 
-**The other backend.** `MatchingOptions.backend = "tensorrt"` runs the blob's own
-`lightglue_aliked.onnx` through the blob's own engine instead
-(`colsfm.matching_trt`). That path *does* see the per-match score, so it runs the
-real SSC (`select_by_square_covering`) before verification, at the blob's own 0.3
-threshold, and skips the grid subsample below entirely. It is not the default
-because it needs `tensorrt`, `cuda-python` and an engine built for this machine's
-GPU. Both paths leave the same two database tables filled, so the choice is
+**The other two backends.** `MatchingOptions.backend = "tensorrt"` runs the blob's
+own `lightglue_aliked.onnx` through the blob's own engine instead
+(`colsfm.matching_trt`), and `"raco"` runs LightGlue+ (`colsfm.matching_raco`),
+which is what a run does by default since 2026-09-06 (NOTES.md decision 17). Both
+*do* see the per-match score, so they run the real SSC
+(`select_by_square_covering`) before verification, at the blob's own 0.3
+threshold, and skip the grid subsample below entirely. Everything above this
+paragraph describes the `pycolmap` path, the ablation for a machine with no
+engine. All three leave the same two database tables filled, so the choice is
 invisible to every later stage.
 """
 
@@ -301,7 +303,7 @@ class MatchingOptions:
     A second field rather than a second default for `min_score`, because the two
     graphs are not the same graph: 0.3 is calibrated for the blob's engine, which
     this backend runs, while `min_score` is calibrated for COLMAP's, which the
-    default backend runs (see the module docstring's "score threshold" note)."""
+    `pycolmap` backend runs (see the module docstring's "score threshold" note)."""
     num_points_tolerance_fraction: float = BLOB_NUM_POINTS_TOLERANCE_FRACTION
     """SSC's acceptance band around the target, as a fraction of it; `tensorrt` only."""
 
@@ -731,7 +733,7 @@ def match_pairs(
     if options.backend == "tensorrt":
         # Imported here, not at module scope: TensorRT and `cuda-python` are only
         # needed by this branch, and a machine without a usable engine must still
-        # be able to run the default backend.
+        # be able to run the `pycolmap` backend.
         from colsfm.matching_trt import match_pairs_tensorrt
 
         return match_pairs_tensorrt(database_path, list(pairs), options)

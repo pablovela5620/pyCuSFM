@@ -86,7 +86,9 @@ class MappingStats:
     A `--ba-backend caspar` run that solved on Ceres used to say so on stdout and
     nowhere else, so a finished run could not be asked which backend produced it.
     The sentences are `colsfm.ba_backend`'s: an unsupported camera model,
-    `--optimize-extrinsics`, or a pycolmap built without CASPAR_ENABLED."""
+    `--no-regularised-extrinsics`, or a pycolmap built without CASPAR_ENABLED. The
+    last is the ordinary outcome of the default `--ba-backend caspar` outside a
+    `colsfm-caspar*` environment, which is exactly why it is written down here."""
 
     @staticmethod
     def of(mapping: MappingResult) -> MappingStats:

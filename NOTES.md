@@ -931,10 +931,11 @@ because the stock environment has no CASPAR build to fall back from silently.
    LO-RANSAC keeps them. On Galileo that is 14 496 points against 5065 on the blob's own
    matches, at a lower reprojection error. 98 to 99 % of the blob's points have one of ours
    within 5 cm, and merging is already at a fixed point, so the difference is structural.
-2. **No per-match scores, so no SSC — on the default backend.** See decision 7. The grid
-   subsample runs after verification and only reduces the count. The TensorRT matching
-   backend (decision 13) does see the score and runs the real SSC before verification, so
-   on `--matching-backend tensorrt` this deviation does not exist.
+2. **No per-match scores, so no SSC — on the `pycolmap` backend.** See decision 7. The grid
+   subsample runs after verification and only reduces the count. The TensorRT and RaCo
+   matching backends (decisions 13 and 17) do see the score and run the real SSC before
+   verification, so on the default `--matching-backend raco`, and on `tensorrt`, this
+   deviation does not exist.
 3. **No pose priors in bundle adjustment.** pycolmap's `PosePrior` is 3-DoF position plus an
    optional gravity direction. There is no 6-DoF absolute-pose prior and no relative-pose
    prior in the BA path, so cuSFM's `use_relative_pose_constraint` with its

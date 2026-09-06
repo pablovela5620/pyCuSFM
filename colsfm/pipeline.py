@@ -56,24 +56,26 @@ Ordering notes worth knowing before reading the code:
   already hold; `verify_loop_plan` then measures and gates the plan, reading the
   matches back. Presence decides what to match, not count: a pair stage 4
   matched and found nothing in is finished work.
-* **`--optimize-extrinsics` maps once, not twice.** The camera-referenced
+* **`--optimize-extrinsics` maps once, not twice.** On by default. The camera-referenced
   reconstruction is built up front when the flag is set, stage 7 maps it, and
   stage 7b refines the extrinsics of the model stage 7 left behind. Both
   references give the same `cam_T_world`, so nothing about stage 7's result
   depends on which one was used (`colsfm.reconstruction`).
-* **The two ONNX stages have two backends each.** `--features-backend` and
-  `--matching-backend` pick between COLMAP's own ALIKED and LightGlue (the
-  default) and the blob's graphs on the blob's TensorRT engines
-  (`colsfm.features_trt`, `colsfm.matching_trt`). They are independent, all four
-  combinations run, and the choice is invisible past the database: both write the
-  same keypoint and descriptor columns and leave the same matches and two-view
-  geometries. The TensorRT matcher is the only path that sees a per-match score,
-  so it is the only one that runs the blob's real SSC spatial NMS.
+* **The two ONNX stages have three backends each.** `--features-backend` and
+  `--matching-backend` pick between RaCo-ALIKED and LightGlue+ on their own
+  engines (`colsfm.features_raco`, `colsfm.matching_raco`, the default since
+  NOTES.md decision 17), COLMAP's own ALIKED and LightGlue, and the blob's graphs
+  on the blob's TensorRT engines (`colsfm.features_trt`, `colsfm.matching_trt`).
+  They are independent, every combination runs, and the choice is invisible past
+  the database: all write the same keypoint and descriptor columns and leave the
+  same matches and two-view geometries. The `pycolmap` matcher is the only one
+  that cannot see a per-match score, so it is the only one that substitutes a grid
+  subsample for the blob's real SSC spatial NMS.
 * **`--use-gpu` governs the ONNX stages only.** ALIKED and LightGlue run on the
   GPU; the Ceres solves stay on the CPU by default, as the blob's own
   `keypoints_mapper_main` and `pose_graph_main` do (docs/open-pipeline-plan.md,
   "Facts that shape the design"). It is read by the `pycolmap` backends only —
-  the TensorRT ones run on CUDA device 0 or not at all. `--ba-use-gpu` moves the
+  the two engine-backed ones run on CUDA device 0 or not at all. `--ba-use-gpu` moves the
   bundle-adjustment linear solve onto the GPU; measured it buys nothing on Galileo (1.68 s against
   1.60 s) and about 8 % on 800 RoboCap images (19.2 s against 20.9 s), so the
   default stays where the blob is.

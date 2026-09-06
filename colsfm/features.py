@@ -29,13 +29,17 @@ and the process aborts with SIGABRT. `resolve_device` therefore probes for cuDNN
 *before* the call and falls back to the CPU provider, which is ~50x slower
 (1.8 s per 1920x1200 image against 0.03 s on the GPU).
 
-**The other backend.** `FeatureOptions.backend = "tensorrt"` runs the blob's own
-`aliked.onnx` through the blob's own engine instead (`colsfm.features_trt`) —
-same descriptors, same preprocessing, no cuDNN and no COLMAP model download. It
-is not the default because it needs `tensorrt`, `cuda-python` and an engine built
-for this machine's GPU, none of which the pycolmap path needs. Both write the
-same two database columns for the same `image_id`s, so the choice is invisible to
-every later stage.
+**The other two backends.** `FeatureOptions.backend = "tensorrt"` runs the blob's
+own `aliked.onnx` through the blob's own engine instead (`colsfm.features_trt`) —
+same descriptors, same preprocessing, no cuDNN and no COLMAP model download —
+and `"raco"` runs RaCo-ALIKED on a batch-dynamic engine (`colsfm.features_raco`),
+which is what a run does by default since 2026-09-06 (NOTES.md decision 17).
+Everything above this paragraph describes the `pycolmap` path, which is the
+ablation for a machine with no engine: the other two need `tensorrt`,
+`cuda-python` and an engine built for this machine's GPU, and `raco` also needs a
+graph that is not committed (`colsfm.model_assets`). All three write the same two
+database columns for the same `image_id`s, so the choice is invisible to every
+later stage.
 """
 
 from __future__ import annotations
@@ -293,7 +297,7 @@ def extract_features(
     if options.backend in {"tensorrt", "raco"}:
         # Imported here, not at module scope: TensorRT and `cuda-python` are only
         # needed by these branches, and a machine without a usable engine must
-        # still be able to run the default backend.
+        # still be able to run the `pycolmap` backend.
         extracted: TensorRTExtraction
         if options.backend == "raco":
             from colsfm.features_raco import extract_raco

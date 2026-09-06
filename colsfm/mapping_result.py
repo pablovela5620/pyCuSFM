@@ -137,8 +137,8 @@ class MappingResult:
     ba_fallback_reason: str | None = None
     """Why `ba_backend` is not what was asked for, or None when it is.
 
-    The three sentences of `colsfm.ba_backend`: an unsupported camera model,
-    `optimize_extrinsics`, or a pycolmap built without CASPAR_ENABLED. Recorded
+    The three sentences of `colsfm.ba_backend`: an unsupported camera model, a solve
+    asked to free `sensor_from_rig`, or a pycolmap built without CASPAR_ENABLED. Recorded
     rather than only printed, so `summary.json` says why a run that asked for the
     GPU backend solved on the CPU."""
     polish: PolishStats | None = None

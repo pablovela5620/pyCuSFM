@@ -1,6 +1,6 @@
 """ALIKED feature extraction through the blob's own TensorRT engine.
 
-The `tensorrt` half of `colsfm.features`. Where the default backend hands the
+The `tensorrt` half of `colsfm.features`. Where the `pycolmap` backend hands the
 images to `pycolmap.extract_features` and lets COLMAP run its own ONNX ALIKED,
 this one runs **the blob's graph**, `pycusfm/models/aliked_lightglue/aliked.onnx`,
 through the engine the blob itself built
