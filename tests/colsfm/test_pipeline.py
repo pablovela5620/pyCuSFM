@@ -484,9 +484,14 @@ def test_the_default_maps_on_caspar_and_refines_the_extrinsics_afterwards(
     (`colsfm.extrinsic_refinement`). The plan must therefore say `caspar` with no
     fallback; it said `ceres` while the pipeline was in fact solving on the GPU.
     """
-    resolved: ResolvedRun = resolve_run(PipelineOptions(input_dir=galileo_input_dir, output_dir=tmp_path / "cusfm"))
-    assert resolved.features.backend == "raco"
-    assert resolved.matching_backend == "raco"
+    # The two backend fields are the one part of the default this assertion does not
+    # want: they would make a bare checkout raise for a missing graph, and they have
+    # nothing to do with which bundle adjuster the plan names.
+    # `test_the_default_resolves_to_the_raco_backends` covers them, behind the graphs.
+    default: PipelineOptions = PipelineOptions(input_dir=galileo_input_dir, output_dir=tmp_path / "cusfm")
+    resolved: ResolvedRun = resolve_run(
+        replace(default, features_backend="pycolmap", matching_backend="pycolmap")
+    )
     assert resolved.mapping.ba_backend == "caspar"
     assert resolved.mapping.optimize_extrinsics is False, "stage 7 maps with the rig fixed"
     assert resolved.ba_plan.backend == "caspar"
@@ -504,13 +509,35 @@ def test_the_unregularised_refinement_is_the_one_that_takes_caspar_off_the_gpu(
     GPU solver for that, so the fallback belongs to the ablation alone.
     """
     plan: ResolvedRun = resolve_run(
-        PipelineOptions(
-            input_dir=galileo_input_dir, output_dir=tmp_path / "cusfm", regularised_extrinsics=False
+        replace(
+            PYCOLMAP_ABLATION,
+            input_dir=galileo_input_dir,
+            output_dir=tmp_path / "cusfm",
+            ba_backend="caspar",
+            optimize_extrinsics=True,
+            regularised_extrinsics=False,
         )
     )
     assert plan.ba_plan.backend == "ceres"
     assert plan.ba_plan.fallback_reason == EXTRINSICS_FALLBACK_REASON
     assert plan.ba_plan.ceres_polish is False
+
+
+@pytest.mark.skipif(
+    any(not path.is_file() for path in required_raco_graphs("raco", "raco")),
+    reason="the RaCo ONNX graphs are missing; `pixi run -e raco raco-export` builds them",
+)
+def test_the_default_resolves_to_the_raco_backends(galileo_input_dir: Path, tmp_path: Path) -> None:
+    """Both ONNX stages get RaCo when nothing on the command line says otherwise.
+
+    Separate from the plan assertion above, and skipped rather than failed where the
+    graphs are absent, because `resolve_run` refuses a `raco` run it cannot perform —
+    which is the behaviour `test_a_missing_raco_graph_names_the_export_command_and_the_ablation`
+    is about.
+    """
+    resolved: ResolvedRun = resolve_run(PipelineOptions(input_dir=galileo_input_dir, output_dir=tmp_path / "cusfm"))
+    assert resolved.features.backend == "raco"
+    assert resolved.matching_backend == "raco"
 
 
 def test_the_raco_default_needs_two_graphs_and_the_ablation_needs_none() -> None:

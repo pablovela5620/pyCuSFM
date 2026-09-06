@@ -61,8 +61,8 @@ through it means nothing. Its numerical half,
 
 ### What the checked run currently reports
 
-**532 passed, 14 skipped** (2026-09-06), the same as the default run and 160 s against its
-93 s. It was 5 failed / 522 passed until the two annotation defects it exists to find were
+**533 passed, 14 skipped** (2026-09-06), the same as the default run and 156 s against its
+103 s. It was 5 failed / 522 passed until the two annotation defects it exists to find were
 fixed: `colsfm.colmap_text_model.parse_colmap_points_text` declared `Int[ndarray,
 "n_points 3"]` and returned `uint8` RGB, and a `publish_atomically` test expected a
 `TypeError` beartype pre-empts with `BeartypeCallHintParamViolation`.
