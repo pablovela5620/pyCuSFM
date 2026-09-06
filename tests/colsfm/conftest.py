@@ -30,6 +30,7 @@ from jaxtyping import Bool, Float64, Int64
 from numpy import ndarray
 
 from colsfm import REPO_ROOT as _REPO_ROOT
+from colsfm.config import CusfmConfig, read_config_directory
 from colsfm.export import RuntimeRecord, append_runtime_record, write_colmap_model, write_optimised_frames_meta
 from colsfm.frames_meta import FRAMES_META_NAME, CameraParams, FramesMeta, KeyframeMeta, read_frames_meta
 from colsfm.geometry import relative_rotation_degrees
@@ -136,6 +137,16 @@ def three_samples(galileo_input: FramesMeta) -> FramesMeta:
     """The first three synchronised samples of the Galileo input, ~24 keyframes."""
     keep: list[int] = [keyframe_id for rig_frame in galileo_input.rig_frames()[:3] for keyframe_id in rig_frame.keyframe_ids]
     return galileo_input.filtered(keep)
+
+
+@pytest.fixture(scope="module")
+def isaac_config(repo_root: Path) -> CusfmConfig:
+    """The isaac profile: 5 BA rounds, a 25 -> 5 px gate, CAUCHY at sigma 4.
+
+    Here rather than in one test module because all five mapping modules read it,
+    and it is the profile the shipped cuSFM runs were produced with.
+    """
+    return read_config_directory(repo_root / "pycusfm" / "configs" / "isaac")
 
 
 @pytest.fixture(scope="session")
