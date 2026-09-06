@@ -66,6 +66,94 @@ The need for initial trajectory guess depends on your input data type:
 
 > **Note:** Support for un-posed sequential monocular images will be added in future release.
 
+## Run with pixi
+
+> This section is specific to the [pixified fork](https://github.com/pablovela5620/pyCuSFM);
+> it is not part of upstream pyCuSFM. See [NOTES.md](NOTES.md) for decisions and gotchas.
+
+One command, no `pip`/`uv`/`conda`, and no `./setup.bash`:
+
+```bash
+git clone https://github.com/pablovela5620/pyCuSFM && cd pyCuSFM
+git lfs pull
+pixi run demo
+```
+
+`demo` runs cuSFM on the bundled `data/r2b_galileo` sample (8 pinhole cameras) and opens
+[Rerun](https://rerun.io) showing the sparse cloud plus **two camera rigs** — the input
+trajectory and the cuSFM-refined one — so the bundle-adjustment correction is visible.
+
+```bash
+pixi run demo                      # bundled r2b_galileo sample (needs no network)
+pixi run demo-robocap              # RoboCap fisheye segment (needs a Rerun catalog once)
+pixi run kitti06                   # the paper's KITTI odometry 06 experiment (~30 min)
+pixi run demo-upstream             # upstream's own cusfm_cli, unmodified
+pixi run check-libs                # ldd gate over the CUDA 13 binaries
+```
+
+### Reproduce KITTI 06
+
+```bash
+pixi run kitti06
+```
+
+One command downloads KITTI odometry sequence 06 (1101 stereo frames, ~570 MB, from a pinned
+third-party Hugging Face mirror), fetches the benchmark's ground-truth poses from the official
+KITTI archive and checks their md5, converts the sequence with upstream's own
+`data/kitti/get_framemeta_file_for_KITTI.py`, runs cuVSLAM and then cuSFM with upstream's KITTI
+configs, writes `data/kitti/06_result_slam/kitti06.rrd`, and scores the result with
+`evo_ape ... -as` (Sim(3)). The recording shows three trajectories — cuVSLAM's SLAM output that
+cuSFM was initialised from, cuSFM's refinement, and the ground truth — plus the sparse cloud and
+both camera streams. `pixi run kitti06-eval` re-scores an existing run without re-running cuSFM, and
+`pixi run kitti06-check-data` reports whether the download finished.
+
+The run reproduces the paper's cuVSLAM baseline but **not** its refinement gain; the numbers and
+the reason are in [NOTES.md](NOTES.md#kitti-06--the-papers-table-4-experiment).
+
+The imagery mirror is third-party and unaffiliated with KITTI. The poses are the KITTI odometry
+benchmark's own ground truth (Geiger, Lenz and Urtasun, CVPR 2012), licensed **CC BY-NC-SA 3.0**
+— non-commercial use, attribution required. Neither is redistributed here: both are downloaded
+at run time and are `.gitignore`d.
+
+Headless, writing an `.rrd` instead of opening a viewer:
+
+```bash
+pixi run -- python demo_rerun.py --rr-config.headless --rr-config.save out.rrd dataset:galileo
+```
+
+Note that top-level options come *before* the `dataset:` subcommand. Useful flags:
+
+```bash
+--run.skip-reconstruction          # re-log an existing COLMAP model, no cuSFM re-run
+--dataset.frame-stride 20          # robocap: coarser sampling, ~6 min instead of ~20,
+                                   # but a visibly worse reconstruction (default: 4)
+--run.feature-type superpoint      # aliked (default) | superpoint | sift_cv_cuda
+--run.model-dir data/cusfm_models/raco   # batched RaCo-ALIKED instead of stock ALIKED
+```
+
+**Requirements.** **x86-64 (`linux-64`) Ubuntu 24.04** with an NVIDIA GPU — both parts are
+hard requirements. The prebuilt binaries are x86-64 ELF executables linking Ubuntu 24.04
+system C++ libraries (glibc 2.38, `libglog.so.1`, OpenCV `.so.406`) that conda-forge cannot
+reproduce, so this is host-specific — see the "Non-hermetic" section of [NOTES.md](NOTES.md).
+On Ubuntu 22.04 the binaries fail at the dynamic loader; on ARM/aarch64 pixi stops with
+`unsupported-platform` and will suggest `pixi workspace platform add linux-aarch64` — do
+**not** follow that suggestion, since no platform entry can make x86-64 binaries runnable.
+Built and validated on an RTX 5090 (Blackwell, `sm_120`) with driver 580.173 using the
+**CUDA 13** binaries.
+
+The binaries also resolve glog and OpenCV from the *host*, not from pixi (they need
+`libglog.so.1` and OpenCV `.so.406`, and the conda-forge equivalents either changed SONAME
+or pin an ffmpeg that conflicts with this workspace):
+
+```bash
+sudo apt install libgoogle-glog0v6t64 libopencv-core406t64 libopencv-calib3d406t64 \
+    libopencv-features2d406t64 libopencv-imgcodecs406t64 libopencv-imgproc406t64 \
+    libopencv-flann406t64
+```
+
+`pixi run check-libs` verifies every binary dependency resolves before you run anything.
+
+
 ## Installation
 
 ### Prerequisites

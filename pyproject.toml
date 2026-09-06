@@ -40,3 +40,9 @@ include-package-data = true
 
 [tool.setuptools.package-data]
 pycusfm = ["bin/*", "lib/*", "configs/**/*", "models/**/*"]
+
+[tool.ruff]
+line-length = 150
+
+[tool.ruff.lint]
+ignore = ["E501", "F722", "F821", "UP037", "UP040"]
