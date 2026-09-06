@@ -2,20 +2,23 @@
 
 cuSFM runs ALIKED and LightGlue as TensorRT engines built from the two ONNX
 graphs in `pycusfm/models/aliked_lightglue/`, caching each engine next to its
-graph under `<stem>_fp16_<trt-version>_sm_<arch>.engine`
+graph under `<stem>_fp16_<digest>_<trt-version>_sm_<arch>.engine`
 (feature_matcher_main.md §5.2). This module owns that cache and the buffer
 management around one execution context; the two backends above own the
 pre- and post-processing.
 
 `tools/raco_extract.py` is the working prior art — the same builder flags, the
 same content-addressed timing cache, the same `set_tensor_address` +
-`execute_async_v3` loop. Three things differ here:
+`execute_async_v3` loop. Two things differ here:
 
-* **The cache key is the blob's file name, not a content hash.** The point is to
-  *reuse the engines that ship in the repo*: `aliked_fp16_10_13_3_9_sm_12_0.engine`
-  and `lightglue_aliked_fp16_10_13_3_9_sm_12_0.engine` were built by the blob
-  itself, deserialise under this TensorRT and this GPU, and cost about 205 s
-  each to rebuild. A content hash would have missed both.
+* **Prebuilt blob engines are accepted by name, explicitly.** The cache key is
+  the graph's own digest, as it is there, so replacing an ONNX in place cannot
+  reuse the engine built from the previous one. On top of that `resolve_engine`
+  accepts the blob's undigested spelling for the two graphs under `MODEL_DIR`:
+  `aliked_fp16_10_13_3_9_sm_12_0.engine` and
+  `lightglue_aliked_fp16_10_13_3_9_sm_12_0.engine` were built by cuSFM itself,
+  deserialise under this TensorRT and this GPU, and cost about 205 s each to
+  rebuild.
 * **The session is generic.** `TensorRTExtractor` hard-codes ALIKED's
   `image`/`keypoints`/`descriptors` binding names; LightGlue has four inputs and
   two outputs, so `TensorRTSession` takes the bindings by name and grows its
@@ -33,6 +36,7 @@ the tests skip on `ImportError`.
 from __future__ import annotations
 
 import ctypes
+import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -66,6 +70,9 @@ PREPROCESS_IMAGE_BINDING: Final[str] = "image"
 
 PREPROCESS_ENGINE_DIR: Final[Path] = REPO_ROOT / "data" / "cusfm_models"
 """Where the generated preprocessing engines are cached; gitignored, like the RaCo graphs."""
+
+ONNX_DIGEST_CHARACTERS: Final[int] = 12
+"""Hex characters of the graph's SHA-256 that go into the engine's file name."""
 
 BGR_TO_RGB_INDICES: Final[tuple[int, int, int]] = (2, 1, 0)
 """The channel permutation the host used to do with `resized_bgr_hwc[..., ::-1]`."""
@@ -242,17 +249,30 @@ def tensorrt_version_tag() -> str:
     return "_".join(numeric[:4])
 
 
-def engine_path_for(onnx_path: Path, *, profile_tag: str = "", device_index: int = 0) -> Path:
-    """Where the engine built from one ONNX graph lives.
+def onnx_digest(onnx_path: Path) -> str:
+    """A short content hash of one ONNX graph, for the engine's file name.
+
+    Args:
+        onnx_path: The graph to digest.
+
+    Returns:
+        The first `ONNX_DIGEST_CHARACTERS` hex characters of its SHA-256.
+
+    Raises:
+        FileNotFoundError: When the graph is missing.
+    """
+    return hashlib.sha256(onnx_path.read_bytes()).hexdigest()[:ONNX_DIGEST_CHARACTERS]
+
+
+def blob_engine_path_for(onnx_path: Path, *, profile_tag: str = "", device_index: int = 0) -> Path:
+    """The name cuSFM's own runtime gives the engine it builds for one graph.
+
+    Only the prebuilt engines under `MODEL_DIR` carry it; `resolve_engine`
+    accepts those and nothing else builds under this name any more.
 
     Args:
         onnx_path: The graph, e.g. `pycusfm/models/aliked_lightglue/aliked.onnx`.
-        profile_tag: A short name for the optimisation profile, inserted after
-            `_fp16`. Empty — the default — keeps the blob's own naming and
-            therefore hits the two engines already in the repo. A shape-dynamic
-            graph must pass one: its engine is only valid for the bounds it was
-            built with, and those bounds are not recoverable from the file name
-            otherwise.
+        profile_tag: A short name for the optimisation profile, inserted after `_fp16`.
         device_index: CUDA device the engine is built for.
 
     Returns:
@@ -260,6 +280,33 @@ def engine_path_for(onnx_path: Path, *, profile_tag: str = "", device_index: int
     """
     tag: str = f"_{profile_tag}" if profile_tag else ""
     return onnx_path.with_name(f"{onnx_path.stem}_fp16{tag}_{tensorrt_version_tag()}_sm_{compute_capability(device_index)}.engine")
+
+
+def engine_path_for(onnx_path: Path, *, profile_tag: str = "", device_index: int = 0) -> Path:
+    """Where the engine built from one ONNX graph lives.
+
+    The name carries a digest of the graph's bytes, so replacing an ONNX file in
+    place names a different engine instead of silently reusing the one built from
+    the previous graph. A graph that is not on disk has no bytes to digest — the
+    prebuilt-engine case — and keeps the blob's own spelling.
+
+    Args:
+        onnx_path: The graph, e.g. `pycusfm/models/aliked_lightglue/aliked.onnx`.
+        profile_tag: A short name for the optimisation profile, inserted after
+            `_fp16`. A shape-dynamic graph must pass one: its engine is only valid
+            for the bounds it was built with, and the digest says nothing about
+            those — they come from the caller, not from the graph.
+        device_index: CUDA device the engine is built for.
+
+    Returns:
+        `<onnx dir>/<stem>_fp16[_<profile tag>]_<digest>_<trt version>_sm_<arch>.engine`,
+        or `blob_engine_path_for`'s answer when the graph is missing.
+    """
+    if not onnx_path.is_file():
+        return blob_engine_path_for(onnx_path, profile_tag=profile_tag, device_index=device_index)
+    tag: str = f"_{profile_tag}" if profile_tag else ""
+    identity: str = f"{onnx_digest(onnx_path)}_{tensorrt_version_tag()}_sm_{compute_capability(device_index)}"
+    return onnx_path.with_name(f"{onnx_path.stem}_fp16{tag}_{identity}.engine")
 
 
 def build_fp16_engine(
@@ -340,6 +387,16 @@ def resolve_engine(
 ) -> Path:
     """Return the cached engine for one graph, building it when it is absent.
 
+    Two names are accepted, in this order:
+
+    1. The digest-named engine of `engine_path_for`, which is what any build here
+       writes and the only name a locally generated graph — RaCo's, the
+       preprocessing ones — can hit.
+    2. The blob's own spelling, but **only** for a graph in `MODEL_DIR`. Those
+       engines were built by cuSFM itself from the two graphs it ships, cost
+       about 205 s each to rebuild, and carry no digest; accepting them is a
+       deliberate allowance for trusted prebuilt engines, not a fallback.
+
     Args:
         onnx_path: The ONNX graph.
         profiles: Optimisation profile per dynamic input; see `build_fp16_engine`.
@@ -353,6 +410,9 @@ def resolve_engine(
     engine_path: Path = engine_path_for(onnx_path, profile_tag=profile_tag, device_index=device_index)
     if engine_path.is_file():
         return engine_path
+    prebuilt: Path = blob_engine_path_for(onnx_path, profile_tag=profile_tag, device_index=device_index)
+    if onnx_path.parent == MODEL_DIR and prebuilt.is_file():
+        return prebuilt
     return build_fp16_engine(onnx_path, engine_path, profiles)
 
 

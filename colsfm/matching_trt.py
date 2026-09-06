@@ -2,8 +2,9 @@
 
 The `tensorrt` half of `colsfm.matching`. It runs
 `pycusfm/models/aliked_lightglue/lightglue_aliked.onnx` through the engine the
-blob itself built (`lightglue_aliked_fp16_10_13_3_9_sm_12_0.engine`, reused from
-the repo when the TensorRT version and the GPU match), which buys the one thing
+blob itself built (`lightglue_aliked_fp16_10_13_3_9_sm_12_0.engine`, accepted as
+a trusted prebuilt engine when the TensorRT version and the GPU match), which
+buys the one thing
 the pycolmap backend cannot have: **the per-match score**. With it, the blob's
 four steps map across exactly, in the blob's own order
 (feature_matcher_main.md §5):

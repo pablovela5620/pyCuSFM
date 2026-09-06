@@ -4,8 +4,9 @@ The `tensorrt` half of `colsfm.features`. Where the default backend hands the
 images to `pycolmap.extract_features` and lets COLMAP run its own ONNX ALIKED,
 this one runs **the blob's graph**, `pycusfm/models/aliked_lightglue/aliked.onnx`,
 through the engine the blob itself built
-(`aliked_fp16_10_13_3_9_sm_12_0.engine`, reused from the repo when the TensorRT
-version and the GPU match — see `colsfm.tensorrt_runtime.engine_path_for`). The
+(`aliked_fp16_10_13_3_9_sm_12_0.engine`, accepted as a trusted prebuilt engine
+when the TensorRT version and the GPU match — see
+`colsfm.tensorrt_runtime.resolve_engine`). The
 descriptors are therefore the blob's descriptors, not a rotation-augmented
 lookalike, which is what makes a TensorRT LightGlue match meaningful
 (`colsfm.matching_trt`).
