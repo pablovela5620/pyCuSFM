@@ -25,6 +25,7 @@ from colsfm.reconstruction import (
     RigReference,
 )
 from colsfm.reconstruction import num_registered_images as num_observing_images
+from colsfm.solver_report import CeresTermination
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,9 +64,9 @@ class RoundStats:
     which is a normalised RMS."""
     ba_final_cost: float | None
     """Ceres cost after the solve, or None."""
-    ba_termination: str
-    """`CONVERGENCE`, `NO_CONVERGENCE` or `FAILURE`; the solver reports this whatever
-    its report says, so it is not optional."""
+    ba_termination: CeresTermination
+    """How the solve ended; the solver reports this whatever its report says, so it is
+    not optional."""
     seconds: float
     """Wall-clock seconds the round took, bundle adjustment included."""
 
@@ -89,8 +90,8 @@ class PolishStats:
     ba_final_cost: float | None
     """Ceres cost after the polish; 3.4 % below the initial one on KITTI 06. None when
     the solve published no report."""
-    ba_termination: str
-    """`CONVERGENCE`, `NO_CONVERGENCE` or `FAILURE`."""
+    ba_termination: CeresTermination
+    """How the polish ended."""
     mean_reprojection_error_before_px: float
     """Mean reprojection error as CASPAR left it, in pixels."""
     mean_reprojection_error_after_px: float

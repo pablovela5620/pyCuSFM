@@ -35,7 +35,7 @@ from colsfm.features import ExtractionReport
 from colsfm.frames_meta import FRAMES_META_NAME, FramesMeta, KeyframeMeta, RigFrame, read_frames_meta
 from colsfm.mapping import MappingResult, RoundStats
 from colsfm.matching import MatchReport, PairMatchStats
-from colsfm.pairs import consecutive_pairs, stereo_pairs
+from colsfm.pairs import normalise_pair, stereo_pairs
 from colsfm.pose_graph import PoseGraphEdge, RigNode
 from colsfm.rerun_log import IMAGE_PLANE_DISTANCE, POINT_RADIUS, TIMELINE, Rgb, build_rig
 from colsfm.stages import (
@@ -267,17 +267,22 @@ def log_pair_selection(
 ) -> None:
     """Stage 3: the consecutive and stereo pairs as lines between camera centres.
 
+    The two colours partition the stage's own `pairs` rather than re-deriving them:
+    `select_pairs` is the union of the two rules, so one `stereo_pairs` set says which
+    side each pair came from, and what is drawn is by construction what was selected.
+
     Args:
         stage: This stage's timeline slot and prose.
         selected: The collection keyframe selection kept.
-        config: The config profile, for `connected_keyframe_num`.
+        config: The config profile, for `connected_keyframe_num` in the notes.
         pairs: The pairs `run_pair_selection_stage` returned.
         console: What it printed.
     """
     rr.set_time(STAGE_TIMELINE, sequence=stage.index)
     by_id: dict[int, KeyframeMeta] = selected.keyframe_by_id()
-    consecutive: list[ImagePair] = consecutive_pairs(selected, config.pose_graph.connected_keyframe_num)
-    stereo: list[ImagePair] = stereo_pairs(selected)
+    declared_stereo: set[ImagePair] = set(stereo_pairs(selected))
+    consecutive: list[ImagePair] = [pair for pair in pairs if pair not in declared_stereo]
+    stereo: list[ImagePair] = [pair for pair in pairs if pair in declared_stereo]
 
     def segments(pairs: Sequence[ImagePair]) -> Float64[ndarray, "n 2 3"]:
         """Two-point segments joining each pair's camera centres."""
@@ -472,7 +477,7 @@ def _verified_revisit_pairs(database_path: Path, rig_position: Mapping[int, int]
         second: int | None = rig_position.get(int(image_id_b))
         if first is None or second is None or abs(first - second) < MIN_LOOP_RIG_GAP:
             continue
-        key: tuple[int, int] = (min(first, second), max(first, second))
+        key: tuple[int, int] = normalise_pair(first, second)
         revisits[key] = revisits.get(key, 0) + int(count)
     return revisits
 

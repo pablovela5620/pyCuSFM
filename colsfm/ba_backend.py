@@ -364,8 +364,7 @@ def caspar_option_names() -> frozenset[str]:
         Every key of a default `caspar.todict()` whose value is a number, i.e.
         everything but the string `gpu_index`.
     """
-    defaults: dict[str, object] = pycolmap.BundleAdjustmentOptions().caspar.todict()
-    return frozenset(name for name, value in defaults.items() if isinstance(value, (int, float)) and not isinstance(value, bool))
+    return frozenset(caspar_option_types())
 
 
 def caspar_option_types() -> dict[str, type[int | float]]:
@@ -449,14 +448,14 @@ def apply_caspar_options(caspar: pycolmap.CasparBundleAdjustmentOptions, overrid
     Raises:
         KeyError: When a name is not a numeric CASPAR option.
     """
+    types: dict[str, type[int | float]] = caspar_option_types()
     for name, value in overrides.items():
-        current: object = getattr(caspar, name, None)
-        if not isinstance(current, (int, float)) or isinstance(current, bool):
+        expected: type[int | float] | None = types.get(name)
+        if expected is None:
             raise KeyError(
-                f"[colsfm] `{name}` is not a numeric CASPAR solver option; "
-                f"the settable ones are {sorted(caspar_option_names())}"
+                f"[colsfm] `{name}` is not a numeric CASPAR solver option; the settable ones are {sorted(types)}"
             )
-        setattr(caspar, name, type(current)(value))
+        setattr(caspar, name, expected(value))
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════

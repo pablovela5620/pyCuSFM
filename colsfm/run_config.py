@@ -242,9 +242,10 @@ class PipelineOptions:
         """Where the input metadata lives.
 
         Returns:
-            `<input_dir>/frames_meta.json`.
+            `<input_dir>/frames_meta.json`, as `SelectionOptions` spells it — one
+            definition, so the two can never name different files.
         """
-        return self.input_dir / FRAMES_META_NAME
+        return self.selection.frames_meta_path
 
 
 @dataclass(frozen=True, slots=True)

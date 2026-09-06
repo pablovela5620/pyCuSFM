@@ -15,13 +15,12 @@ import pytest
 from conftest import build_reconstruction
 
 from colsfm.frames_meta import FramesMeta
-from colsfm.reconstruction import RigReference, rig_reference
+from colsfm.reconstruction import RigReference, gauge_camera_params_id, rig_reference
 from colsfm.rig_calibration import (
     ExtrinsicDelta,
     calibrated_cam_from_rig,
     camera_params_id_by_camera_id,
     extrinsic_deltas,
-    reference_camera_params_id,
     rig_config,
     rotation_degrees,
 )
@@ -34,8 +33,12 @@ def galileo_reference(three_samples: FramesMeta) -> RigReference:
 
 
 def test_the_reference_camera_owns_the_lowest_keyframe_id(three_samples: FramesMeta) -> None:
-    """`FramesMeta.rig_frames`' rule, and the one both baseline tools applied."""
-    chosen: int = reference_camera_params_id(three_samples)
+    """`FramesMeta.rig_frames`' rule, and the one both baseline tools applied.
+
+    `colsfm.reconstruction.gauge_camera_params_id` is that rule; this module used to
+    carry a second copy under its own name, which the two audit tools imported.
+    """
+    chosen: int = gauge_camera_params_id(three_samples)
 
     assert chosen == min(three_samples.keyframes, key=lambda item: item.keyframe_id).camera_params_id
 

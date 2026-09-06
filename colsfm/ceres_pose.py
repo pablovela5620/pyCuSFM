@@ -42,6 +42,7 @@ from jaxtyping import Float64
 from numpy import ndarray
 
 from colsfm.geometry import Matrix3, QuaternionXYZW, Vector3
+from colsfm.solver_report import CeresTermination
 
 LinearSolver: TypeAlias = Literal["SPARSE_SCHUR", "SPARSE_NORMAL_CHOLESKY"]
 """The two linear solvers cuSFM uses: SPARSE_SCHUR on the CPU, the other on the cuDSS path."""
@@ -97,8 +98,15 @@ class PoseBlocks(NamedTuple):
     """Translation in metres, owned by the problem and written in place by the solve."""
 
 
-class SolverStats(NamedTuple):
-    """The four numbers every caller reads back out of a `pyceres.SolverSummary`."""
+@dataclass(frozen=True, slots=True)
+class SolverStats:
+    """The four numbers every caller reads back out of a `pyceres.SolverSummary`.
+
+    A dataclass, not a `NamedTuple`, for two reasons that agree: no caller unpacks it
+    positionally or hashes it — every one reads `solved.iterations` and friends — and
+    beartype cannot check a `Literal` type alias on a `NamedTuple` field under PEP 563
+    deferred annotations, which is what `termination` is.
+    """
 
     iterations: int
     """Minimizer iterations, successful and unsuccessful."""
@@ -106,8 +114,8 @@ class SolverStats(NamedTuple):
     """Ceres cost before the solve."""
     final_cost: float
     """Ceres cost after the solve."""
-    termination: str
-    """`CONVERGENCE`, `NO_CONVERGENCE` or `FAILURE`."""
+    termination: CeresTermination
+    """How the solve ended."""
 
 
 def pose_parameter_blocks(pose: pycolmap.Rigid3d, *, canonical_sign: bool = False) -> PoseBlocks:

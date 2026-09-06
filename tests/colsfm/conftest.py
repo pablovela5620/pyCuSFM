@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
 import numpy as np
 import pycolmap
@@ -35,6 +35,9 @@ from colsfm.export import RuntimeRecord, append_runtime_record, write_colmap_mod
 from colsfm.frames_meta import FRAMES_META_NAME, CameraParams, FramesMeta, KeyframeMeta, read_frames_meta
 from colsfm.geometry import relative_rotation_degrees
 from colsfm.schema import KEYFRAME, load_schema
+
+if TYPE_CHECKING:
+    from mapping_helpers import SyntheticRig
 
 REPO_ROOT: Path = _REPO_ROOT
 """Repo root, so data paths resolve regardless of the working directory."""
@@ -137,6 +140,43 @@ def three_samples(galileo_input: FramesMeta) -> FramesMeta:
     """The first three synchronised samples of the Galileo input, ~24 keyframes."""
     keep: list[int] = [keyframe_id for rig_frame in galileo_input.rig_frames()[:3] for keyframe_id in rig_frame.keyframe_ids]
     return galileo_input.filtered(keep)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _quiet_glog() -> None:
+    """Silence COLMAP's own logging so the tests' own numbers stay readable.
+
+    Session scope, and here rather than in each mapping module: `minloglevel` is a
+    process-wide setting, so five module-scoped copies were five spellings of one
+    effect that the first mapping module already had for the rest of the run.
+    """
+    pycolmap.logging.minloglevel = 2
+
+
+@pytest.fixture(scope="module")
+def synthetic_rig() -> SyntheticRig:
+    """A 20-frame, two-camera rig with 500 points and 0.3 px observation noise.
+
+    `mapping_helpers` is imported inside the body, not at the top of the file:
+    it imports `project_and_mask` from here, so a module-level import would be a
+    cycle. Module scope, as the four copies this replaces had — building the rig
+    costs 8 ms and its database 39 ms, so each module still gets its own.
+    """
+    from mapping_helpers import build_synthetic_rig
+
+    return build_synthetic_rig()
+
+
+@pytest.fixture(scope="module")
+def synthetic_database(synthetic_rig: SyntheticRig, tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The synthetic rig's observations as a COLMAP database."""
+    from mapping_helpers import synthetic_matches, write_database
+
+    database_path: Path = tmp_path_factory.mktemp("synthetic") / "database.db"
+    write_database(
+        database_path, synthetic_rig.frames_meta, synthetic_rig.keypoints_px, synthetic_matches(synthetic_rig)
+    )
+    return database_path
 
 
 @pytest.fixture(scope="module")

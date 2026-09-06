@@ -24,7 +24,17 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Final
+from typing import Final, Literal, TypeAlias
+
+CeresTermination: TypeAlias = Literal["CONVERGENCE", "NO_CONVERGENCE", "FAILURE"]
+"""How Ceres ended a solve, as `TerminationType`'s bare name.
+
+Three values, not a `str`: every solve in the package -- pycolmap's bundle adjustment,
+the extrinsics-only pyceres problem, the pose graph -- reports the same enum, and four
+docstrings used to spell the same three names in prose beside a `str` annotation. Ceres'
+own `USER_SUCCESS` and `USER_FAILURE` cannot arrive here because nothing in this package
+installs an `IterationCallback`, which is the only thing that produces them.
+"""
 
 BRIEF_REPORT_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"Iterations:\s*(\d+),\s*Initial cost:\s*([0-9.eE+-]+),\s*Final cost:\s*([0-9.eE+-]+)"

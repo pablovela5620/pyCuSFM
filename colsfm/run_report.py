@@ -27,7 +27,7 @@ from colsfm.ba_backend import BaBackend
 from colsfm.frames_meta import CameraParams, FramesMeta
 from colsfm.geometry import MILLIMETRES_PER_METRE, relative_rotation_degrees
 from colsfm.mapping import MappingResult, PolishStats
-from colsfm.pose_graph import PoseGraphEdge
+from colsfm.pose_graph import EdgeKind, PoseGraphEdge
 from colsfm.run_config import PipelineOptions
 
 
@@ -178,7 +178,7 @@ class LoopEdgeRecord:
     """Translation of the measurement, in metres."""
     information_diagonal: tuple[float, float, float, float, float, float]
     """Diagonal of the 6x6 weight, rotation block first then translation."""
-    kind: str
+    kind: EdgeKind
     """`PoseGraphEdge.kind`; always `"loop"` in this file, kept so the record is self-describing."""
 
 

@@ -72,13 +72,13 @@ from jaxtyping import Int64
 from numpy import ndarray
 from serde import serde
 
-from colsfm.ba_backend import caspar_supported_camera_models
+from colsfm.ba_backend import caspar_supported_camera_models, resolve_backend
 from colsfm.benchmark import ReconstructionMetrics, write_json_report
 from colsfm.cameras import COLMAP_MODEL_BY_PROJECTION_MODEL, colmap_camera_parameters
 from colsfm.export import KEYFRAME_METADATA_SUBPATH, colour_points_from_images, write_colmap_model, write_optimised_frames_meta, write_pose_files
 from colsfm.frames_meta import FRAMES_META_NAME, FramesMeta, KeyframeMeta, read_frames_meta
-from colsfm.reconstruction import RigReference, rig_reference
-from colsfm.rig_calibration import ExtrinsicDelta, extrinsic_deltas, reference_camera_params_id, rig_config
+from colsfm.reconstruction import RigReference, gauge_camera_params_id, rig_reference
+from colsfm.rig_calibration import ExtrinsicDelta, extrinsic_deltas, rig_config
 from tools.audit.colmap_baseline_galileo import (
     EXTRACTOR_BY_CHOICE,
     MATCHER_BY_CHOICE,
@@ -556,14 +556,17 @@ def main(config: ColmapRigBaselineRobocapConfig) -> None:
             keyframe_id for rig_frame in frames_meta.rig_frames()[: config.max_num_rig_frames] for keyframe_id in rig_frame.keyframe_ids
         ]
         frames_meta = frames_meta.filtered(kept)
-    reference_id: int = reference_camera_params_id(frames_meta)
+    reference_id: int = gauge_camera_params_id(frames_meta)
     reference: RigReference = rig_reference(frames_meta, reference_id)
 
     supported: frozenset[str] = caspar_supported_camera_models() if config.ba_backend == "caspar" else frozenset()
     # CASPAR throws on a multi-sensor frame when it may move the extrinsics
     # (`bundle_adjustment_caspar.cc:186`), so this is the one COLMAP default the
-    # CASPAR path cannot keep.
-    refine_sensor_from_rig: bool = config.ba_backend != "caspar"
+    # CASPAR path cannot keep. `colsfm.ba_backend` owns that rule: ask it what a solve
+    # that frees `sensor_from_rig` would run on, and refine only when the answer is
+    # still the requested backend.
+    refining_backend, _ = resolve_backend(config.ba_backend, optimize_extrinsics=True)
+    refine_sensor_from_rig: bool = refining_backend == config.ba_backend
     options: pycolmap.IncrementalPipelineOptions = pipeline_options(config, refine_sensor_from_rig)
 
     pycolmap.logging.verbose_level = config.verbose_level

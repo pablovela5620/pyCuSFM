@@ -59,6 +59,7 @@ from colsfm.extrinsic_costs import RepeatedCauchyLoss, RigReprojectionCost
 from colsfm.extrinsic_observations import CameraObservations, CameraPairKey, camera_observations, co_observed_camera_pairs
 from colsfm.pose_graph import Information6, RelativePoseCost, default_information
 from colsfm.reconstruction import RigReference
+from colsfm.solver_report import CeresTermination
 
 EXTRINSIC_LINEAR_SOLVER: Final[LinearSolver] = "SPARSE_NORMAL_CHOLESKY"
 """The extrinsics-only problem has a handful of pose blocks and no Schur structure."""
@@ -133,8 +134,8 @@ class ExtrinsicSolveStats:
     """Ceres cost before the solve."""
     final_cost: float
     """Ceres cost after the solve."""
-    termination: str
-    """`CONVERGENCE`, `NO_CONVERGENCE` or `FAILURE`."""
+    termination: CeresTermination
+    """How the solve ended."""
     seconds: float
     """Wall-clock seconds, problem construction included."""
 

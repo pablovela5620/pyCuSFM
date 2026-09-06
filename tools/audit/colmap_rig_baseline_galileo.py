@@ -48,8 +48,8 @@ from serde import serde
 
 from colsfm.benchmark import ReconstructionMetrics, RigTrack, write_json_report
 from colsfm.frames_meta import FramesMeta, KeyframeMeta
-from colsfm.reconstruction import RigReference, rig_reference
-from colsfm.rig_calibration import ExtrinsicDelta, extrinsic_deltas, reference_camera_params_id, rig_config
+from colsfm.reconstruction import RigReference, gauge_camera_params_id, rig_reference
+from colsfm.rig_calibration import ExtrinsicDelta, extrinsic_deltas, rig_config
 from colsfm.trajectory import TrajectoryScore, image_center_score, rig_track_from_reconstruction, score_track_against_ground_truth
 from tools.audit.colmap_baseline_galileo import (
     EXTRACTOR_BY_CHOICE,
@@ -248,7 +248,7 @@ def main(config: ColmapRigBaselineConfig) -> None:
 
     reference: GalileoReference = read_galileo_reference(config.input_dir)
     frames_meta: FramesMeta = reference.frames_meta
-    reference_params_id: int = reference_camera_params_id(frames_meta)
+    reference_params_id: int = gauge_camera_params_id(frames_meta)
     rig_ref: RigReference = rig_reference(frames_meta, reference_params_id)
     original_by_staged: dict[str, str] = _stage_images(frames_meta, config.input_dir, staged_root)
     num_rig_frames: int = len({name.split("/")[1] for name in original_by_staged})

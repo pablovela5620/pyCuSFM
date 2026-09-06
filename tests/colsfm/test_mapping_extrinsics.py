@@ -24,7 +24,6 @@ from conftest import pose_delta
 from mapping_helpers import (
     PERTURBATION_DEG,
     SyntheticRig,
-    build_synthetic_rig,
     quiet_options,
     random_offset,
     synthetic_matches,
@@ -35,18 +34,6 @@ from colsfm.config import CusfmConfig, VisionMappingConfig
 from colsfm.frames_meta import FramesMeta, read_frames_meta
 from colsfm.mapping import MappingResult, run_mapping
 from colsfm.reconstruction import build_reconstruction, gauge_camera_params_id
-
-
-@pytest.fixture(autouse=True, scope="module")
-def _quiet_glog() -> None:
-    """Silence COLMAP's own logging so the tests' own numbers stay readable."""
-    pycolmap.logging.minloglevel = 2
-
-
-@pytest.fixture(scope="module")
-def synthetic_rig() -> SyntheticRig:
-    """A 20-frame, two-camera rig with 500 points and 0.3 px observation noise."""
-    return build_synthetic_rig()
 
 
 @pytest.fixture(scope="module")

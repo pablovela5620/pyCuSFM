@@ -24,6 +24,7 @@ import numpy as np
 from colsfm.frames_meta import FramesMeta, KeyframeMeta
 from colsfm.geometry import MICROSECONDS_PER_SECOND
 from colsfm.loop_pose import RigPoseRejection, RigPoseRejectionReason
+from colsfm.pairs import normalise_pair
 from colsfm.retrieval import RetrievalIndex, RetrievalQuery
 
 
@@ -31,8 +32,6 @@ from colsfm.retrieval import RetrievalIndex, RetrievalQuery
 class LoopClosureDiagnostics:
     """Where the candidates went, so a run can be explained without re-running it."""
 
-    enabled: bool
-    """Whether `LoopClosureConfig.enabled` let the stage run at all."""
     session_duration_seconds: float
     """`max(timestamp) - min(timestamp)` over the keyframes, in seconds."""
     min_time_gap_seconds: float
@@ -121,11 +120,10 @@ class FunnelCounters:
         else:
             self.rejected_by_direction += 1
 
-    def freeze(self, *, enabled: bool, duration_seconds: float, gap_seconds: float, score_threshold: float, edges: int) -> LoopClosureDiagnostics:
+    def freeze(self, *, duration_seconds: float, gap_seconds: float, score_threshold: float, edges: int) -> LoopClosureDiagnostics:
         """Turn the counters and the run's resolved gates into the reported diagnostics.
 
         Args:
-            enabled: Whether the stage ran.
             duration_seconds: The session duration the gates were derived from.
             gap_seconds: The temporal gap actually applied.
             score_threshold: The retrieval score gate actually applied.
@@ -135,7 +133,6 @@ class FunnelCounters:
             The frozen diagnostics.
         """
         return LoopClosureDiagnostics(
-            enabled=enabled,
             session_duration_seconds=duration_seconds,
             min_time_gap_seconds=gap_seconds,
             good_score_threshold=score_threshold,
@@ -322,7 +319,7 @@ def shortlist_rig_pairs(
     counters.after_banding = len(banded)
     shortlist: dict[tuple[int, int], RetrievalHit] = {}
     for hit in banded:
-        key: tuple[int, int] = (min(hit.source_rig_id, hit.target_rig_id), max(hit.source_rig_id, hit.target_rig_id))
+        key: tuple[int, int] = normalise_pair(hit.source_rig_id, hit.target_rig_id)
         incumbent: RetrievalHit | None = shortlist.get(key)
         if incumbent is None or hit.score > incumbent.score:
             shortlist[key] = hit

@@ -44,28 +44,6 @@ from colsfm.reconstruction import build_reconstruction
 from colsfm.run_report import MappingStats
 
 
-@pytest.fixture(autouse=True, scope="module")
-def _quiet_glog() -> None:
-    """Silence COLMAP's own logging so the tests' own numbers stay readable."""
-    pycolmap.logging.minloglevel = 2
-
-
-@pytest.fixture(scope="module")
-def synthetic_rig() -> SyntheticRig:
-    """A 20-frame, two-camera rig with 500 points and 0.3 px observation noise."""
-    return build_synthetic_rig()
-
-
-@pytest.fixture(scope="module")
-def synthetic_database(synthetic_rig: SyntheticRig, tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """The synthetic rig's observations as a COLMAP database."""
-    database_path: Path = tmp_path_factory.mktemp("synthetic") / "database.db"
-    write_database(
-        database_path, synthetic_rig.frames_meta, synthetic_rig.keypoints_px, synthetic_matches(synthetic_rig)
-    )
-    return database_path
-
-
 @pytest.fixture(scope="module")
 def fisheye_rig() -> SyntheticRig:
     """A 6-frame, two-camera OPENCV_FISHEYE rig: the model stock CASPAR cannot project."""

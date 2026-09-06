@@ -29,7 +29,7 @@ from loop_helpers import ProjectedPoints, matcher_from_point_indices, project_an
 from numpy import ndarray
 from scipy.spatial.transform import Rotation
 
-from colsfm.config import PoseGraphConfig, read_config_directory
+from colsfm.config import CusfmConfig, PoseGraphConfig, read_config_directory
 from colsfm.database import read_keypoints_batch
 from colsfm.frames_meta import FramesMeta, parse_message, read_frames_meta
 from colsfm.geometry import rigid3d_from_matrix
@@ -49,6 +49,7 @@ from colsfm.loop_closure import (
     verify_loop_plan,
 )
 from colsfm.loop_pose import Keypoints, RigPoseConfig
+from colsfm.matching import MatchingOptions
 from colsfm.pose_graph import PoseGraphEdge, RigNode, gate_loop_edges, sequential_edges, solve_pose_graph
 from colsfm.retrieval import (
     ALIKED_DESCRIPTOR_DIM,
@@ -59,7 +60,9 @@ from colsfm.retrieval import (
     build_retrieval_index,
 )
 from colsfm.rig_geometry import calibrated_cameras
+from colsfm.run_config import PipelineOptions
 from colsfm.schema import KEYFRAMES_METADATA_COLLECTION, load_schema
+from colsfm.stages import LoopClosureStageResult, run_loop_closure_stage
 
 REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 """Repo root, so data paths resolve regardless of the working directory."""
@@ -378,7 +381,7 @@ def match_fn(scene: SquareRigScene) -> MatchFunction:
 @pytest.fixture(scope="module")
 def loop_result(scene: SquareRigScene, match_fn: MatchFunction) -> LoopClosureResult:
     """The loop-closure run over the synthetic scene, with the stage switched on."""
-    return find_loop_edges(scene.frames_meta, scene.database_path, scene.index, LoopClosureConfig(enabled=True), match_fn)
+    return find_loop_edges(scene.frames_meta, scene.database_path, scene.index, LoopClosureConfig(), match_fn)
 
 
 # --------------------------------------------------------------------------------------
@@ -421,7 +424,7 @@ def test_the_plan_names_exactly_the_pairs_the_search_asks_for(scene: SquareRigSc
     pair list. The plan derives that list instead — local-map stereo and neighbour
     pairs, then the source-to-target observation pairs — and this compares the two.
     """
-    config: LoopClosureConfig = LoopClosureConfig(enabled=True)
+    config: LoopClosureConfig = LoopClosureConfig()
     plan: LoopSearchPlan = plan_loop_search(scene.frames_meta, scene.database_path, scene.index, config)
     requested: set[tuple[int, int]] = set()
     find_loop_edges(scene.frames_meta, scene.database_path, scene.index, config, recording_matcher(requested))
@@ -432,7 +435,7 @@ def test_the_plan_names_exactly_the_pairs_the_search_asks_for(scene: SquareRigSc
 
 def test_the_plan_keeps_the_shortlisted_rig_pairs_and_the_retrieval_diagnostics(scene: SquareRigScene) -> None:
     """Retrieval runs once, so its funnel counters belong to the plan, not to a second pass."""
-    config: LoopClosureConfig = LoopClosureConfig(enabled=True)
+    config: LoopClosureConfig = LoopClosureConfig()
     plan: LoopSearchPlan = plan_loop_search(scene.frames_meta, scene.database_path, scene.index, config)
     assert plan.rig_pairs, "the scene revisits its own track, so rig pairs are shortlisted"
     normalised: set[tuple[int, int]] = {(min(pair), max(pair)) for pair in plan.rig_pairs}
@@ -448,7 +451,7 @@ def test_planning_then_verifying_gives_the_same_edges_as_one_call(
     scene: SquareRigScene, match_fn: MatchFunction, loop_result: LoopClosureResult
 ) -> None:
     """The two-step form is the one-step form; `find_loop_edges` is now their composition."""
-    config: LoopClosureConfig = LoopClosureConfig(enabled=True)
+    config: LoopClosureConfig = LoopClosureConfig()
     plan: LoopSearchPlan = plan_loop_search(scene.frames_meta, scene.database_path, scene.index, config)
     stepwise: LoopClosureResult = verify_loop_plan(plan, match_fn)
     assert [(edge.source, edge.target) for edge in stepwise.edges] == [
@@ -457,36 +460,27 @@ def test_planning_then_verifying_gives_the_same_edges_as_one_call(
     assert stepwise.diagnostics == loop_result.diagnostics
 
 
-def test_a_disabled_plan_asks_for_nothing(scene: SquareRigScene) -> None:
-    """`enabled=False` stays a clean no-op, and now costs no retrieval at all."""
-    plan: LoopSearchPlan = plan_loop_search(
-        scene.frames_meta, scene.database_path, scene.index, LoopClosureConfig(enabled=False)
-    )
-    assert plan.image_pairs == ()
-    assert plan.rig_pairs == ()
-    result: LoopClosureResult = verify_loop_plan(plan, make_match_function(scene))
-    assert result.edges == []
-    assert result.diagnostics.enabled is False
-
-
 # --------------------------------------------------------------------------------------
 # c. loop closure end to end
 # --------------------------------------------------------------------------------------
 
 
-def test_the_stage_is_on_by_default_and_disabling_it_is_inert(scene: SquareRigScene, match_fn: MatchFunction) -> None:
-    """`LoopClosureConfig.enabled` is True, as in the blob, and `enabled=False` runs nothing.
+def test_the_stage_is_on_by_default_and_disabling_it_is_inert(scene: SquareRigScene, isaac_config: CusfmConfig) -> None:
+    """`--loop-closure` is on, as in the blob, and the stage's `enabled=False` runs nothing.
 
     The default flipped on 2026-09-05 (NOTES.md decision 10, revised) so every run pays for
     the same stage the blob runs; the disabled path must stay a clean no-op for ablations.
+    There is exactly one switch — the stage argument — so this is the only place that can
+    assert the off path: `LoopClosureConfig` no longer carries a second copy of it, and
+    nothing below `run_loop_closure_stage` has a disabled representation to keep consistent.
     """
-    assert LoopClosureConfig().enabled is True
-    result: LoopClosureResult = find_loop_edges(
-        scene.frames_meta, scene.database_path, scene.index, LoopClosureConfig(enabled=False), match_fn
+    assert PipelineOptions(input_dir=Path(), output_dir=Path()).loop_closure is True
+    result: LoopClosureStageResult = run_loop_closure_stage(
+        scene.frames_meta, scene.database_path, isaac_config.pose_graph, MatchingOptions(), enabled=False
     )
     assert result.edges == []
-    assert result.diagnostics.enabled is False
-    assert result.diagnostics.queries == 0
+    assert result.num_pairs_matched == 0
+    assert result.diagnostics is None
 
 
 def test_the_score_gate_is_one_constant_and_can_be_overridden(
@@ -504,7 +498,7 @@ def test_the_score_gate_is_one_constant_and_can_be_overridden(
     assert loop_result.diagnostics.good_score_threshold == GOOD_SCORE_THRESHOLD
 
     strict: LoopClosureResult = find_loop_edges(
-        scene.frames_meta, scene.database_path, scene.index, LoopClosureConfig(enabled=True, good_score_threshold=0.99), match_fn
+        scene.frames_meta, scene.database_path, scene.index, LoopClosureConfig(good_score_threshold=0.99), match_fn
     )
     assert strict.diagnostics.good_score_threshold == 0.99
     assert strict.diagnostics.rejected_by_score > 0
@@ -582,7 +576,7 @@ def clean_match_fn(scene: SquareRigScene) -> MatchFunction:
 @pytest.fixture(scope="module")
 def serial_result(scene: SquareRigScene, clean_match_fn: MatchFunction) -> LoopClosureResult:
     """The reference run: one worker thread, the outlier-free matcher."""
-    return find_loop_edges(scene.frames_meta, scene.database_path, scene.index, LoopClosureConfig(enabled=True, num_threads=1), clean_match_fn)
+    return find_loop_edges(scene.frames_meta, scene.database_path, scene.index, LoopClosureConfig(num_threads=1), clean_match_fn)
 
 
 def _poses_by_rig_pair(result: LoopClosureResult) -> dict[tuple[int, int], pycolmap.Rigid3d]:
@@ -614,7 +608,7 @@ def test_the_thread_count_does_not_reach_the_result(scene: SquareRigScene, clean
     """
     assert LoopClosureConfig().num_threads >= 1
     threaded: LoopClosureResult = find_loop_edges(
-        scene.frames_meta, scene.database_path, scene.index, LoopClosureConfig(enabled=True, num_threads=8), clean_match_fn
+        scene.frames_meta, scene.database_path, scene.index, LoopClosureConfig(num_threads=8), clean_match_fn
     )
     assert threaded.diagnostics.after_deduplication == serial_result.diagnostics.after_deduplication
     for result in (serial_result, threaded):
@@ -651,13 +645,13 @@ def test_reading_the_keypoints_once_and_passing_them_in_replaces_the_database_re
     assert len(keypoints) == len(scene.index.image_ids)
     absent: Path = Path("no/such/database.db")
     reused: LoopClosureResult = find_loop_edges(
-        scene.frames_meta, absent, scene.index, LoopClosureConfig(enabled=True, num_threads=1), clean_match_fn, keypoints=keypoints
+        scene.frames_meta, absent, scene.index, LoopClosureConfig(num_threads=1), clean_match_fn, keypoints=keypoints
     )
     assert reused.diagnostics.after_deduplication == serial_result.diagnostics.after_deduplication
     shared: set[tuple[int, int]] = set(_poses_by_rig_pair(reused)) & set(_poses_by_rig_pair(serial_result))
     assert len(shared) >= 0.8 * len(serial_result.edges)
     with pytest.raises(FileNotFoundError):
-        find_loop_edges(scene.frames_meta, absent, scene.index, LoopClosureConfig(enabled=True), clean_match_fn)
+        find_loop_edges(scene.frames_meta, absent, scene.index, LoopClosureConfig(), clean_match_fn)
 
 
 def test_loop_edges_reduce_trajectory_error_when_the_odometry_drifts(scene: SquareRigScene, loop_result: LoopClosureResult) -> None:
@@ -707,9 +701,9 @@ def test_stored_weights_scale_the_information_matrix_by_the_inlier_count(scene: 
     `set_random_seed` does not reach them, so a pair sitting on the inlier gate falls either
     way between runs. The poses themselves agree to 0.1 mm; only the gate decision moves.
     """
-    config: LoopClosureConfig = LoopClosureConfig(enabled=True, use_stored_weights=True)
+    config: LoopClosureConfig = LoopClosureConfig(use_stored_weights=True)
     identity_run: LoopClosureResult = find_loop_edges(
-        scene.frames_meta, scene.database_path, scene.index, LoopClosureConfig(enabled=True), match_fn
+        scene.frames_meta, scene.database_path, scene.index, LoopClosureConfig(), match_fn
     )
     weighted_run: LoopClosureResult = find_loop_edges(scene.frames_meta, scene.database_path, scene.index, config, match_fn)
     assert identity_run.edges
@@ -834,12 +828,10 @@ def test_the_config_profile_supplies_the_loop_gates() -> None:
         pytest.skip(f"the loop-closure config profile is not present at {LOOP_CLOSURE_CONFIG_DIR}")
     pose_graph: PoseGraphConfig = read_config_directory(LOOP_CLOSURE_CONFIG_DIR).pose_graph
     config: LoopClosureConfig = LoopClosureConfig.from_pose_graph(pose_graph)
-    assert config.enabled is True
     assert config.loop_closure_interval_ratio == pose_graph.loop_closure_interval_ratio
     assert config.max_translation_m == pose_graph.loop_edge_translation_threshold_meters == 1.0
     assert config.max_rotation_deg == pose_graph.loop_edge_rotation_threshold_degrees == 10.0
     assert config.loop_residual_weight == pose_graph.loop_residual_weight
-    assert LoopClosureConfig.from_pose_graph(pose_graph, enabled=False).enabled is False
 
 
 def _loop_edge(translation_m: float, rotation_deg: float) -> PoseGraphEdge:

@@ -120,7 +120,7 @@ from colsfm.extrinsic_observations import (
     co_observed_camera_pairs,
 )
 from colsfm.extrinsic_solve import ExtrinsicRefinementOptions, ExtrinsicSolveStats, solve_extrinsics
-from colsfm.geometry import MILLIMETRES_PER_METRE
+from colsfm.geometry import MILLIMETRES_PER_METRE, relative_rotation_degrees
 from colsfm.mapping import (
     MappingOptions,
     MappingResult,
@@ -266,7 +266,7 @@ def extrinsic_deltas(
             float(np.linalg.norm(np.asarray(updated.translation) - np.asarray(previous.translation)))
             * MILLIMETRES_PER_METRE
         )
-        rotation_deg.append(float(np.rad2deg((previous.rotation.inverse() * updated.rotation).angle())))
+        rotation_deg.append(relative_rotation_degrees(previous, updated))
     if not translation_mm:
         return 0.0, 0.0
     return max(translation_mm), max(rotation_deg)

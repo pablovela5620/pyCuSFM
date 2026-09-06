@@ -246,8 +246,10 @@ measurement in this module can reach.
 Where that leaves the stage
 ---------------------------
 
-`LoopClosureConfig.enabled` is **True** since 2026-09-05 (it was False until then; the blob
-always runs the stage, and the user wants the comparison to pay for it on both sides). The
+The stage is **on** since 2026-09-05 (it was off until then; the blob always runs it, and
+the user wants the comparison to pay for it on both sides). Nothing in this module can turn
+it off: `colsfm.stages.run_loop_closure_stage(..., enabled=...)` is the one switch, fed by
+`--no-loop-closure`, and it returns before this module is reached. The
 paragraph below is the reasoning that kept it off, kept for the record. The estimator is a real improvement — it beats
 the old one by 200 mm and beats running no loops at all, on the frozen pair set and end to
 end — but 401 mm against a 135 mm target is not a result worth switching on by default, and
@@ -329,11 +331,6 @@ DEFAULT_MEASUREMENT_THREADS: Final[int] = min(8, os.cpu_count() or 1)
 class LoopClosureConfig:
     """Gates and thresholds for the loop-closure stage."""
 
-    enabled: bool = True
-    """Master switch. On by default since 2026-09-05, as in the blob (NOTES.md decision 10,
-    revised): every run and every blob comparison pays for the same stage. On Galileo the
-    10 s loop gate rejects every candidate, so the stage changes nothing there; pass
-    `enabled=False` (`--no-loop-closure`) for an explicit ablation."""
     top_k: int = 20
     """`query_result_number`: retrieval hits considered per query keyframe."""
     good_score_threshold: float | None = None
@@ -404,7 +401,7 @@ class LoopClosureConfig:
         return self.rig_pose.min_inliers
 
     @classmethod
-    def from_pose_graph(cls, config: PoseGraphConfig, *, enabled: bool = True) -> LoopClosureConfig:
+    def from_pose_graph(cls, config: PoseGraphConfig) -> LoopClosureConfig:
         """Build the stage's settings from the `pose_graph_config.pb.txt` a run was given.
 
         The five fields the config profile owns are its loop gates; everything else stays at
@@ -414,13 +411,11 @@ class LoopClosureConfig:
 
         Args:
             config: The parsed `pose_graph_config.pb.txt`.
-            enabled: Whether the stage should run.
 
         Returns:
             The loop-closure settings.
         """
         return cls(
-            enabled=enabled,
             loop_closure_interval_ratio=config.loop_closure_interval_ratio,
             max_translation_m=config.loop_edge_translation_threshold_meters,
             max_rotation_deg=config.loop_edge_rotation_threshold_degrees,
@@ -540,14 +535,6 @@ class LoopSearchPlan:
 
     config: LoopClosureConfig
     """The gates and thresholds the plan was made under, and will be verified under."""
-    enabled: bool
-    """Whether the stage runs at all; a disabled plan asks for nothing and verifies nothing."""
-    rig_pairs: tuple[tuple[int, int], ...]
-    """The shortlisted `(source rig id, target rig id)` pairs, in measurement order.
-
-    Directed as the retrieval hit that survived deduplication was directed, and grouped
-    by source rig frame, because a source triangulates its local map once however many
-    candidates it has. One entry per unordered rig pair."""
     image_pairs: tuple[ImagePair, ...]
     """Every image pair the measurement will ask for, normalised, deduplicated and sorted.
 
@@ -569,6 +556,20 @@ class LoopSearchPlan:
     """The temporal gate actually applied, for the diagnostics."""
     score_threshold: float
     """The resolved retrieval score gate, for the diagnostics."""
+
+    @property
+    def rig_pairs(self) -> tuple[tuple[int, int], ...]:
+        """The shortlisted `(source rig id, target rig id)` pairs, in measurement order.
+
+        Directed as the retrieval hit that survived deduplication was directed, and
+        grouped by source rig frame, because a source triangulates its local map once
+        however many candidates it has. One entry per unordered rig pair. Read off
+        `groups`, which is the same shortlist in the order the measurement walks it.
+
+        Returns:
+            One pair per shortlisted rig pair, in ascending source-rig order.
+        """
+        return tuple((source_rig_id, hit.target_rig_id) for source_rig_id, hits in self.groups for hit in hits)
 
     @property
     def queries(self) -> int:
@@ -608,15 +609,14 @@ def plan_loop_search(
         database_path: COLMAP database holding the keypoints. Only read when `keypoints`
             is None.
         index: Retrieval index over the same keyframe ids.
-        config: Gates and thresholds. Nothing is planned unless `config.enabled`.
+        config: Gates and thresholds.
         keypoints: Keypoint pixels per image id, already read; read here when None.
 
     Returns:
         The plan, which `verify_loop_plan` turns into edges.
 
     Raises:
-        FileNotFoundError: When `database_path` does not exist, the stage is enabled and no
-            `keypoints` were given.
+        FileNotFoundError: When `database_path` does not exist and no `keypoints` were given.
     """
     keyframe_by_id: dict[int, KeyframeMeta] = frames_meta.keyframe_by_id()
     timestamps_us: dict[int, int] = {keyframe_id: keyframe.timestamp_microseconds for keyframe_id, keyframe in keyframe_by_id.items()}
@@ -625,23 +625,6 @@ def plan_loop_search(
     score_threshold: float = GOOD_SCORE_THRESHOLD if config.good_score_threshold is None else config.good_score_threshold
     counters: FunnelCounters = FunnelCounters()
     empty_geometry: RigGeometry = rig_geometry(frames_meta)
-
-    if not config.enabled:
-        print("Loop closure is disabled; set LoopClosureConfig.enabled to run it.")
-        return LoopSearchPlan(
-            config=config,
-            enabled=False,
-            rig_pairs=(),
-            image_pairs=(),
-            groups=(),
-            geometry=empty_geometry,
-            rig_index=rig_frame_index(frames_meta),
-            keypoints={},
-            counters=counters,
-            duration_seconds=duration_seconds,
-            gap_seconds=gap_seconds,
-            score_threshold=score_threshold,
-        )
 
     shortlist: dict[tuple[int, int], RetrievalHit] = shortlist_rig_pairs(
         frames_meta,
@@ -664,8 +647,6 @@ def plan_loop_search(
     rig_index: RigFrameIndex = rig_frame_index(frames_meta)
     return LoopSearchPlan(
         config=config,
-        enabled=True,
-        rig_pairs=rig_pairs,
         image_pairs=required_image_pairs(
             rig_index, empty_geometry, pixels, config.rig_pose.neighbour_span, rig_pairs
         ),
@@ -693,16 +674,6 @@ def verify_loop_plan(plan: LoopSearchPlan, match_fn: MatchFunction) -> LoopClosu
         included.
     """
     config: LoopClosureConfig = plan.config
-    if not plan.enabled:
-        empty: LoopClosureDiagnostics = plan.counters.freeze(
-            enabled=False,
-            duration_seconds=plan.duration_seconds,
-            gap_seconds=plan.gap_seconds,
-            score_threshold=plan.score_threshold,
-            edges=0,
-        )
-        return LoopClosureResult(edges=[], diagnostics=empty)
-
     estimator: RigPoseEstimator = RigPoseEstimator(
         index=plan.rig_index,
         geometry=plan.geometry,
@@ -730,7 +701,6 @@ def verify_loop_plan(plan: LoopSearchPlan, match_fn: MatchFunction) -> LoopClosu
         )
     gated: list[PoseGraphEdge] = gate_loop_edges(edges, max_translation_m=config.max_translation_m, max_rotation_deg=config.max_rotation_deg)
     diagnostics: LoopClosureDiagnostics = plan.counters.freeze(
-        enabled=True,
         duration_seconds=plan.duration_seconds,
         gap_seconds=plan.gap_seconds,
         score_threshold=plan.score_threshold,
@@ -757,7 +727,7 @@ def find_loop_edges(
         frames_meta: Parsed `frames_meta.json`.
         database_path: COLMAP database holding the keypoints `match_fn`'s indices refer to.
         index: Retrieval index over the same keyframe ids.
-        config: Gates and thresholds. Nothing runs unless `config.enabled`.
+        config: Gates and thresholds.
         match_fn: `match_fn(image_id_a, image_id_b) -> Int[ndarray, "m 2"]`.
         keypoints: Keypoint pixels per image id, already read; read here when None.
 
@@ -765,8 +735,7 @@ def find_loop_edges(
         The gated loop edges and the diagnostics of the run.
 
     Raises:
-        FileNotFoundError: When `database_path` does not exist, the stage is enabled and no
-            `keypoints` were given.
+        FileNotFoundError: When `database_path` does not exist and no `keypoints` were given.
     """
     return verify_loop_plan(plan_loop_search(frames_meta, database_path, index, config, keypoints), match_fn)
 

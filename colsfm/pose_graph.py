@@ -52,6 +52,7 @@ from colsfm.ceres_pose import (
     solver_options,
     solver_stats,
 )
+from colsfm.solver_report import CeresTermination
 
 EdgeKind: TypeAlias = Literal["consecutive", "loop"]
 Information6: TypeAlias = Float[np.ndarray, "6 6"]
@@ -417,8 +418,8 @@ class PoseGraphResult:
     """Ceres' initial cost, i.e. `0.5 * sum(residual**2)` before optimising."""
     final_cost: float
     """Ceres' final cost."""
-    termination: str
-    """Ceres termination type, e.g. `"CONVERGENCE"` or `"NO_CONVERGENCE"`."""
+    termination: CeresTermination
+    """How the solve ended, as `colsfm.solver_report` names it."""
     is_solution_usable: bool
     """`Summary::IsSolutionUsable()`; False means the poses were left where Ceres stopped."""
     brief_report: str

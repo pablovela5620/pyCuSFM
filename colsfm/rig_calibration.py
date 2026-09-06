@@ -46,18 +46,6 @@ class ExtrinsicDelta:
     """Geodesic angle between recovered and calibrated `cam_from_rig` rotations."""
 
 
-def reference_camera_params_id(frames_meta: FramesMeta) -> int:
-    """Pick the rig's reference camera: the one owning the lowest keyframe id.
-
-    Args:
-        frames_meta: The parsed metadata.
-
-    Returns:
-        The reference `camera_params_id`.
-    """
-    return min(frames_meta.keyframes, key=lambda item: item.keyframe_id).camera_params_id
-
-
 def calibrated_cam_from_rig(frames_meta: FramesMeta, reference: RigReference) -> dict[int, pycolmap.Rigid3d]:
     """The calibration's `cam_from_rig` per camera, the reference at identity.
 

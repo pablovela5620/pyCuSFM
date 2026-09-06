@@ -250,15 +250,15 @@ def run_keyframe_selection_stage(options: SelectionOptions) -> KeyframeSelection
 
 
 def run_feature_extraction_stage(
-    options: PipelineOptions, selected: FramesMeta, feature_options: FeatureOptions | None = None
+    options: PipelineOptions, selected: FramesMeta, feature_options: FeatureOptions
 ) -> ExtractionReport:
     """Create the COLMAP database and run ALIKED over the selected keyframes.
 
     Args:
         options: The run's options, for the database path and the image root.
         selected: The collection keyframe selection kept.
-        feature_options: The extractor's resolved settings; derived from `options`
-            when None, which is what a caller stepping through one stage wants.
+        feature_options: The extractor's resolved settings, as `resolve_run` produced
+            them; `PipelineOptions.resolve()` is the one place that derives them.
 
     Returns:
         The extraction report: per-image keypoint counts, the device used and the
@@ -267,17 +267,12 @@ def run_feature_extraction_stage(
     Raises:
         FileNotFoundError: When the image root is missing.
     """
-    resolved: FeatureOptions = (
-        FeatureOptions(backend=options.features_backend, num_threads=options.num_threads, device=options.device)
-        if feature_options is None
-        else feature_options
-    )
     create_database(options.database_path, selected, overwrite=True)
     return extract_features(
         options.database_path,
         options.input_dir,
         [keyframe.image_name for keyframe in selected.keyframes],
-        resolved,
+        feature_options,
     )
 
 

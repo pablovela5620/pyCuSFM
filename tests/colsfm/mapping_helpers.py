@@ -8,9 +8,11 @@ test modules that split out of it hold only what each of them asserts.
 
 What is shared with *every* synthetic-scene test — the projection and its
 in-image mask — stays in `conftest.py`; this module only adds what a rig scene
-needs on top of it. Fixtures stay in the test modules, as they do for the loop
-scenes in `loop_helpers.py`: building the rig costs 8 ms and its database 39 ms,
-so a per-module fixture is cheaper than a shared one is worth.
+needs on top of it. The `synthetic_rig` and `synthetic_database` fixtures over it
+live in `conftest.py` too, declared once instead of copied into each of the four
+modules that ask for them; they stay **module** scoped, because building the rig
+costs 8 ms and its database 39 ms, so a per-module scene is cheaper than a shared
+one is worth.
 """
 
 from __future__ import annotations

@@ -46,28 +46,6 @@ from colsfm.mapping import MappingResult, RoundStats, load_correspondences, pixe
 from colsfm.reconstruction import RIG_ID, PosedModel, build_reconstruction, camera_sensor_id, gauge_rig_frame
 
 
-@pytest.fixture(autouse=True, scope="module")
-def _quiet_glog() -> None:
-    """Silence COLMAP's own logging so the tests' own numbers stay readable."""
-    pycolmap.logging.minloglevel = 2
-
-
-@pytest.fixture(scope="module")
-def synthetic_rig() -> SyntheticRig:
-    """A 20-frame, two-camera rig with 500 points and 0.3 px observation noise."""
-    return build_synthetic_rig()
-
-
-@pytest.fixture(scope="module")
-def synthetic_database(synthetic_rig: SyntheticRig, tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """The synthetic rig's observations as a COLMAP database."""
-    database_path: Path = tmp_path_factory.mktemp("synthetic") / "database.db"
-    write_database(
-        database_path, synthetic_rig.frames_meta, synthetic_rig.keypoints_px, synthetic_matches(synthetic_rig)
-    )
-    return database_path
-
-
 def test_pixel_error_schedule_is_the_isaac_ramp(isaac_config: CusfmConfig) -> None:
     """The gate decays linearly across the outer loop: 25, 20, 15, 10, 5 (§5.6).
 

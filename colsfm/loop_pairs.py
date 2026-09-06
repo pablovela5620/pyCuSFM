@@ -17,6 +17,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 
 from colsfm.database import Keypoints
+from colsfm.pairs import normalise_pair
 from colsfm.rig_geometry import RigFrameIndex, RigGeometry
 
 
@@ -101,7 +102,7 @@ def required_image_pairs(
             # matches from that anchor whether or not it does.
             if anchor in keypoints:
                 for partner in local_map_partners(index, geometry, neighbour_span, source_rig_id, camera_id):
-                    pairs.add((min(anchor, partner), max(anchor, partner)))
+                    pairs.add(normalise_pair(anchor, partner))
             target_cameras: list[int] = [camera_id]
             partner_camera: int | None = geometry.stereo_partner.get(camera_id)
             if partner_camera is not None:
@@ -111,5 +112,5 @@ def required_image_pairs(
                     observed: int | None = index.keyframe(target_rig_id, target_camera)
                     if observed is None or observed not in keypoints:
                         continue
-                    pairs.add((min(anchor, observed), max(anchor, observed)))
+                    pairs.add(normalise_pair(anchor, observed))
     return tuple(sorted(pairs))

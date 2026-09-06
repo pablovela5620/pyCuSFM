@@ -19,7 +19,7 @@ import numpy as np
 import pycolmap
 import pytest
 from jaxtyping import Float64
-from mapping_helpers import SyntheticRig, build_synthetic_rig, synthetic_matches, write_database
+from mapping_helpers import SyntheticRig, synthetic_matches, write_database
 from numpy import ndarray
 
 from colsfm.config import CusfmConfig
@@ -31,18 +31,6 @@ from colsfm.mapping import (
     projection_sanity_bound_px,
 )
 from colsfm.reconstruction import build_reconstruction
-
-
-@pytest.fixture(autouse=True, scope="module")
-def _quiet_glog() -> None:
-    """Silence COLMAP's own logging so the tests' own numbers stay readable."""
-    pycolmap.logging.minloglevel = 2
-
-
-@pytest.fixture(scope="module")
-def synthetic_rig() -> SyntheticRig:
-    """A 20-frame, two-camera rig with 500 points and 0.3 px observation noise."""
-    return build_synthetic_rig()
 
 
 @pytest.fixture(scope="module")

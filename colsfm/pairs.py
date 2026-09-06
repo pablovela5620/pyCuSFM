@@ -85,7 +85,7 @@ def consecutive_pairs(frames_meta: FramesMeta, connected_keyframe_num: int) -> l
                     break
                 successor_id: int | None = index.get((rig_frames[position + offset].synced_sample_id, camera_params_id))
                 if successor_id is not None:
-                    pairs.add(_normalise(keyframe_id, successor_id))
+                    pairs.add(normalise_pair(keyframe_id, successor_id))
     return sorted(pairs)
 
 
@@ -108,7 +108,7 @@ def stereo_pairs(frames_meta: FramesMeta) -> list[ImagePair]:
             left_id: int | None = index.get((rig_frame.synced_sample_id, stereo_pair.left_camera_params_id))
             right_id: int | None = index.get((rig_frame.synced_sample_id, stereo_pair.right_camera_params_id))
             if left_id is not None and right_id is not None:
-                pairs.add(_normalise(left_id, right_id))
+                pairs.add(normalise_pair(left_id, right_id))
     return sorted(pairs)
 
 
@@ -135,12 +135,17 @@ def select_pairs(frames_meta: FramesMeta, connected_keyframe_num: int = 1) -> li
     return sorted(pairs)
 
 
-def _normalise(image_id1: int, image_id2: int) -> ImagePair:
+def normalise_pair(image_id1: int, image_id2: int) -> ImagePair:
     """Order a pair as `(min, max)`.
 
+    Public because the canonical form is the package's, not this module's: loop pair
+    enumeration, the rig-pair shortlist and the walkthrough's revisit heat map all key
+    dictionaries and sets by an unordered pair, and each used to inline `(min, max)`
+    with no self-pair check at all.
+
     Args:
-        image_id1: One image id.
-        image_id2: The other image id.
+        image_id1: One id — an image id, or a rig id where the pair is a rig pair.
+        image_id2: The other id.
 
     Returns:
         The canonical pair.
@@ -194,4 +199,4 @@ def read_task_pairs(task_path: Path, schema: CusfmSchema | None = None) -> list[
     resolved_schema: CusfmSchema = load_schema() if schema is None else schema
     task = resolved_schema.message_class(FEATURE_MATCHING_TASK)()
     task.ParseFromString(task_path.read_bytes())
-    return sorted({_normalise(int(pair.source_frame_id), int(pair.target_frame_id)) for pair in task.frame_pairs})
+    return sorted({normalise_pair(int(pair.source_frame_id), int(pair.target_frame_id)) for pair in task.frame_pairs})
