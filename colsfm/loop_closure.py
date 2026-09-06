@@ -266,7 +266,7 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final
 
@@ -287,12 +287,41 @@ from colsfm.loop_pose import (
     RigPoseEstimator,
     RigPoseOutcome,
     RigPoseRejection,
-    RigPoseRejectionReason,
     required_image_pairs,
 )
+from colsfm.loop_shortlist import (
+    FunnelCounters,
+    LoopClosureDiagnostics,
+    RetrievalHit,
+    select_best_candidates,
+    shortlist_rig_pairs,
+)
 from colsfm.pose_graph import Information6, PoseGraphEdge, gate_loop_edges, loop_edge_information
-from colsfm.retrieval import GOOD_SCORE_THRESHOLD, RetrievalIndex, RetrievalQuery
+from colsfm.retrieval import GOOD_SCORE_THRESHOLD, RetrievalIndex
 from colsfm.rig_geometry import rig_frame_index, rig_geometry
+
+__all__ = [
+    "FunnelCounters",
+    "LoopCandidate",
+    "LoopClosureConfig",
+    "LoopClosureDiagnostics",
+    "LoopClosureResult",
+    "LoopSearchPlan",
+    "RetrievalHit",
+    "find_loop_edges",
+    "is_good_match",
+    "minimum_time_gap_seconds",
+    "plan_loop_search",
+    "select_best_candidates",
+    "session_duration_seconds",
+    "verify_loop_plan",
+]
+"""The loop subsystem's public surface.
+
+`colsfm.loop_closure` stays the one import path, whichever of its two modules a
+name is defined in: `colsfm.loop_shortlist` owns the retrieval half of the funnel
+-- the gates, the banding, the counters and the diagnostics they freeze into --
+and this module owns the plan, the measurement and the gating."""
 
 DEFAULT_MEASUREMENT_THREADS: Final[int] = min(8, os.cpu_count() or 1)
 """Worker threads the measurement pass uses by default; see `LoopClosureConfig.num_threads`."""
@@ -402,29 +431,6 @@ class LoopClosureConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class RetrievalHit:
-    """One retrieval hit that passed the score, time and rig gates, before any matching.
-
-    The funnel bands and deduplicates these, and only the survivors are handed to the
-    matcher. Nothing here needs an image pair to have been matched, which is what lets the
-    stage name every pair it will need in a single dry run (`find_loop_edges`).
-    """
-
-    query_keyframe_id: int
-    """Keyframe the query was issued from."""
-    candidate_keyframe_id: int
-    """Retrieved keyframe."""
-    source_rig_id: int
-    """`synced_sample_id` of the query keyframe's rig frame."""
-    target_rig_id: int
-    """`synced_sample_id` of the candidate keyframe's rig frame."""
-    score: float
-    """Retrieval score in `[0, 1]`."""
-    delta_seconds: float
-    """`t_query - t_candidate` in seconds; `select_best_candidates` bands on its magnitude."""
-
-
-@dataclass(frozen=True, slots=True)
 class LoopCandidate:
     """One retrieval hit that survived the metric verification.
 
@@ -437,123 +443,6 @@ class LoopCandidate:
     """The retrieval hit this rig pair was shortlisted by."""
     estimate: RigPoseEstimate
     """The metric measurement of the rig pair and its evidence."""
-
-
-@dataclass(frozen=True, slots=True)
-class LoopClosureDiagnostics:
-    """Where the candidates went, so a run can be explained without re-running it."""
-
-    enabled: bool
-    """Whether `LoopClosureConfig.enabled` let the stage run at all."""
-    session_duration_seconds: float
-    """`max(timestamp) - min(timestamp)` over the keyframes, in seconds."""
-    min_time_gap_seconds: float
-    """The temporal gap actually applied: `max(fixed threshold, ratio * session duration)`."""
-    good_score_threshold: float
-    """The retrieval score gate actually applied."""
-    queries: int
-    """Query keyframes the stage issued a retrieval for."""
-    candidates_retrieved: int
-    """Retrieval hits the index examined across all queries, before any gate. The gate
-    counters below split exactly this number, because they all come from the same walk."""
-    rejected_by_score: int
-    """Hits dropped by `good_score_threshold`."""
-    rejected_by_time: int
-    """Hits dropped by the temporal gate."""
-    rejected_by_same_rig: int
-    """Hits whose rig frame is the query's own; an intra-rig pair is an extrinsic edge."""
-    after_banding: int
-    """Hits left after `select_best_candidates` over every query."""
-    after_deduplication: int
-    """Rig pairs left after keeping the best-scoring hit per unordered rig pair; this is
-    what the metric estimator is actually run on."""
-    rejected_no_matches: int
-    """Rig pairs whose local map and loop matches yielded too few 2-D-3-D observations."""
-    rejected_by_geometry: int
-    """Rig pairs the generalized PnP failed on outright."""
-    rejected_by_is_good: int
-    """Rig pairs that failed `inliers > min_inliers and inliers / observations > min_inlier_ratio`."""
-    rejected_by_direction: int
-    """Rig pairs whose refined translation direction disagreed with the generalized
-    essential matrix's by more than `RigPoseConfig.max_direction_disagreement_deg`."""
-    verified: int
-    """Rig pairs that produced a metric relative pose."""
-    edges: int
-    """Edges left after `gate_loop_edges`, i.e. what the caller receives."""
-
-
-@dataclass(slots=True)
-class _FunnelCounters:
-    """The running counts of one `find_loop_edges` pass, before they are frozen.
-
-    One declaration of the twelve names, which used to be spelled three times: as string
-    literals in a `dict.fromkeys`, as diagnostics fields, and again in a rejection-to-counter
-    table with an unreachable None key.
-    """
-
-    queries: int = 0
-    """Query keyframes a retrieval was issued for."""
-    candidates_retrieved: int = 0
-    """Retrieval hits the index examined, before any gate."""
-    rejected_by_score: int = 0
-    """Hits dropped by the score gate."""
-    rejected_by_time: int = 0
-    """Hits dropped by the temporal gate."""
-    rejected_by_same_rig: int = 0
-    """Hits whose rig frame is the query's own."""
-    after_banding: int = 0
-    """Hits left after `select_best_candidates`."""
-    after_deduplication: int = 0
-    """Rig pairs left after one hit per unordered rig pair."""
-    rejected_no_matches: int = 0
-    """Rig pairs with too few 2-D-3-D observations."""
-    rejected_by_geometry: int = 0
-    """Rig pairs the generalized PnP failed on."""
-    rejected_by_is_good: int = 0
-    """Rig pairs that failed `is_good_match`."""
-    rejected_by_direction: int = 0
-    """Rig pairs the direction cross-check dropped."""
-    verified: int = 0
-    """Rig pairs that produced a metric relative pose."""
-
-    def count(self, rejection: RigPoseRejection) -> None:
-        """Add one `colsfm.loop_pose` rejection to the counter that owns it.
-
-        Args:
-            rejection: The gate that turned the rig pair down.
-        """
-        reason: RigPoseRejectionReason = rejection.reason
-        if reason == "no_observations":
-            self.rejected_no_matches += 1
-        elif reason == "no_pose":
-            self.rejected_by_geometry += 1
-        elif reason == "too_few_inliers":
-            # The same rule `is_good_match` states, applied one stage earlier.
-            self.rejected_by_is_good += 1
-        else:
-            self.rejected_by_direction += 1
-
-    def freeze(self, *, enabled: bool, duration_seconds: float, gap_seconds: float, score_threshold: float, edges: int) -> LoopClosureDiagnostics:
-        """Turn the counters and the run's resolved gates into the reported diagnostics.
-
-        Args:
-            enabled: Whether the stage ran.
-            duration_seconds: The session duration the gates were derived from.
-            gap_seconds: The temporal gap actually applied.
-            score_threshold: The retrieval score gate actually applied.
-            edges: Edges left after `gate_loop_edges`.
-
-        Returns:
-            The frozen diagnostics.
-        """
-        return LoopClosureDiagnostics(
-            enabled=enabled,
-            session_duration_seconds=duration_seconds,
-            min_time_gap_seconds=gap_seconds,
-            good_score_threshold=score_threshold,
-            edges=edges,
-            **asdict(self),
-        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -632,55 +521,6 @@ def minimum_time_gap_seconds(timestamps_us: Sequence[int], config: LoopClosureCo
     return max(config.loop_interval_threshold_in_seconds, config.loop_closure_interval_ratio * session_duration_seconds(timestamps_us))
 
 
-def select_best_candidates(hits: Sequence[RetrievalHit], band_seconds: float) -> list[RetrievalHit]:
-    """`SelectBestCandidates`: keep one hit per band of `|dt|` (spec §6.4).
-
-    Sorts ascending by `|dt|` and walks greedily: a hit more than `band_seconds` beyond the
-    last emitted one opens a new band, otherwise it replaces the last emitted one when it
-    scores higher. This is what stops a single revisit producing 20 near-duplicate loop
-    edges (spec §7.1 item 5).
-
-    **Departure from the blob, measured.** `SelectBestCandidates` ranks a band first by the
-    geometric inlier count and only then by the retrieval score. Ranking by inliers needs
-    every candidate matched *before* the band is chosen, which is 15 325 image pairs on
-    RoboCap where the banded shortlist needs 6 000 — and the pipeline has to name every pair
-    it will match in one dry run, before any match result exists (`find_loop_edges`). The
-    retrieval score is the only ranking available at that point. Measured on RoboCap the two
-    orders pick nearly the same pairs, because a band is a 10 s window of one revisit and its
-    candidates are near-duplicates of each other.
-
-    Args:
-        hits: Retrieval hits for one query keyframe that passed the score and time gates.
-        band_seconds: Band width in seconds; the blob uses
-            `loop_interval_threshold_in_seconds`.
-
-    Returns:
-        The kept hits, in ascending `|dt|` order.
-    """
-    ordered: list[RetrievalHit] = sorted(hits, key=lambda hit: (abs(hit.delta_seconds), hit.candidate_keyframe_id))
-    kept: list[RetrievalHit] = []
-    last_gap_seconds: float = -np.inf
-    for hit in ordered:
-        gap_seconds: float = abs(hit.delta_seconds)
-        if gap_seconds - last_gap_seconds > band_seconds:
-            kept.append(hit)
-            last_gap_seconds = gap_seconds
-            continue
-        if hit.score > kept[-1].score:
-            kept[-1] = hit
-    return kept
-
-
-# ======================================================================================
-# the database read
-# ======================================================================================
-
-
-# ======================================================================================
-# the stage
-# ======================================================================================
-
-
 @dataclass(frozen=True, slots=True)
 class LoopSearchPlan:
     """Everything the loop search will do, decided before a single match exists.
@@ -723,7 +563,7 @@ class LoopSearchPlan:
     """Rig frames in capture order with their prior poses."""
     keypoints: Mapping[int, Keypoints]
     """Keypoint pixels per image id, read once — 148 MB on RoboCap."""
-    counters: _FunnelCounters
+    counters: FunnelCounters
     """The funnel so far: retrieval's own counters, which `verify_loop_plan` finishes."""
     duration_seconds: float
     """Session length, for the diagnostics."""
@@ -785,7 +625,7 @@ def plan_loop_search(
     duration_seconds: float = session_duration_seconds(list(timestamps_us.values()))
     gap_seconds: float = minimum_time_gap_seconds(list(timestamps_us.values()), config)
     score_threshold: float = GOOD_SCORE_THRESHOLD if config.good_score_threshold is None else config.good_score_threshold
-    counters: _FunnelCounters = _FunnelCounters()
+    counters: FunnelCounters = FunnelCounters()
     empty_geometry: RigGeometry = rig_geometry(frames_meta)
 
     if not config.enabled:
@@ -805,8 +645,16 @@ def plan_loop_search(
             score_threshold=score_threshold,
         )
 
-    shortlist: dict[tuple[int, int], RetrievalHit] = _shortlist_rig_pairs(
-        frames_meta, index, config, keyframe_by_id, timestamps_us, gap_seconds, score_threshold, counters
+    shortlist: dict[tuple[int, int], RetrievalHit] = shortlist_rig_pairs(
+        frames_meta,
+        index,
+        keyframe_by_id,
+        timestamps_us,
+        top_k=config.top_k,
+        candidate_band_seconds=config.candidate_band_seconds,
+        gap_seconds=gap_seconds,
+        score_threshold=score_threshold,
+        counters=counters,
     )
     pixels: Mapping[int, Keypoints] = (
         read_keypoints_batch(database_path, index.image_ids, dtype=np.float64) if keypoints is None else keypoints
@@ -923,127 +771,6 @@ def find_loop_edges(
     return verify_loop_plan(plan_loop_search(frames_meta, database_path, index, config, keypoints), match_fn)
 
 
-def _query_camera_ids(frames_meta: FramesMeta) -> set[int]:
-    """Camera ids allowed to issue a retrieval query.
-
-    Both blob paths query the **left** camera of each declared stereo pair and skip the rest
-    ("Skip, due to frame N is not a left camera frame"). Metadata that declares no stereo
-    pair has no left camera to pick, so every camera queries.
-
-    Args:
-        frames_meta: The parsed metadata.
-
-    Returns:
-        The camera ids that may issue a query.
-    """
-    if not frames_meta.stereo_pairs:
-        return set(frames_meta.cameras)
-    return {pair.left_camera_params_id for pair in frames_meta.stereo_pairs}
-
-
-def _hits_for_query(
-    query: KeyframeMeta,
-    source_rig_id: int,
-    answer: RetrievalQuery,
-    keyframe_by_id: Mapping[int, KeyframeMeta],
-    score_threshold: float,
-    counters: _FunnelCounters,
-) -> list[RetrievalHit]:
-    """Turn one query keyframe's retrieval answer into gated hits.
-
-    Args:
-        query: The query keyframe.
-        source_rig_id: `synced_sample_id` of the query keyframe's rig frame.
-        answer: What `RetrievalIndex.search` returned for it.
-        keyframe_by_id: Every keyframe, indexed by id.
-        score_threshold: The resolved retrieval score gate.
-        counters: Diagnostic counters, mutated in place.
-
-    Returns:
-        The hits that passed the score and same-rig gates, in retrieval order.
-    """
-    counters.candidates_retrieved += len(answer.candidates) + answer.rejected_by_time
-    counters.rejected_by_time += answer.rejected_by_time
-    hits: list[RetrievalHit] = []
-    for candidate in answer.candidates:
-        if candidate.score < score_threshold:
-            counters.rejected_by_score += 1
-            continue
-        target: KeyframeMeta | None = keyframe_by_id.get(candidate.image_id)
-        if target is None:
-            continue
-        if target.synced_sample_id == source_rig_id:
-            counters.rejected_by_same_rig += 1
-            continue
-        hits.append(
-            RetrievalHit(
-                query_keyframe_id=query.keyframe_id,
-                candidate_keyframe_id=target.keyframe_id,
-                source_rig_id=source_rig_id,
-                target_rig_id=target.synced_sample_id,
-                score=candidate.score,
-                delta_seconds=(query.timestamp_microseconds - target.timestamp_microseconds) / MICROSECONDS_PER_SECOND,
-            )
-        )
-    return hits
-
-
-def _shortlist_rig_pairs(
-    frames_meta: FramesMeta,
-    index: RetrievalIndex,
-    config: LoopClosureConfig,
-    keyframe_by_id: Mapping[int, KeyframeMeta],
-    timestamps_us: Mapping[int, int],
-    gap_seconds: float,
-    score_threshold: float,
-    counters: _FunnelCounters,
-) -> dict[tuple[int, int], RetrievalHit]:
-    """Retrieve, gate, band and deduplicate down to one hit per unordered rig pair.
-
-    The blob applies the time gate AFTER retrieval, so temporal neighbours eat slots out of
-    its top-20 and it needs an early abort when more than half the hits are too close
-    (spec §6.4). `RetrievalIndex.search` applies it inside the ranking walk instead, which
-    keeps all `top_k` slots useful and reports what the gate dropped from the same walk.
-
-    Args:
-        frames_meta: The parsed metadata.
-        index: The retrieval index.
-        config: Gates and thresholds.
-        keyframe_by_id: Every keyframe, indexed by id.
-        timestamps_us: Capture time per keyframe id.
-        gap_seconds: The temporal gate actually applied.
-        score_threshold: The resolved retrieval score gate.
-        counters: Diagnostic counters, mutated in place.
-
-    Returns:
-        The best-scoring hit per unordered rig pair, keyed by that pair.
-    """
-    query_camera_ids: set[int] = _query_camera_ids(frames_meta)
-    gap_us: int = round(gap_seconds * MICROSECONDS_PER_SECOND)
-    indexed: set[int] = set(index.image_ids)
-
-    banded: list[RetrievalHit] = []
-    for rig in frames_meta.rig_frames():
-        for query_id in rig.keyframe_ids:
-            query: KeyframeMeta = keyframe_by_id[query_id]
-            if query.camera_params_id not in query_camera_ids or query_id not in indexed:
-                continue
-            counters.queries += 1
-            answer: RetrievalQuery = index.search(query_id, top_k=config.top_k, min_time_gap_us=gap_us, timestamps=timestamps_us)
-            for_query: list[RetrievalHit] = _hits_for_query(query, rig.synced_sample_id, answer, keyframe_by_id, score_threshold, counters)
-            banded.extend(select_best_candidates(for_query, config.candidate_band_seconds))
-
-    counters.after_banding = len(banded)
-    shortlist: dict[tuple[int, int], RetrievalHit] = {}
-    for hit in banded:
-        key: tuple[int, int] = (min(hit.source_rig_id, hit.target_rig_id), max(hit.source_rig_id, hit.target_rig_id))
-        incumbent: RetrievalHit | None = shortlist.get(key)
-        if incumbent is None or hit.score > incumbent.score:
-            shortlist[key] = hit
-    counters.after_deduplication = len(shortlist)
-    return shortlist
-
-
 def _group_by_source_rig(shortlist: Mapping[tuple[int, int], RetrievalHit]) -> list[tuple[int, tuple[RetrievalHit, ...]]]:
     """Order the shortlist deterministically and gather it by source rig frame.
 
@@ -1067,7 +794,7 @@ def _measure_groups(
     groups: list[tuple[int, tuple[RetrievalHit, ...]]],
     estimator: RigPoseEstimator,
     config: LoopClosureConfig,
-    counters: _FunnelCounters,
+    counters: FunnelCounters,
 ) -> list[LoopCandidate]:
     """Run the metric rig-to-rig estimator over the planned measurement groups.
 
