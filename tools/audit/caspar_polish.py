@@ -49,13 +49,13 @@ from colsfm.config import BundleAdjustmentConfig, CusfmConfig, LossFunctionType,
 from colsfm.export import write_colmap_model, write_optimised_frames_meta, write_pose_files
 from colsfm.frames_meta import FramesMeta, read_frames_meta
 from colsfm.mapping import (
-    BRIEF_REPORT_PATTERN,
     MappingOptions,
     bundle_adjustment_options,
     registered_image_ids,
     solve_bundle_adjustment,
 )
 from colsfm.pipeline import optimised_camera_poses
+from colsfm.solver_report import SolverReport, parse_brief_report
 
 Positions: TypeAlias = Float64[ndarray, "n 3"]
 
@@ -108,12 +108,12 @@ class SolveReport:
     """Observations in the model; likewise unchanged."""
     gauge_frame_id: int
     """The one frame whose `rig_from_world` was held constant."""
-    ba_num_iterations: int
-    """Ceres iterations, from `brief_report()`."""
-    ba_initial_cost: float
-    """Cost of the model as it came off disk."""
-    ba_final_cost: float
-    """Cost after the solve."""
+    ba_num_iterations: int | None
+    """Ceres iterations, from `brief_report()`; None when the solver published none."""
+    ba_initial_cost: float | None
+    """Cost of the model as it came off disk; None when the solver published none."""
+    ba_final_cost: float | None
+    """Cost after the solve; None when the solver published none."""
     ba_termination: str
     """`BundleAdjustmentSummary.termination_type`."""
     solve_seconds: float
@@ -160,21 +160,6 @@ def load_reconstruction(sparse_dir: Path) -> pycolmap.Reconstruction:
     reconstruction: pycolmap.Reconstruction = pycolmap.Reconstruction(str(sparse_dir))
     reconstruction.update_point_3d_errors()
     return reconstruction
-
-
-def parse_brief_report(summary: pycolmap.BundleAdjustmentSummary) -> tuple[int, float, float]:
-    """Read iterations and costs out of Ceres' one-line report.
-
-    Args:
-        summary: The solver summary.
-
-    Returns:
-        Iterations, initial cost and final cost; zeros when the report does not parse.
-    """
-    match = BRIEF_REPORT_PATTERN.search(summary.brief_report())
-    if match is None:
-        return 0, 0.0, 0.0
-    return int(match.group(1)), float(match.group(2)), float(match.group(3))
 
 
 def rig_track_of(reconstruction: pycolmap.Reconstruction, template: FramesMeta) -> RigTrack:
@@ -245,7 +230,7 @@ def polish(config: PolishConfig) -> SolveReport:
 
     displacement_m: Float64[ndarray, "n"] = np.linalg.norm(after_track.world_t_rig - before_track.world_t_rig, axis=1)
     fit: RigidAlignment = align_rigid(before_track.world_t_rig, after_track.world_t_rig, estimate_scale=True)
-    iterations, initial_cost, final_cost = parse_brief_report(summary)
+    solver: SolverReport = parse_brief_report(summary.brief_report())
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
     write_colmap_model(config.output_dir, reconstruction)
@@ -262,9 +247,9 @@ def polish(config: PolishConfig) -> SolveReport:
         num_points3D=reconstruction.num_points3D(),
         num_observations=num_observations,
         gauge_frame_id=gauge_frame_id,
-        ba_num_iterations=iterations,
-        ba_initial_cost=initial_cost,
-        ba_final_cost=final_cost,
+        ba_num_iterations=solver.num_iterations,
+        ba_initial_cost=solver.initial_cost,
+        ba_final_cost=solver.final_cost,
         ba_termination=summary.termination_type.name,
         solve_seconds=solve_seconds,
         mean_reprojection_error_before_px=before_reprojection_px,
@@ -279,6 +264,23 @@ def polish(config: PolishConfig) -> SolveReport:
     return report
 
 
+NOT_REPORTED: Final[str] = "not reported"
+"""Table entry for a statistic the solver did not publish; never a zero."""
+
+
+def format_optional(value: float | None, spec: str) -> str:
+    """Render a statistic that the solver may not have published.
+
+    Args:
+        value: The number, or None when the solver reported none.
+        spec: Format specification applied when the number exists.
+
+    Returns:
+        The formatted number, or `NOT_REPORTED`.
+    """
+    return NOT_REPORTED if value is None else format(value, spec)
+
+
 def main(config: PolishConfig) -> None:
     """Polish one model and print the numbers the experiment needs.
 
@@ -286,13 +288,17 @@ def main(config: PolishConfig) -> None:
         config: Parsed command-line configuration.
     """
     report: SolveReport = polish(config)
+    solver: SolverReport = SolverReport(
+        num_iterations=report.ba_num_iterations, initial_cost=report.ba_initial_cost, final_cost=report.ba_final_cost
+    )
     print()
     print(f"| metric | {report.label} |")
     print("|---|---:|")
-    print(f"| Ceres iterations | {report.ba_num_iterations} |")
-    print(f"| initial cost | {report.ba_initial_cost:.6g} |")
-    print(f"| final cost | {report.ba_final_cost:.6g} |")
-    print(f"| cost reduction | {1.0 - report.ba_final_cost / report.ba_initial_cost:.4%} |")
+    iterations: str = NOT_REPORTED if report.ba_num_iterations is None else str(report.ba_num_iterations)
+    print(f"| Ceres iterations | {iterations} |")
+    print(f"| initial cost | {format_optional(report.ba_initial_cost, '.6g')} |")
+    print(f"| final cost | {format_optional(report.ba_final_cost, '.6g')} |")
+    print(f"| cost reduction | {format_optional(solver.cost_reduction, '.4%')} |")
     print(f"| termination | {report.ba_termination} |")
     print(f"| solve seconds | {report.solve_seconds:.1f} |")
     print(f"| mean reprojection before (px) | {report.mean_reprojection_error_before_px:.4f} |")

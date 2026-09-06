@@ -26,19 +26,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, TypeAlias
 
-import numpy as np
 import tyro
 from jaxtyping import Int64
 from numpy import ndarray
 from serde import serde
 
 from colsfm.benchmark import RigTrack, read_run, rig_track_from_frames_meta, write_json_report
-from tools.audit.galileo_metrics import (
-    GalileoReference,
-    TrajectoryScore,
-    read_galileo_reference,
-    score_track_against_ground_truth,
-)
+from colsfm.trajectory import TrajectoryScore, indices_of_timestamps, score_track_against_ground_truth
+from tools.audit.galileo_metrics import GalileoReference, read_galileo_reference
 
 
 @dataclass(frozen=True)
@@ -98,14 +93,7 @@ def _score_on_timestamps(track: RigTrack, reference: GalileoReference, keep_micr
     Returns:
         The score.
     """
-    selected: Int64[ndarray, "m"] = (
-        np.arange(len(track), dtype=np.int64)
-        if keep_microseconds is None
-        else np.asarray(
-            [index for index, stamp in enumerate(track.timestamps_microseconds) if int(stamp) in keep_microseconds],
-            dtype=np.int64,
-        )
-    )
+    selected: Int64[ndarray, "m"] = indices_of_timestamps(track, keep_microseconds)
     return score_track_against_ground_truth(track.take(selected), reference.ground_truth)
 
 
