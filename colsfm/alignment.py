@@ -30,11 +30,13 @@ is one consumer of these primitives, and `tools/audit` is another.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
 import numpy as np
+import pycolmap
 from jaxtyping import Bool, Int64
 from numpy import ndarray
 from scipy.spatial.transform import Rotation
@@ -66,6 +68,7 @@ __all__ = [
     "read_ground_truth",
     "rig_rigidity_spread_millimeters",
     "rig_track_from_frames_meta",
+    "rig_track_of",
 ]
 """What this module offers, its own and `colsfm.rigid_fit`'s.
 
@@ -115,6 +118,30 @@ class RigTrack:
         )
 
 
+def rig_track_of(poses: Sequence[tuple[int, pycolmap.Rigid3d]]) -> RigTrack:
+    """Stack timestamped rig poses into a trajectory.
+
+    The one place `(timestamp, world_T_vehicle)` becomes three parallel arrays, so
+    that a track derived from the metadata and one derived from a reconstruction are
+    the same object built the same way. `colsfm.trajectory` carried a second copy of
+    this stacking.
+
+    Args:
+        poses: `(timestamp in microseconds, world_T_vehicle)` per sample, in the
+            order the track should hold them.
+
+    Returns:
+        The trajectory; empty arrays of the right rank when nothing was given.
+    """
+    return RigTrack(
+        timestamps_microseconds=np.asarray([timestamp for timestamp, _ in poses], dtype=np.int64),
+        world_t_rig=np.asarray([pose.translation for _, pose in poses], dtype=np.float64).reshape(-1, 3),
+        world_R_rig=np.asarray(
+            [Rotation.from_quat(pose.rotation.quat).as_matrix() for _, pose in poses], dtype=np.float64
+        ).reshape(-1, 3, 3),
+    )
+
+
 def rig_track_from_frames_meta(frames_meta: FramesMeta, keep_image_names: set[str] | None = None) -> RigTrack:
     """Build the rig trajectory a `frames_meta.json` implies.
 
@@ -139,13 +166,7 @@ def rig_track_from_frames_meta(frames_meta: FramesMeta, keep_image_names: set[st
             if names.isdisjoint(keep_image_names):
                 continue
         frames.append(rig_frame)
-    return RigTrack(
-        timestamps_microseconds=np.asarray([frame.timestamp_microseconds for frame in frames], dtype=np.int64),
-        world_t_rig=np.asarray([frame.world_T_vehicle.translation for frame in frames], dtype=np.float64).reshape(-1, 3),
-        world_R_rig=np.asarray(
-            [Rotation.from_quat(frame.world_T_vehicle.rotation.quat).as_matrix() for frame in frames], dtype=np.float64
-        ).reshape(-1, 3, 3),
-    )
+    return rig_track_of([(frame.timestamp_microseconds, frame.world_T_vehicle) for frame in frames])
 
 
 def rig_rigidity_spread_millimeters(frames_meta: FramesMeta) -> float:

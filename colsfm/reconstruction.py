@@ -204,6 +204,28 @@ def rig_reference(frames_meta: FramesMeta, reference_camera_params_id: int | Non
     )
 
 
+def cam_from_rig_by_camera_params_id(frames_meta: FramesMeta, reference: RigReference) -> dict[int, pycolmap.Rigid3d]:
+    """`sensor_from_rig` per camera against a chosen rig origin.
+
+    `cam_i_T_cam_ref = cam_i_T_vehicle * vehicle_T_cam_ref`, which is what `build_rig`
+    writes into the reconstruction and what `colsfm.rig_calibration` compares a
+    mapper's answer against. One expression, so a comparison against the calibration
+    cannot be measuring a different calibration.
+
+    Args:
+        frames_meta: The parsed metadata.
+        reference: The rig origin and its `vehicle_T_cam_ref` bridge.
+
+    Returns:
+        `cam_from_rig` per `camera_params_id`, ascending; the reference camera's is
+        the identity by construction.
+    """
+    return {
+        camera_params_id: camera.vehicle_T_cam.inverse() * reference.vehicle_T_reference
+        for camera_params_id, camera in sorted(frames_meta.cameras.items())
+    }
+
+
 def build_rig(frames_meta: FramesMeta, reference_camera_params_id: int | None = None) -> pycolmap.Rig:
     """Build the rig: one sensor per `camera_params_id`, posed against the reference.
 
@@ -223,10 +245,10 @@ def build_rig(frames_meta: FramesMeta, reference_camera_params_id: int | None = 
     rig: pycolmap.Rig = pycolmap.Rig()
     rig.rig_id = RIG_ID
     rig.add_ref_sensor(reference.sensor_id())
-    for camera_params_id, camera in sorted(frames_meta.cameras.items()):
+    for camera_params_id, cam_from_rig in cam_from_rig_by_camera_params_id(frames_meta, reference).items():
         if camera_params_id == reference_camera_params_id:
             continue
-        rig.add_sensor(camera_sensor_id(camera_params_id), camera.vehicle_T_cam.inverse() * reference.vehicle_T_reference)
+        rig.add_sensor(camera_sensor_id(camera_params_id), cam_from_rig)
     return rig
 
 

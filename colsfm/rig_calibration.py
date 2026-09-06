@@ -28,7 +28,7 @@ from serde import serde
 
 from colsfm.frames_meta import CameraParams, FramesMeta
 from colsfm.geometry import MILLIMETRES_PER_METRE, relative_rotation_degrees
-from colsfm.reconstruction import RigReference
+from colsfm.reconstruction import RigReference, cam_from_rig_by_camera_params_id
 
 
 @serde
@@ -65,8 +65,9 @@ class ExtrinsicChange:
 def calibrated_cam_from_rig(frames_meta: FramesMeta, reference: RigReference) -> dict[int, pycolmap.Rigid3d]:
     """The calibration's `cam_from_rig` per camera, the reference at identity.
 
-    `cam_i_T_cam_ref = cam_i_T_vehicle * vehicle_T_cam_ref`, which is what
-    `colsfm.reconstruction.build_rig` writes into a cuSFM reconstruction.
+    `colsfm.reconstruction.cam_from_rig_by_camera_params_id` is the algebra, and
+    `build_rig` writes the very same transforms into a cuSFM reconstruction — which
+    is the point: this function's answer has to be what the mapper was given.
 
     Args:
         frames_meta: The parsed metadata.
@@ -75,10 +76,7 @@ def calibrated_cam_from_rig(frames_meta: FramesMeta, reference: RigReference) ->
     Returns:
         `cam_from_rig` per `camera_params_id`.
     """
-    return {
-        camera_params_id: camera.vehicle_T_cam.inverse() * reference.vehicle_T_reference
-        for camera_params_id, camera in sorted(frames_meta.cameras.items())
-    }
+    return cam_from_rig_by_camera_params_id(frames_meta, reference)
 
 
 def rig_config(frames_meta: FramesMeta, reference: RigReference) -> pycolmap.RigConfig:

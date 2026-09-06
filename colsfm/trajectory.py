@@ -28,7 +28,7 @@ from typing import Final
 
 import numpy as np
 import pycolmap
-from jaxtyping import Float64, Int64
+from jaxtyping import Int64
 from numpy import ndarray
 
 from colsfm.alignment import (
@@ -38,6 +38,7 @@ from colsfm.alignment import (
     RigTrack,
     align_rigid,
     match_timestamps,
+    rig_track_of,
 )
 from colsfm.frames_meta import CameraParams, FramesMeta, KeyframeMeta
 from colsfm.geometry import MILLIMETRES_PER_METRE, Vector3
@@ -179,22 +180,19 @@ def rig_track_from_reconstruction(
         if keyframe.image_name in world_T_cam_by_name:
             members.setdefault(keyframe.synced_sample_id, []).append(keyframe)
 
-    timestamps: list[int] = []
-    positions: list[Float64[ndarray, "3"]] = []
-    rotations: list[Float64[ndarray, "3 3"]] = []
+    poses: list[tuple[int, pycolmap.Rigid3d]] = []
     for synced_sample_id in sorted(members):
         reference: KeyframeMeta = min(members[synced_sample_id], key=lambda item: item.keyframe_id)
         camera: CameraParams = frames_meta.cameras[reference.camera_params_id]
-        world_T_vehicle: pycolmap.Rigid3d = world_T_cam_by_name[reference.image_name] * camera.vehicle_T_cam.inverse()
-        timestamps.append(reference.timestamp_microseconds)
-        positions.append(np.asarray(world_T_vehicle.translation, dtype=np.float64))
-        rotations.append(world_T_vehicle.rotation.matrix().astype(np.float64))
-
-    return RigTrack(
-        timestamps_microseconds=np.asarray(timestamps, dtype=np.int64),
-        world_t_rig=np.asarray(positions, dtype=np.float64).reshape(-1, 3),
-        world_R_rig=np.asarray(rotations, dtype=np.float64).reshape(-1, 3, 3),
-    )
+        poses.append(
+            (
+                reference.timestamp_microseconds,
+                world_T_cam_by_name[reference.image_name] * camera.vehicle_T_cam.inverse(),
+            )
+        )
+    # The stacking is `colsfm.alignment`'s: a track built from a reconstruction and one
+    # built from the metadata have to be the same three arrays, built the same way.
+    return rig_track_of(poses)
 
 
 def image_center_score(
