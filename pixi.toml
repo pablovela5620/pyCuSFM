@@ -10,6 +10,8 @@ python = "3.12.*"
 pyyaml = "*"
 pillow = "*"
 setuptools = "<78"
+# `hf download` fetches the KITTI 06 mirror in `_download-kitti06`.
+huggingface_hub = "*"
 # ── Rerun demo side (demo_rerun.py) ──
 # rerun-sdk comes from PyPI (below): 0.37.1 is not on conda-forge yet (0.37.0 is).
 numpy = "*"
@@ -44,6 +46,10 @@ simplecv = { git = "https://github.com/rerun-io/examples-monorepo.git", subdirec
 tyro = ">=0.9.1"
 jaxtyping = "*"
 beartype = "*"
+# `evo_ape` scores KITTI 06 against the official ground truth. Kept as the
+# reference implementation of Sim(3)-aligned ATE so the number the demo prints
+# itself is cross-checked against a tool nobody here wrote.
+evo = "*"
 
 [pypi-options.dependency-overrides]
 tensorrt-cu12 = "==10.13.3.9.post1"
@@ -124,3 +130,23 @@ demo-upstream = { cmd = """bash -o pipefail -ec '
     --cusfm_base_dir data/cusfm_runs/galileo 2>&1 \
     | tee data/cusfm_runs/galileo/demo-upstream.log
 '""", depends-on = ["setup-cuda13", "prepare-galileo-output"] }
+
+# ── KITTI 06 reproduction ────────────────────────────────────────────────────
+# Guarded: both downloads are skipped once their marker file is on disk, so
+# `pixi run kitti06` is cheap to re-run.
+#
+# Imagery comes from a third-party Hugging Face mirror of KITTI odometry
+# sequence 06, pinned to one revision. That mirror carries no poses, so the
+# ground truth is fetched separately from the official KITTI archive (no login)
+# and its md5 is checked -- a silently different pose file would move every
+# reported number.
+_download-kitti06 = { cmd = "mkdir -p data/kitti/dataset/sequences/06 && ([ -f data/kitti/dataset/sequences/06/calib.txt ] || hf download yujie2696/kitti_odometry_06 --repo-type dataset --revision 9ce62e03c1ae82b7f8e013808cb68a22dc82fe88 --local-dir data/kitti/dataset/sequences/06) && ln -sfn dataset/sequences/06 data/kitti/06 && ([ -f data/kitti/06/poses_gt_06.txt ] || (curl -fsSL -o data/kitti/dataset/data_odometry_poses.zip https://s3.eu-central-1.amazonaws.com/avg-kitti/data_odometry_poses.zip && unzip -o -j data/kitti/dataset/data_odometry_poses.zip dataset/poses/06.txt -d data/kitti/dataset && echo '7247b3fe2ef8ccbfa6ddb7801132c2b4  data/kitti/dataset/06.txt' | md5sum -c - && mv data/kitti/dataset/06.txt data/kitti/06/poses_gt_06.txt))", description = "Fetch KITTI odometry 06 imagery (HF mirror) and the official ground-truth poses" }
+
+# The upstream converter ignores its own --output-name flag and always writes
+# keyframe_meta.json, while the pipeline reads frames_meta.json -- hence the cp.
+# The script is upstream and stays unedited.
+kitti06 = { cmd = "python data/kitti/get_framemeta_file_for_KITTI.py data/kitti/06 && cp data/kitti/06/keyframe_meta.json data/kitti/06/frames_meta.json && python demo_rerun.py --rr-config.headless --rr-config.save data/kitti/06_result_slam/kitti06.rrd dataset:kitti06 && evo_ape tum data/kitti/06/poses_gt_06.tum data/kitti/06_result_slam/output_poses/merged_pose_file.tum -as", depends-on = ["setup-cuda13", "_download-kitti06"], description = "Reproduce the paper's KITTI 06 experiment end to end and score it with evo" }
+
+# Re-score an existing run: reuses the COLMAP model on disk (no cuSFM, no
+# cuVSLAM), rewrites the ground-truth TUM, re-logs the recording, and re-runs evo.
+kitti06-eval = { cmd = "python demo_rerun.py --run.skip-reconstruction --rr-config.headless --rr-config.save data/kitti/06_result_slam/kitti06.rrd dataset:kitti06 && evo_ape tum data/kitti/06/poses_gt_06.tum data/kitti/06_result_slam/output_poses/merged_pose_file.tum -as", depends-on = ["setup-cuda13"], description = "Re-score an existing KITTI 06 run without re-running cuSFM" }

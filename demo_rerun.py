@@ -1,6 +1,6 @@
 """Run cuSFM on a posed multi-camera sequence and visualise it in Rerun.
 
-Two datasets, one code path:
+Three datasets, one code path:
 
 - ``galileo``  — the bundled ``data/r2b_galileo`` sample: 8 PINHOLE cameras on a
   ground robot, 226 keyframes, and a ``ground_truth.txt`` trajectory.
@@ -8,10 +8,14 @@ Two datasets, one code path:
   cameras on a head-worn rig, with a per-frame basalt VIO trajectory already
   in the recording. Only the 4 world-facing cameras are reconstructed; the two
   inward-facing eye-tracking cameras are shown as greyed frusta.
+- ``kitti06`` — KITTI odometry sequence 06: a stereo pair on a car, 1101 frames
+  over a 1233 m loop, with the benchmark's own ground truth. This is the paper's
+  Table 4 experiment.
 
-Both datasets already carry an initial trajectory, so cuVSLAM is skipped
+galileo and robocap already carry an initial trajectory, so cuVSLAM is skipped
 (``--skip_cuvslam``) and cuSFM's global bundle adjustment *refines* the given
-poses. The point of the demo is to make that refinement visible.
+poses. The point of the demo is to make that refinement visible. KITTI ships no
+poses at all, so there cuVSLAM runs first and its trajectory becomes the input.
 
 Output follows the ``exoego:v2`` rig schema (see simplecv's
 ``packages/simplecv/docs/exoego_schema.md``), with **two rigs** under one world::
@@ -48,7 +52,7 @@ import shutil
 import subprocess
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Annotated, Literal, TypeAlias, cast
@@ -130,6 +134,16 @@ CUSFM_POSE_GRAPH_DIR: str = _cusfm_constants.kPOSE_GRAPH_DIR
 CUSFM_OUTPUT_POSES_DIR: str = _cusfm_constants.kOUTPUT_POSES_DIR
 CUSFM_MERGED_POSE_FILE: str = _cusfm_constants.kMERGED_POSE_FILE
 CUSFM_FRAME_META_FILE: str = _cusfm_constants.kFRAME_META_FILE
+CUSFM_CUVSLAM_DIR: str = _cusfm_constants.kCUVSLAM_OUTPUT_DIR
+CUSFM_SLAM_POSES_FILE: str = _cusfm_constants.kSLAM_POSES_FILE
+CUSFM_ODOM_POSES_FILE: str = _cusfm_constants.kODOM_POSES_FILE
+
+KITTI_CONFIG_DIR: Path = Path(__file__).resolve().parent / "data" / "kitti" / "config"
+"""Upstream's KITTI configs, shipped in this repo and used unmodified.
+
+They are not ``pycusfm/configs/isaac``: KITTI's are tuned for a forward-driving
+stereo car (different keypoint counts, matching gates and pose-graph weights), and
+running sequence 06 through the isaac profile is not the paper's experiment."""
 
 LOOP_CLOSURE_CONFIG_DIR: Path = (
     Path(__file__).resolve().parent / "data" / "cusfm_configs" / "loop-closure-fixed"
@@ -231,6 +245,37 @@ class GalileoConfig:
     """Frustum length in metres (a ground robot, so larger than the headset)."""
 
 
+@dataclass
+class KittiConfig:
+    """Reproduce the paper's KITTI odometry 06 experiment (stereo car, no input poses)."""
+
+    input_dir: Path = Path("data/kitti/06")
+    """Sequence directory: ``image_0/``, ``image_1/``, ``calib.txt``, ``times.txt``,
+    and the ``frames_meta.json`` that ``data/kitti/get_framemeta_file_for_KITTI.py``
+    produces. ``pixi run kitti06`` creates all of it; nothing here is committed."""
+    result_dir: Path = Path("data/kitti/06_result_slam")
+    """cuSFM workspace. Named for what it holds — a run initialised from cuVSLAM's
+    *SLAM* poses, which is what the paper's baseline needs."""
+    ground_truth: Path = Path("data/kitti/06/poses_gt_06.txt")
+    """KITTI odometry ground truth (the benchmark's ``poses/06.txt``): 1101 rows of a
+    row-major 3x4 ``world_T_cam0``. The upstream converter puts the vehicle frame on
+    camera 0, so these poses need no frame change to be comparable."""
+    ground_truth_tum: Path = Path("data/kitti/06/poses_gt_06.tum")
+    """Where to write the ground truth in TUM form for ``evo_ape``.
+
+    Timestamps go through the same ``int(seconds * 1e6)`` truncation the upstream
+    converter applies to ``times.txt``, so they match cuSFM's TUM output exactly and
+    evo associates every frame instead of silently dropping some to its 0.01 s
+    matching window."""
+    image_stride: int = 10
+    """Log a stereo pair every Nth sample. KITTI's PNGs are ~270 KB each, so stride 1
+    would put ~590 MB of imagery in the recording; 10 keeps it near 60 MB and still
+    shows the drive. Visualisation only — cuSFM is given every frame either way."""
+    image_plane_distance: float = 2.0
+    """Frustum length in metres: a car over a 1233 m loop, so far larger than the
+    ground robot and the headset."""
+
+
 DatasetConfig: TypeAlias = (
     Annotated[
         RobocapConfig,
@@ -239,6 +284,10 @@ DatasetConfig: TypeAlias = (
     | Annotated[
         GalileoConfig,
         tyro.conf.subcommand("galileo", description="Bundled r2b_galileo pinhole sample (has ground truth)"),
+    ]
+    | Annotated[
+        KittiConfig,
+        tyro.conf.subcommand("kitti06", description="KITTI odometry 06; cuVSLAM supplies the initial poses"),
     ]
 )
 
@@ -303,6 +352,14 @@ class RunConfig:
     *independent* third trajectory. That matters because the supplied basalt
     trajectory is pure multi-camera VIO with no loop closure or mapping, so it
     drifts too and is not ground truth."""
+    use_cuvslam_slam_pose: bool = False
+    """Initialise cuSFM from cuVSLAM's loop-closed *SLAM* trajectory instead of its
+    raw odometry. Only read when cuVSLAM actually runs, so it pairs with
+    ``--run.no-skip-cuvslam``.
+
+    Not cosmetic on KITTI 06: odometry alone scores 2.37 m Sim(3) ATE against the
+    benchmark ground truth and SLAM 1.34 m, and cuSFM refines whatever it is handed
+    rather than recovering from a bad initialisation."""
     downsampling_matches: bool = True
     """cuSFM's ``isaac`` profile downsamples which image pairs get matched
     (``max_keyframes_per_collection: 6`` per 10 s window). That suits a vehicle
@@ -410,6 +467,51 @@ def umeyama_rigid(
     return rotation, translation, rmse, would_be_scale
 
 
+def trajectory_length(positions: Float[ndarray, "n 3"]) -> float:
+    """Total distance travelled along a polyline, in metres."""
+    return float(np.linalg.norm(np.diff(positions, axis=0), axis=1).sum()) if len(positions) > 1 else 0.0
+
+
+def sim3_ate(
+    estimate: Float[ndarray, "n 3"], reference: Float[ndarray, "n 3"]
+) -> tuple[float, float]:
+    """Sim(3)-aligned absolute trajectory error (RMSE, metres) and the fitted scale.
+
+    The rigid fit above deliberately holds scale at 1; this one does not, because
+    the KITTI odometry benchmark and the cuSFM paper both report Sim(3)-aligned ATE.
+    Mixing the two conventions is how a 1.3 m result is misread as a 3 m one, so the
+    scale is returned and printed rather than absorbed silently. It is reused rather
+    than reimplemented: ``umeyama_rigid`` already computes the optimal rotation and
+    the scale it *would* have fitted, and only the translation has to be recomputed
+    with the scale applied.
+    """
+    rotation, _, _, scale = umeyama_rigid(estimate, reference)
+    translation: Float64[ndarray, "3"] = reference.mean(axis=0) - scale * rotation @ estimate.mean(axis=0)
+    residual: Float64[ndarray, "n 3"] = (scale * (estimate @ rotation.T) + translation) - reference
+    return float(np.sqrt((residual**2).sum(axis=1).mean())), scale
+
+
+def match_timestamps(
+    left_ns: Int[ndarray, "n"], right_ns: Int[ndarray, "m"]
+) -> tuple[Int[ndarray, "k"], Int[ndarray, "k"]]:
+    """Index pairs where two timelines name the same microsecond.
+
+    Exact, not nearest-neighbour, and matched at microsecond rather than nanosecond
+    granularity: every timeline joined here descends from the same
+    ``int(seconds * 1e6)`` truncation that ``get_framemeta_file_for_KITTI.py``
+    applies, and cuSFM prints those microseconds back out as decimal seconds. A
+    tolerance would only hide it when that contract breaks.
+    """
+    lookup: dict[int, int] = {int(value) // 1000: index for index, value in enumerate(right_ns)}
+    pairs: list[tuple[int, int]] = [
+        (index, lookup[int(value) // 1000]) for index, value in enumerate(left_ns) if int(value) // 1000 in lookup
+    ]
+    if not pairs:
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64)
+    left_index, right_index = zip(*pairs, strict=True)
+    return np.asarray(left_index, dtype=np.int64), np.asarray(right_index, dtype=np.int64)
+
+
 def interpolate_poses(
     query_ns: Int[ndarray, "m"],
     source_ns: Int[ndarray, "n"],
@@ -495,6 +597,13 @@ class PreparedSequence:
     ``cam_00`` as the reference camera; this value overrides the schema metadata
     with the true origin instead. Do not make the tint and metadata agree by moving
     the rig frame to the camera."""
+    input_source: str = "ego-motion"
+    """Provenance of ``world_T_rig``, shown on the rig in the viewer and printed.
+    Never "ground truth": on every dataset here the input trajectory is an estimate."""
+    base_dir: Path | None = None
+    """Explicit cuSFM workspace. ``None`` uses ``run.work_dir/<name><variant>/cusfm``.
+    KITTI pins its own so the run lands beside the sequence, the ground truth and the
+    recording the task writes."""
 
     @property
     def sfm_cameras(self) -> list[PreparedCamera]:
@@ -989,6 +1098,7 @@ def prepare_robocap(config: RobocapConfig, run: RunConfig) -> PreparedSequence:
         image_plane_distance=config.image_plane_distance,
         projection_model="OPENCV_FISHEYE",
         reference_name="imu_00",
+        input_source="basalt VIO",
         full_timestamps_ns=full_times,
         full_world_T_rig=full_world_T_rig,
         keyframe_mask=keyframe_mask,
@@ -1010,7 +1120,7 @@ def prepare_robocap(config: RobocapConfig, run: RunConfig) -> PreparedSequence:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Galileo: upstream's bundled sample, already in cuSFM's format
+# Datasets already in cuSFM's frames_meta.json format: galileo and KITTI 06
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -1029,12 +1139,14 @@ def from_axis_angle_dict(node: dict) -> Float64[ndarray, "4 4"]:
     return compose(rotation, np.array([translation["x"], translation["y"], translation["z"]], dtype=np.float64))
 
 
-def prepare_galileo(config: GalileoConfig, run: RunConfig) -> PreparedSequence:
-    """Read upstream's bundled ``frames_meta.json`` into the common container."""
-    print(f"[galileo] reading {config.input_dir}")
-    frames_meta: dict = json.loads((config.input_dir / CUSFM_FRAME_META_FILE).read_text())
-    camera_params: dict = frames_meta["camera_params_id_to_camera_params"]
+def read_frames_meta_cameras(frames_meta: dict) -> tuple[list[PreparedCamera], dict[str, str]]:
+    """Read ``camera_params_id_to_camera_params`` into prepared cameras.
 
+    Shared by every dataset that already speaks cuSFM's format. Returns the cameras
+    in ``camera_params_id`` order plus the id-to-sensor-name map that the keyframe
+    records are indexed by.
+    """
+    camera_params: dict = frames_meta["camera_params_id_to_camera_params"]
     cameras: list[PreparedCamera] = []
     id_to_name: dict[str, str] = {}
     for params_id in sorted(camera_params, key=int):
@@ -1055,6 +1167,14 @@ def prepare_galileo(config: GalileoConfig, run: RunConfig) -> PreparedSequence:
                 used_for_sfm=True,
             )
         )
+    return cameras, id_to_name
+
+
+def prepare_galileo(config: GalileoConfig, run: RunConfig) -> PreparedSequence:
+    """Read upstream's bundled ``frames_meta.json`` into the common container."""
+    print(f"[galileo] reading {config.input_dir}")
+    frames_meta: dict = json.loads((config.input_dir / CUSFM_FRAME_META_FILE).read_text())
+    cameras, id_to_name = read_frames_meta_cameras(frames_meta)
 
     # Upstream's frames_meta.json is proto3-serialised, and proto3 drops
     # zero-valued scalar fields — so `camera_params_id: "0"` is simply absent
@@ -1115,6 +1235,224 @@ def prepare_galileo(config: GalileoConfig, run: RunConfig) -> PreparedSequence:
     return sequence
 
 
+
+def prepare_kitti(config: KittiConfig, run: RunConfig) -> PreparedSequence:
+    """Read the KITTI 06 sequence that ``get_framemeta_file_for_KITTI.py`` converted.
+
+    KITTI ships no trajectory, so ``world_T_rig`` is left at identity here and filled
+    in by :func:`attach_cuvslam_trajectory` once cuVSLAM has run inside the pipeline.
+    Nothing between the two reads it: cuSFM is driven by ``frames_meta.json``, and
+    that file is regenerated with cuVSLAM's poses before feature extraction.
+
+    The converter puts the vehicle frame on camera 0 (its
+    ``sensor_to_vehicle_transform`` is a pure baseline offset along X), which is also
+    the frame KITTI's ground truth is written in — so no frame change is ever needed
+    between the ground truth, cuVSLAM's TUM output and cuSFM's vehicle-frame poses.
+    """
+    meta_path: Path = config.input_dir / CUSFM_FRAME_META_FILE
+    if not meta_path.is_file():
+        raise FileNotFoundError(
+            f"{meta_path} is missing. Run `pixi run kitti06`, which downloads the sequence and "
+            f"converts it with data/kitti/get_framemeta_file_for_KITTI.py. That script always "
+            f"writes keyframe_meta.json regardless of --output-name, so the task copies it."
+        )
+    print(f"[kitti06] reading {config.input_dir}")
+    frames_meta: dict = json.loads(meta_path.read_text())
+    cameras, id_to_name = read_frames_meta_cameras(frames_meta)
+
+    grouped: dict[str, dict[str, str]] = {}
+    timestamps_us: dict[str, int] = {}
+    for keyframe in frames_meta["keyframes_metadata"]:
+        sample_id: str = keyframe["synced_sample_id"]
+        grouped.setdefault(sample_id, {})[id_to_name[keyframe["camera_params_id"]]] = keyframe["image_name"]
+        timestamps_us[sample_id] = int(keyframe["timestamp_microseconds"])
+    sample_ids: list[str] = sorted(grouped, key=int)
+
+    image_paths: dict[str, list[Path | None]] = {
+        camera.name: [
+            config.input_dir / grouped[sample_id][camera.name] if camera.name in grouped[sample_id] else None
+            for sample_id in sample_ids
+        ]
+        for camera in cameras
+    }
+    sequence: PreparedSequence = PreparedSequence(
+        name="kitti06",
+        cameras=cameras,
+        timestamps_ns=np.asarray([timestamps_us[sample_id] * 1000 for sample_id in sample_ids], dtype=np.int64),
+        world_T_rig=np.tile(np.eye(4, dtype=np.float64), (len(sample_ids), 1, 1)),
+        image_paths=image_paths,
+        input_dir=config.input_dir,
+        frames_meta_path=meta_path,
+        image_plane_distance=config.image_plane_distance,
+        projection_model="PINHOLE",
+        reference_name="vehicle_00",
+        input_source="cuVSLAM (pending)",
+        base_dir=config.result_dir,
+    )
+    print(f"  {len(sample_ids)} stereo samples, {len(cameras)} cameras (upstream frames_meta.json used as-is)")
+    return sequence
+
+
+def kitti_run_config(run: RunConfig) -> RunConfig:
+    """Apply KITTI 06's published configuration to any knob still at its default.
+
+    tyro picks the dataset through a subcommand but every dataset shares one
+    ``RunConfig``, so ``dataset:kitti06`` would otherwise inherit the RoboCap
+    defaults — fatally ``skip_cuvslam=True``, since KITTI carries no poses at all and
+    cuSFM would be handed identity for every frame.
+
+    Anything set explicitly is left alone, which is why this compares against a fresh
+    ``RunConfig()`` instead of overwriting unconditionally: ``pixi run kitti06`` gets
+    the paper's setup, and ``--run.no-use-cuvslam-slam-pose`` still means what it says.
+    """
+    defaults: RunConfig = RunConfig()
+    published: dict[str, object] = {
+        # Upstream's KITTI profile, unmodified. The loop-closure-repaired isaac copy
+        # that the other two datasets default to is not this experiment.
+        "config_dir": KITTI_CONFIG_DIR,
+        # KITTI has no input trajectory; cuVSLAM has to produce one.
+        "skip_cuvslam": False,
+        # The paper's baseline row is cuVSLAM *SLAM*, not raw odometry.
+        "use_cuvslam_slam_pose": True,
+        # docs/tutorial.md: the paper's experiments used pose-graph optimisation
+        # without the separate data-association stage.
+        "skip_data_association": True,
+        # cuSFM's own default keyframe gate; at 10 Hz and ~11 m/s it keeps almost
+        # every frame, and leaving it at the demo's 0.0 changes which frames the
+        # solver sees.
+        "min_inter_frame_distance": 0.5,
+    }
+    changed: dict[str, object] = {
+        name: value for name, value in published.items() if getattr(run, name) == getattr(defaults, name)
+    }
+    if changed:
+        print("[kitti06] applying the published run configuration: " + ", ".join(sorted(changed)))
+    return replace(run, **changed)
+
+
+def attach_cuvslam_trajectory(sequence: PreparedSequence, base_dir: Path, use_slam_pose: bool) -> PreparedSequence:
+    """Adopt the trajectory cuVSLAM produced during the run as the input trajectory.
+
+    KITTI has no poses of its own, so ``rig_00`` shows whatever cuVSLAM estimated —
+    ``slam_poses.tum`` (loop-closed) or ``odom_poses.tum`` (raw odometry), matching
+    what cuSFM was initialised from.
+
+    cuVSLAM does not pose every frame (it has no pose for frame 0, which it defines
+    as the origin of nothing), so the sequence is narrowed to the samples it did
+    pose. Leaving identity in for the rest would park a phantom rig at the origin and
+    drag the Umeyama fit with it.
+    """
+    poses_file: Path = base_dir / CUSFM_CUVSLAM_DIR / (
+        CUSFM_SLAM_POSES_FILE if use_slam_pose else CUSFM_ODOM_POSES_FILE
+    )
+    trajectory = read_tum_poses(poses_file)
+    if trajectory is None:
+        raise FileNotFoundError(
+            f"{poses_file} is missing or empty, so KITTI has no input trajectory. "
+            f"cuVSLAM must run for this dataset (--run.no-skip-cuvslam)."
+        )
+    times_ns, poses = trajectory
+    sample_index, pose_index = match_timestamps(sequence.timestamps_ns, times_ns)
+    if len(sample_index) < 3:
+        raise RuntimeError(
+            f"only {len(sample_index)} of {len(sequence.timestamps_ns)} samples matched a cuVSLAM pose "
+            f"in {poses_file}; the timestamp contract between frames_meta.json and the TUM output broke."
+        )
+    label: str = f"cuVSLAM {'SLAM' if use_slam_pose else 'odometry'}"
+    print(f"  input trajectory: {label}, {len(sample_index)}/{len(sequence.timestamps_ns)} samples posed")
+    return replace(
+        sequence,
+        timestamps_ns=sequence.timestamps_ns[sample_index],
+        world_T_rig=poses[pose_index],
+        image_paths={
+            name: [paths[index] for index in sample_index] for name, paths in sequence.image_paths.items()
+        },
+        input_source=label,
+    )
+
+
+def read_kitti_ground_truth(config: KittiConfig) -> tuple[Int[ndarray, "n"], Float64[ndarray, "n 4 4"]]:
+    """Read ``poses/06.txt`` and pair it with ``times.txt``.
+
+    Each row is a row-major 3x4 ``world_T_cam0``; the benchmark ships no timestamps
+    with the poses, so row *i* is frame *i* and its time comes from ``times.txt``
+    through the same truncation the upstream converter uses.
+    """
+    if not config.ground_truth.is_file():
+        raise FileNotFoundError(
+            f"{config.ground_truth} is missing. `pixi run kitti06` downloads it from the official "
+            f"KITTI odometry archive and checks its md5; the image mirror carries no poses."
+        )
+    times_path: Path = config.input_dir / "times.txt"
+    seconds: Float64[ndarray, "n"] = np.asarray(times_path.read_text().split(), dtype=np.float64)
+    rows: Float64[ndarray, "n 3 4"] = np.asarray(
+        [[float(value) for value in line.split()] for line in config.ground_truth.read_text().splitlines() if line.strip()],
+        dtype=np.float64,
+    ).reshape(-1, 3, 4)
+    if len(rows) != len(seconds):
+        raise ValueError(
+            f"{config.ground_truth} has {len(rows)} poses but {times_path} has {len(seconds)} timestamps."
+        )
+    poses: Float64[ndarray, "n 4 4"] = np.tile(np.eye(4, dtype=np.float64), (len(rows), 1, 1))
+    poses[:, :3, :4] = rows
+    # int(), not round(): this is exactly what get_framemeta_file_for_KITTI.py does to
+    # times.txt, and the join has to agree with it to the microsecond.
+    return (seconds * 1e6).astype(np.int64) * 1000, poses
+
+
+def report_kitti_ground_truth(config: KittiConfig, sequence: PreparedSequence, base_dir: Path) -> None:
+    """Score both trajectories against KITTI's ground truth and log it as a third run.
+
+    Two rows of the reproduction table come out of one run: the cuVSLAM trajectory
+    cuSFM was *initialised* with (``sequence.world_T_rig``) and cuSFM's own output
+    (``output_poses/merged_pose_file.tum``, byte for byte the file ``evo_ape`` reads).
+
+    Sim(3), matching the paper and the KITTI benchmark. The fitted scale is printed
+    because it is a real diagnostic here — the stereo baseline makes the estimate
+    metric, so a scale far from 1.0 would mean the reconstruction shrank, not that the
+    alignment was free to choose.
+
+    The ground truth is logged unaligned. It shares KITTI's camera-0 frame with
+    cuVSLAM, which starts at the same origin, so the three lines are directly
+    comparable and the drift between them is the thing worth seeing.
+    """
+    ground_truth_ns, ground_truth = read_kitti_ground_truth(config)
+    write_tum_poses(config.ground_truth_tum, ground_truth_ns, ground_truth)
+
+    print("\n─── KITTI 06 vs ground truth (Sim(3)-aligned ATE) ───")
+    print(f"  ground truth      : {len(ground_truth)} poses, {trajectory_length(ground_truth[:, :3, 3]):.1f} m driven")
+
+    input_index, truth_index = match_timestamps(sequence.timestamps_ns, ground_truth_ns)
+    input_rmse, input_scale = sim3_ate(
+        sequence.world_T_rig[input_index, :3, 3], ground_truth[truth_index, :3, 3]
+    )
+    print(
+        f"  {sequence.input_source:18s}: {input_rmse:.3f} m RMSE over {len(input_index)} poses "
+        f"(scale {input_scale:.5f})  <- what cuSFM was given"
+    )
+
+    refined = read_cusfm_vehicle_poses(base_dir / CUSFM_SPARSE_DIR)
+    if refined is not None:
+        refined_ns, refined_poses = refined
+        refined_index, truth_index = match_timestamps(refined_ns, ground_truth_ns)
+        refined_rmse, refined_scale = sim3_ate(
+            refined_poses[refined_index, :3, 3], ground_truth[truth_index, :3, 3]
+        )
+        print(
+            f"  {'cuSFM refined':18s}: {refined_rmse:.3f} m RMSE over {len(refined_index)} poses "
+            f"(scale {refined_scale:.5f})  <- {CUSFM_MERGED_POSE_FILE}"
+        )
+    print(f"  {'paper, Table 4':18s}: CuVSLAM 1.202 m -> CuSfM-View Graph 0.783 m")
+    print(f"  wrote {config.ground_truth_tum} for `evo_ape tum ... -as`")
+
+    log_trajectory(
+        "ground_truth",
+        ground_truth[:, :3, 3],
+        source=f"KITTI odometry benchmark ({len(ground_truth)} poses, unaligned)",
+        hue=(140, 255, 140),
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # cuSFM
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1123,14 +1461,17 @@ def prepare_galileo(config: GalileoConfig, run: RunConfig) -> PreparedSequence:
 def run_cusfm(sequence: PreparedSequence, run: RunConfig) -> Path:
     """Run the cuSFM pipeline and return the COLMAP ``sparse/`` directory.
 
-    cuVSLAM is skipped: both datasets already carry a trajectory, which is fed
-    in through ``frames_meta.json``'s ``camera_to_world`` under
-    ``initial_pose_type: EGO_MOTION``. cuSFM's global bundle adjustment then
-    refines it.
+    On galileo and robocap cuVSLAM is skipped: both already carry a trajectory,
+    fed in through ``frames_meta.json``'s ``camera_to_world`` under
+    ``initial_pose_type: EGO_MOTION``, and cuSFM's global bundle adjustment refines
+    it. On KITTI there is nothing to refine until cuVSLAM has run, so it runs first
+    and rewrites ``frames_meta.json`` with its own poses.
     """
     from pycusfm.cusfm_runner import create_cusfm_runner
 
-    base_dir: Path = run.work_dir / f"{sequence.name}{run.variant}" / "cusfm"
+    base_dir: Path = (
+        sequence.base_dir if sequence.base_dir is not None else run.work_dir / f"{sequence.name}{run.variant}" / "cusfm"
+    )
     sparse_dir: Path = base_dir / CUSFM_SPARSE_DIR
     if run.skip_reconstruction:
         if not (sparse_dir / "images.txt").is_file() and not (sparse_dir / "images.bin").is_file():
@@ -1143,7 +1484,9 @@ def run_cusfm(sequence: PreparedSequence, run: RunConfig) -> Path:
     print(
         f"[cusfm] {sequence.name}{run.variant}: feature_type={run.feature_type} "
         f"ba_frame_type={run.ba_frame_type} skip_cuvslam={run.skip_cuvslam} "
-        f"skip_pose_graph={run.skip_pose_graph}"
+        f"use_cuvslam_slam_pose={run.use_cuvslam_slam_pose} "
+        f"skip_data_association={run.skip_data_association} "
+        f"skip_pose_graph={run.skip_pose_graph} -> {base_dir}"
     )
     start: float = time.time()
     extra: dict[str, str] = {}
@@ -1163,6 +1506,7 @@ def run_cusfm(sequence: PreparedSequence, run: RunConfig) -> Path:
         optimize_extrinsics=run.optimize_extrinsics,
         min_inter_frame_distance=run.min_inter_frame_distance,
         skip_cuvslam=run.skip_cuvslam,
+        use_cuvslam_slam_pose=run.use_cuvslam_slam_pose,
         skip_feature_extractor=run.skip_feature_extractor,
         skip_data_association=run.skip_data_association,
         num_threads=run.num_threads,
@@ -1244,27 +1588,23 @@ def read_colmap_model(sparse_dir: Path) -> ColmapModel:
     )
 
 
-def read_cusfm_vehicle_poses(sparse_dir: Path) -> tuple[Int[ndarray, "n"], Float64[ndarray, "n 4 4"]] | None:
-    """Read cuSFM's own vehicle-frame (== rig-frame) trajectory, if it wrote one.
+def read_tum_poses(tum: Path) -> tuple[Int[ndarray, "n"], Float64[ndarray, "n 4 4"]] | None:
+    """Parse a TUM trajectory (``t tx ty tz qx qy qz qw``) written by cuSFM or cuVSLAM.
 
-    ``extract_pose_from_map_main --export_pose_in_vehicle_frame=True`` emits
-    ``output_poses/merged_pose_file.tum``. This is the correct source for
-    ``world_T_rig`` once ``--run.optimize-extrinsics`` is on: deriving the rig pose
-    from a camera pose and the *input* ``rig_T_cam`` would be wrong precisely
-    because bundle adjustment has just changed that extrinsic.
+    Returns ``None`` when the file is missing or empty, which is the normal case for
+    stages that were skipped.
+
+    cuSFM receives integer microseconds in ``frames_meta.json``, converts them to
+    floating-point seconds, then prints many decimal places. Parse the text directly
+    and recover that integer-microsecond contract: float64 cannot retain nanoseconds
+    at Galileo's ~1.7e9-second epoch, while rounding the printed seconds to
+    nanoseconds would preserve conversion noise instead of the input timestamp.
     """
-    tum: Path = sparse_dir.parent / CUSFM_OUTPUT_POSES_DIR / CUSFM_MERGED_POSE_FILE
     if not tum.is_file():
         return None
     rows: list[list[str]] = [line.split() for line in tum.read_text().splitlines() if line.strip()]
     if not rows:
         return None
-    # cuSFM receives integer microseconds in frames_meta.json, converts them to
-    # floating-point seconds, then prints many decimal places in TUM. Parse the
-    # text directly and recover that integer-microsecond contract: float64 cannot
-    # retain nanoseconds at Galileo's ~1.7e9-second epoch, while rounding the
-    # printed seconds to nanoseconds would preserve conversion noise instead of
-    # the input timestamp.
     times_ns: Int[ndarray, "n"] = np.asarray(
         [
             int((Decimal(row[0]) * Decimal(1_000_000)).to_integral_value(rounding=ROUND_HALF_UP))
@@ -1280,6 +1620,34 @@ def read_cusfm_vehicle_poses(sparse_dir: Path) -> tuple[Int[ndarray, "n"], Float
         [compose(Rotation.from_quat(row[3:7]).as_matrix(), row[0:3]) for row in raw]
     )
     return times_ns, poses
+
+
+def write_tum_poses(tum: Path, times_ns: Int[ndarray, "n"], poses: Float[ndarray, "n 4 4"]) -> None:
+    """Write a TUM trajectory, with timestamps printed the way cuSFM prints them.
+
+    Nine decimal places on a value that is exact to the microsecond, so evo's
+    timestamp association against cuSFM's own output is exact rather than nearest.
+    """
+    quaternions: Float64[ndarray, "n 4"] = Rotation.from_matrix(poses[:, :3, :3]).as_quat()
+    lines: list[str] = [
+        f"{1e-9 * float(timestamp):.9f} "
+        + " ".join(f"{value:.9f}" for value in (*pose[:3, 3], *quaternion))
+        for timestamp, pose, quaternion in zip(times_ns, poses, quaternions, strict=True)
+    ]
+    tum.write_text("\n".join(lines) + "\n")
+
+
+def read_cusfm_vehicle_poses(sparse_dir: Path) -> tuple[Int[ndarray, "n"], Float64[ndarray, "n 4 4"]] | None:
+    """Read cuSFM's own vehicle-frame (== rig-frame) trajectory, if it wrote one.
+
+    ``extract_pose_from_map_main --export_pose_in_vehicle_frame=True`` emits
+    ``output_poses/merged_pose_file.tum``. This is the correct source for
+    ``world_T_rig`` once ``--run.optimize-extrinsics`` is on: deriving the rig pose
+    from a camera pose and the *input* ``rig_T_cam`` would be wrong precisely
+    because bundle adjustment has just changed that extrinsic. It is also the file
+    ``evo_ape`` scores on KITTI, so the demo and evo read the same bytes.
+    """
+    return read_tum_poses(sparse_dir.parent / CUSFM_OUTPUT_POSES_DIR / CUSFM_MERGED_POSE_FILE)
 
 
 def refined_extrinsics(
@@ -1825,12 +2193,20 @@ def build_blueprint(sequence: PreparedSequence) -> rrb.Blueprint:
 def main(config: Config) -> None:
     """Prepare, reconstruct, align, and log."""
     dataset: DatasetConfig = config.dataset
+    run: RunConfig = config.run
+    sequence: PreparedSequence
     if isinstance(dataset, RobocapConfig):
-        sequence: PreparedSequence = prepare_robocap(dataset, config.run)
+        sequence = prepare_robocap(dataset, run)
+    elif isinstance(dataset, KittiConfig):
+        run = kitti_run_config(run)
+        sequence = prepare_kitti(dataset, run)
     else:
-        sequence = prepare_galileo(dataset, config.run)
+        sequence = prepare_galileo(dataset, run)
 
-    sparse_dir: Path = run_cusfm(sequence, config.run)
+    sparse_dir: Path = run_cusfm(sequence, run)
+    if isinstance(dataset, KittiConfig):
+        # Only now does an input trajectory exist: cuVSLAM produced it inside the run.
+        sequence = attach_cuvslam_trajectory(sequence, sparse_dir.parent, run.use_cuvslam_slam_pose)
     model: ColmapModel = read_colmap_model(sparse_dir)
     sample_indices, cusfm_world_T_rig, rigidity_spread, per_camera = cusfm_rig_trajectory(sequence, model)
 
@@ -1850,14 +2226,12 @@ def main(config: Config) -> None:
     )
     alignment: Float64[ndarray, "4 4"] = compose(rotation, translation)
     aligned_world_T_rig: Float64[ndarray, "m 4 4"] = alignment @ cusfm_world_T_rig
-    trajectory_length: float = float(
-        np.linalg.norm(np.diff(input_world_T_rig[:, :3, 3], axis=0), axis=1).sum()
-    )
+    travelled: float = trajectory_length(input_world_T_rig[:, :3, 3])
     print(f"  aligned {len(sample_indices)} rig poses to the input trajectory (scale held at 1.0)")
     # Not "ATE": the input trajectory is itself an estimate unless the dataset
     # ships ground truth (galileo does; RoboCap's basalt VIO does not).
     print(
-        f"  disagreement RMSE : {1e3 * rmse:.1f} mm over {trajectory_length:.2f} m travelled "
+        f"  disagreement RMSE : {1e3 * rmse:.1f} mm over {travelled:.2f} m travelled "
         f"(cuSFM vs input estimate, NOT ground truth)"
     )
     print(f"  would-be scale    : {would_be_scale:.5f} (1.0 = cuSFM preserved metric scale)")
@@ -1880,7 +2254,7 @@ def main(config: Config) -> None:
         input_rig,
         sequence,
         input_times,
-        label="input trajectory (basalt VIO)" if sequence.name == "robocap" else "input trajectory (ego-motion)",
+        label=f"input trajectory ({sequence.input_source})",
         frustum_color=None,
     )
 
@@ -1891,7 +2265,7 @@ def main(config: Config) -> None:
     cusfm_pose_times_ns: Int[ndarray, "n"] = sequence.timestamps_ns[sample_indices]
     cusfm_pose_stream: Float64[ndarray, "n 4 4"] = aligned_world_T_rig
     vehicle = read_cusfm_vehicle_poses(sparse_dir)
-    if vehicle is not None and config.run.optimize_extrinsics:
+    if vehicle is not None and run.optimize_extrinsics:
         vehicle_times, vehicle_poses = vehicle
         refined, extrinsic_spread = refined_extrinsics(sequence, model, vehicle_times, vehicle_poses)
         cusfm_pose_times_ns = vehicle_times
@@ -1924,7 +2298,7 @@ def main(config: Config) -> None:
     aligned_points: Float64[ndarray, "n_points 3"] = (
         model.points_xyz @ rotation.T + translation if len(model.points_xyz) else model.points_xyz
     )
-    keep: Bool[ndarray, "n_points"] = clip_outliers(aligned_points, config.run.point_clip_percentile)
+    keep: Bool[ndarray, "n_points"] = clip_outliers(aligned_points, run.point_clip_percentile)
     dropped: int = int((~keep).sum())
     if dropped:
         print(f"  clipped {dropped} outlier points ({100 * dropped / len(keep):.1f}%) for display only")
@@ -1934,11 +2308,10 @@ def main(config: Config) -> None:
         static=True,
     )
 
-    input_source: str = "basalt VIO" if sequence.name == "robocap" else "ego-motion"
     log_trajectory(
         "input",
         input_poses[:, :3, 3],
-        source=f"{input_source} ({len(input_times)} poses)",
+        source=f"{sequence.input_source} ({len(input_times)} poses)",
         hue=(120, 200, 255),
         keyframe_positions=sequence.world_T_rig[:, :3, 3],
     )
@@ -1948,6 +2321,9 @@ def main(config: Config) -> None:
         source=f"cuSFM global BA ({len(model.points_xyz)} points)",
         hue=(255, 150, 40),
     )
+
+    if isinstance(dataset, KittiConfig):
+        report_kitti_ground_truth(dataset, sequence, sparse_dir.parent)
 
     loops: Int[ndarray, "m 2"] | None = read_loop_closures(sparse_dir.parent / CUSFM_POSE_GRAPH_DIR)
     if loops is not None:
