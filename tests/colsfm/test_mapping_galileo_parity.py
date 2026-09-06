@@ -193,7 +193,7 @@ class ParityRun:
     result: MappingResult
     """What the mapper produced."""
     elapsed_seconds: float
-    """Wall-clock seconds the call took, for the runtime comparison."""
+    """Wall-clock seconds the call took. Only the `perf` runtime test asserts on it."""
 
 
 @pytest.fixture(scope="module")
@@ -272,13 +272,6 @@ def test_galileo_parity_against_the_blob(galileo_blob: BlobRun, parity: ParityRu
     assert result.num_registered_images == len(galileo_blob.input_meta.keyframes)
     assert abs(result.num_images_with_observations - galileo_blob.reference.num_images()) <= 2
     assert abs(result.mean_reprojection_error_px - blob_reprojection_px) < 0.3
-    # `docs/open-pipeline-plan.md` asks for a per-stage runtime within 2x of the
-    # blob's; the benchmark harness is where that bound is enforced. This guard
-    # only catches a gross regression (an order of magnitude), because the test
-    # measures wall clock on a machine that other runs share: standalone the stage
-    # takes ~7 s, under a concurrent RoboCap run it measured 28 s against a 6.7 s
-    # blob reference, and a 3x bound failed for reasons unrelated to the code.
-    assert parity.elapsed_seconds < 10.0 * galileo_blob.runtime_seconds
     assert result.num_points3D >= 0.9 * galileo_blob.reference.num_points3D()
 
     blob_points: Float64[ndarray, "num_blob_points 3"] = np.array(
@@ -291,6 +284,22 @@ def test_galileo_parity_against_the_blob(galileo_blob: BlobRun, parity: ParityRu
     coverage: float = float(np.mean(nearest_m < 0.05))
     print(f"[colsfm] {galileo_blob.name} parity | {coverage:.1%} of the blob's points have one of ours within 5 cm")
     assert coverage >= 0.95
+
+
+@pytest.mark.perf
+def test_the_galileo_mapping_is_no_slower_than_ten_times_the_blob(galileo_blob: BlobRun, parity: ParityRun) -> None:
+    """A gross-regression guard on the mapping stage, an order of magnitude wide.
+
+    `docs/open-pipeline-plan.md` asks for a per-stage runtime within 2x of the
+    blob's; the benchmark harness is where that bound is enforced. This one is
+    deliberately loose, because it measures wall clock on a machine other runs
+    share: standalone the stage takes ~7 s, under a concurrent RoboCap run it
+    measured 28 s against a 6.7 s blob reference, and a 3x bound failed for
+    reasons unrelated to the code. That is also why it is `perf` and not part of
+    the parity test it used to sit inside — a busy machine must not be able to
+    fail the numerical comparison.
+    """
+    assert parity.elapsed_seconds < 10.0 * galileo_blob.runtime_seconds
 
 
 def test_galileo_rig_poses_match_the_blob(galileo_blob: BlobRun, parity: ParityRun) -> None:

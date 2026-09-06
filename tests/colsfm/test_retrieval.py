@@ -334,6 +334,7 @@ def _random_corpus(n_images: int, descriptors_per_image: int, seed: int) -> dict
     return corpus
 
 
+@pytest.mark.perf
 @pytest.mark.parametrize(("n_images", "budget_seconds"), [(226, 20.0), (900, 60.0)])
 def test_brute_force_build_stays_inside_the_runtime_budget(n_images: int, budget_seconds: float) -> None:
     """226 x 2048 in a few seconds and 900 x 2048 under a minute, on CPU NumPy.
@@ -345,6 +346,10 @@ def test_brute_force_build_stays_inside_the_runtime_budget(n_images: int, budget
 
     The backend is named rather than left to `auto`, which would send the 900-image case to
     the vocab index; that one has its own budget test below.
+
+    Every assertion here is a wall-clock bound, so the whole test is `perf`: what it
+    measures on a shared machine is the machine. The recall these settings buy is
+    asserted on the real Galileo descriptors instead, without a clock.
     """
     corpus: dict[int, Descriptors] = _random_corpus(n_images, 2048, seed=n_images)
     started: float = time.perf_counter()
@@ -464,13 +469,27 @@ def test_the_vectorised_l1_score_agrees_with_the_spec_reference() -> None:
             assert l1_score(query, document) == pytest.approx(float(scores[first, second]), abs=1e-6)
 
 
-def test_the_vocabulary_backend_builds_and_queries_1000_images_inside_the_budget() -> None:
-    """1000 x 2048 descriptors: build and 1000 queries, both well under the pipeline budget.
+@dataclass(frozen=True, slots=True)
+class VocabBuild:
+    """A vocabulary index over 1000 synthetic images, with what it cost to make and use."""
 
-    Measured here: 11.1 s to build and 0.07 s for all 1000 queries, because the inverted
-    index scores every pair during the build. The bounds are generous multiples so the test
-    fails on an algorithmic regression rather than on a busy machine. RoboCap's real 4528
-    images take 42 s to build and 1.4 s to query.
+    index: RetrievalIndex
+    """The built index."""
+    build_seconds: float
+    """Wall-clock seconds `build_retrieval_index` took. Only the `perf` test reads this."""
+    query_seconds: float
+    """Wall-clock seconds all 1000 queries took. Only the `perf` test reads this."""
+
+
+@pytest.fixture(scope="module")
+def vocab_build() -> VocabBuild:
+    """Build the 1000-image vocabulary index once and query every image of it.
+
+    Two tests read this — the tree's shape and the runtime budget — and the build
+    is the most expensive single step in this module, so it happens once.
+
+    Returns:
+        The index, its build time and the time all 1000 queries took.
     """
     corpus: dict[int, Descriptors] = _random_corpus(1000, 2048, seed=1)
     started: float = time.perf_counter()
@@ -481,9 +500,29 @@ def test_the_vocabulary_backend_builds_and_queries_1000_images_inside_the_budget
         index.query(image_id, top_k=20)
     query_seconds: float = time.perf_counter() - started
     print(f"vocab retrieval: 1000 x 2048 -> {index.n_words} words, build {build_seconds:.1f} s, 1000 queries {query_seconds:.2f} s")
-    assert index.n_words == VocabConfig().branching ** VocabConfig().depth
-    assert build_seconds < 90.0
-    assert query_seconds < 30.0
+    return VocabBuild(index=index, build_seconds=build_seconds, query_seconds=query_seconds)
+
+
+def test_the_vocabulary_backend_builds_the_whole_tree(vocab_build: VocabBuild) -> None:
+    """1000 x 2048 descriptors fill every leaf: the word count is `branching ** depth`.
+
+    The claim that does not depend on the machine, so it runs by default. What the
+    build and the queries cost is the `perf` test below.
+    """
+    assert vocab_build.index.n_words == VocabConfig().branching ** VocabConfig().depth
+
+
+@pytest.mark.perf
+def test_the_vocabulary_backend_builds_and_queries_1000_images_inside_the_budget(vocab_build: VocabBuild) -> None:
+    """1000 x 2048 descriptors: build and 1000 queries, both well under the pipeline budget.
+
+    Measured here: 11.1 s to build and 0.07 s for all 1000 queries, because the inverted
+    index scores every pair during the build. The bounds are generous multiples so the test
+    fails on an algorithmic regression rather than on a busy machine. RoboCap's real 4528
+    images take 42 s to build and 1.4 s to query.
+    """
+    assert vocab_build.build_seconds < 90.0
+    assert vocab_build.query_seconds < 30.0
 
 
 # --------------------------------------------------------------------------------------
