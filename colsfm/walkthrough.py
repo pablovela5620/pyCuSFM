@@ -251,6 +251,12 @@ class WalkthroughObserver(PipelineObserver):
     `output_dir` is the run's staging directory: mid-run, that is where the
     database and the exported artifacts are, and reading the destination would
     read the *previous* run."""
+    published_options: PipelineOptions = field(init=False)
+    """The same options with the caller's own `output_dir`, for the panels to *name*.
+
+    A staging directory is where a stage wrote; it is not where the artifact ends
+    up, and a finished recording that names one names a directory that no longer
+    exists."""
     stages: tuple[WalkthroughStage, ...]
     """The timeline slots this run records, in stage order."""
     console: dict[str, str] = field(default_factory=dict)
@@ -332,6 +338,7 @@ class WalkthroughObserver(PipelineObserver):
                 staging directory. Everything this observer opens mid-run is there.
             stages: The stages it will record; already held as `stages`.
         """
+        self.published_options = self.options
         self.options = options
         rr.log("/", rr.ViewCoordinates.RFU, static=True)
 
@@ -358,6 +365,7 @@ class WalkthroughObserver(PipelineObserver):
             self.options.input_dir,
             self.config.num_sample_keyframes,
             self.console["feature_extraction"],
+            published_database_path=self.published_options.database_path,
         )
 
     def on_pair_selection(self, pairs: Sequence[ImagePair]) -> None:

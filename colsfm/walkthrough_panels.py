@@ -200,6 +200,7 @@ def log_feature_extraction(
     input_dir: Path,
     num_samples: int,
     console: str,
+    published_database_path: Path | None = None,
 ) -> list[SamplePane]:
     """Stage 2: sample keyframes with their ALIKED keypoints, plus the count histogram.
 
@@ -210,10 +211,14 @@ def log_feature_extraction(
         stage: This stage's timeline slot and prose.
         selected: The collection keyframe selection kept.
         extraction: The report `run_feature_extraction_stage` returned.
-        database_path: The database the stage wrote.
+        database_path: The database the stage wrote, read from here and now.
         input_dir: The dataset's raw image root.
         num_samples: How many keyframes to show.
         console: What the stage printed.
+        published_database_path: Where that database will live once the run publishes,
+            for the notes row. Mid-run the stage writes into the run's staging
+            directory (`colsfm.run_lifecycle`), and naming that in a finished
+            recording would name a directory that no longer exists.
 
     Returns:
         One pane per keyframe that was drawn, so the blueprint can give each its
@@ -245,7 +250,7 @@ def log_feature_extraction(
             ("keypoints per image (min / median / max)", f"{int(ordered.min())} / {int(np.median(ordered))} / {int(ordered.max())}"),
             ("device", extraction.device),
             ("seconds", f"{extraction.elapsed_seconds:.2f}"),
-            ("database", f"`{database_path}`"),
+            ("database", f"`{database_path if published_database_path is None else published_database_path}`"),
             ("samples drawn", ", ".join(pane.name for pane in panes) if panes else "none; the imagery is not on disk"),
         ],
         console,
