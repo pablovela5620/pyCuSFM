@@ -18,10 +18,14 @@ point: the graph has a real batch axis, `image [batch, 3, 1200, 1920]` with
 `batch` in 1..16, so the engine is built with an optimisation profile rather than
 at the shipped static shape and `DEFAULT_BATCH_SIZE` images cross the PCIe bus
 and the detector pyramid together. Everything either side of the engine is
-unchanged and imported from `colsfm.features_trt`: the same OpenCV
-preprocessing, the same bounded decode-ahead thread pool, the same
-`(k + 1) * 0.5 * (size - 1)` mapping back onto the original image, the same two
-database columns written for image rows somebody else created.
+unchanged and runs through `colsfm.features_native`, the same module the blob's
+backend runs through: the same OpenCV preprocessing, the same bounded
+decode-ahead thread pool, the same `(k + 1) * 0.5 * (size - 1)` mapping back onto
+the original image, the same two database columns written for image rows
+somebody else created. What this module still owns is what is RaCo's alone —
+which of two graphs serves a size, what its optimisation profiles are, how wide
+a batch each admits, and that its `scores` output is a rank rather than a
+detector response.
 
 **Native resolution is the default, and it is a deliberate deviation.** The
 blob's feature extractor resizes every input to its network size
@@ -64,38 +68,27 @@ that this graph has no score gate, and the matcher's SSC (which runs on
 from __future__ import annotations
 
 import time
-from collections.abc import Iterator, Sequence
-from contextlib import ExitStack
+from collections.abc import Sequence
 from dataclasses import dataclass
-from itertools import islice
 from pathlib import Path
 from typing import Final, Literal, TypeAlias
 
-import numpy as np
-import pycolmap
-from jaxtyping import Bool, Float32, Int64
-from numpy import ndarray
-
 from colsfm import REPO_ROOT
-from colsfm.database import Descriptors, KeypointsXY, keypoint_counts
+from colsfm.database import keypoint_counts
 from colsfm.features import RacoEngineChoice, TensorRTExtraction
-from colsfm.features_trt import (
+from colsfm.features_native import (
     ALIKED_IMAGE_BINDING,
     DEFAULT_GPU_PREPROCESSING,
     DEFAULT_PREPROCESSING_WORKERS,
     DESCRIPTOR_TYPE,
-    NETWORK_HEIGHT,
-    NETWORK_WIDTH,
+    ExtractionGroup,
     ImageTask,
-    PreparedImage,
-    _image_tasks,
-    _prepared_stream,
-    normalized_to_pixels,
+    NativeModel,
+    image_tasks,
+    run_native_extraction,
 )
-from colsfm.tensorrt_runtime import DeviceTensor, GpuPreprocessor, ShapeProfile, TensorRTSession, resolve_engine
-
-NetworkBatch: TypeAlias = Float32[ndarray, "batch 3 network_height network_width"]
-"""One batch of preprocessed images as the engine takes it: planar RGB in [0, 1]."""
+from colsfm.features_trt import NETWORK_HEIGHT, NETWORK_WIDTH
+from colsfm.tensorrt_runtime import ShapeProfile, resolve_engine
 
 RACO_ONNX_PATH: Final[Path] = REPO_ROOT / "data" / "cusfm_models" / "raco-aliked-b1-16.onnx"
 """The batch-dynamic RaCo-ALIKED graph; its engine is cached beside it.
@@ -156,6 +149,20 @@ Galileo frame reaches the same convolutions either way."""
 
 MAXIMUM_NETWORK_WIDTH: Final[int] = 1920
 """The profile's `max` width, which Galileo already is."""
+
+RACO_MODEL: Final[NativeModel] = NativeModel(
+    name="raco",
+    image_binding=ALIKED_IMAGE_BINDING,
+    descriptor_type=DESCRIPTOR_TYPE,
+    score_meaning="selection_rank",
+)
+"""RaCo's graphs as `colsfm.features_native` sees them.
+
+`selection_rank` is the load-bearing half, and the module docstring above is its
+justification: this graph's `scores` never touched a score map, so the blob's
+`detector_threshold` means nothing against it and `colsfm.features` passes
+`RACO_MIN_SCORE` instead. Both graphs bind their image as `image` and store
+`ALIKED_N16ROT` descriptors, which is why one runner drives both."""
 
 
 def raco_profile(network_height: int = NETWORK_HEIGHT, network_width: int = NETWORK_WIDTH) -> dict[str, ShapeProfile]:
@@ -306,7 +313,7 @@ def select_raco_engine(network_size: tuple[int, int], choice: RacoEngineChoice =
     )
 
 
-def _engine_file(engine: RacoEngine) -> Path:
+def engine_file(engine: RacoEngine) -> Path:
     """Build or find the cached engine file for one selection.
 
     Args:
@@ -339,58 +346,43 @@ def _size_groups(tasks: Sequence[ImageTask]) -> dict[tuple[int, int], list[Image
     return groups
 
 
-def _batched(prepared: Iterator[PreparedImage], batch_size: int) -> Iterator[list[PreparedImage]]:
-    """Group a prepared-image stream into fixed-size batches, the last one short.
+def extraction_groups(tasks: Sequence[ImageTask], *, native_resolution: bool, choice: RacoEngineChoice) -> list[ExtractionGroup]:
+    """Decide which engine runs which images, and at what size.
+
+    The whole of RaCo's engine policy, and the only part of extraction this
+    backend still owns: group by the size each image will run at, pick an engine
+    per group, and resolve — building on first use — the engine file. Resolving
+    every group before any of them executes means a build that fails leaves no
+    half-extracted database behind.
 
     Args:
-        prepared: Prepared images, in the order their results are wanted.
-        batch_size: Images per batch.
+        tasks: The images, in the order their results are wanted.
+        native_resolution: Run each image at its own size rounded up to
+            `INPUT_DIM_DIVISOR`. `False` puts every image in one group at the
+            fixed graph's declared 1920x1200.
+        choice: Which engine serves a group; see `select_raco_engine`.
 
-    Yields:
-        Non-empty lists of at most `batch_size` prepared images.
+    Returns:
+        One group per network size, first-seen size first; empty when there is
+        nothing to extract.
     """
-    while batch := list(islice(prepared, max(batch_size, 1))):
-        yield batch
-
-
-def _store_batch(
-    database: pycolmap.Database,
-    batch: Sequence[PreparedImage],
-    outputs: dict[str, ndarray],
-    *,
-    min_score: float,
-    max_num_features: int,
-) -> None:
-    """Write one executed batch's keypoints and descriptors into the database.
-
-    Args:
-        database: An open COLMAP database whose image rows already exist.
-        batch: The prepared images that made up this execution, in binding order.
-        outputs: The engine's `keypoints`, `descriptors` and `scores` arrays.
-        min_score: Gate on `scores`, which is a selection rank; see the module
-            docstring.
-        max_num_features: Keypoint ceiling per image; 0 or less keeps everything
-            the gate left.
-    """
-    keypoints_bn2: Float32[ndarray, "batch num_keypoints 2"] = np.asarray(outputs["keypoints"], dtype=np.float32)
-    descriptors_bnd: Float32[ndarray, "batch num_keypoints 128"] = np.asarray(outputs["descriptors"], dtype=np.float32)
-    scores_bn: Float32[ndarray, "batch num_keypoints"] = np.asarray(outputs["scores"], dtype=np.float32)
-    for index, item in enumerate(batch):
-        scores: Float32[ndarray, " num_keypoints"] = scores_bn[index].reshape(-1)
-        kept: Bool[ndarray, " num_keypoints"] = scores >= np.float32(min_score)
-        if max_num_features > 0 and int(kept.sum()) > max_num_features:
-            strongest: Int64[ndarray, " num_selected"] = np.argsort(np.where(kept, scores, -np.inf))[::-1][:max_num_features]
-            kept = np.zeros_like(kept)
-            kept[strongest] = True
-        keypoints_xy: KeypointsXY = normalized_to_pixels(
-            keypoints_bn2[index].reshape(-1, 2)[kept], item.task.image_width, item.task.image_height
+    sizes: dict[tuple[int, int], list[ImageTask]] = (
+        _size_groups(tasks) if native_resolution else {fixed_engine_size_group(): list(tasks)}
+    )
+    groups: list[ExtractionGroup] = []
+    for network_size, group in sizes.items():
+        if not group:
+            continue
+        engine: RacoEngine = select_raco_engine(network_size, choice)
+        groups.append(
+            ExtractionGroup(
+                engine_path=engine_file(engine),
+                tasks=group,
+                network_height=engine.network_height,
+                network_width=engine.network_width,
+            )
         )
-        descriptors: Descriptors = np.ascontiguousarray(descriptors_bnd[index].reshape(len(scores), -1)[kept])
-        database.write_keypoints(item.task.image_id, keypoints_xy)
-        database.write_descriptors(
-            item.task.image_id,
-            pycolmap.FeatureDescriptorsFloat(data=descriptors, type=DESCRIPTOR_TYPE).to_bytes(),
-        )
+    return groups
 
 
 def extract_raco(
@@ -453,52 +445,16 @@ def extract_raco(
         raise ValueError(f"batch_size must be in [{MINIMUM_BATCH_SIZE}, {maximum_batch_size}], got {batch_size}")
 
     started: float = time.perf_counter()
-    tasks: list[ImageTask] = _image_tasks(database_path, image_root, image_names)
-    groups: dict[tuple[int, int], list[ImageTask]] = (
-        _size_groups(tasks) if native_resolution else {fixed_engine_size_group(): list(tasks)}
+    tasks: list[ImageTask] = image_tasks(database_path, image_root, image_names)
+    run_native_extraction(
+        database_path,
+        extraction_groups(tasks, native_resolution=native_resolution, choice=engine_choice),
+        RACO_MODEL,
+        min_score=min_score,
+        max_num_features=max_num_features,
+        batch_size=batch_size,
+        preprocessing_workers=preprocessing_workers,
+        gpu_preprocessing=gpu_preprocessing,
     )
-    with ExitStack() as stack:
-        database: pycolmap.Database = stack.enter_context(pycolmap.Database.open(database_path))
-        sessions: dict[Path, TensorRTSession] = {}
-        preprocessors: dict[tuple[Path, int, int], GpuPreprocessor] = {}
-        for network_size, group in groups.items():
-            if not group:
-                continue
-            engine: RacoEngine = select_raco_engine(network_size, engine_choice)
-            engine_path: Path = _engine_file(engine)
-            if engine_path not in sessions:
-                sessions[engine_path] = stack.enter_context(TensorRTSession(engine_path, reuse_output_buffers=True))
-            session: TensorRTSession = sessions[engine_path]
-            network_height: int = engine.network_height
-            network_width: int = engine.network_width
-            preprocessor: GpuPreprocessor | None = None
-            if gpu_preprocessing:
-                preprocessor_key: tuple[Path, int, int] = (engine_path, network_height, network_width)
-                if preprocessor_key not in preprocessors:
-                    preprocessors[preprocessor_key] = stack.enter_context(
-                        GpuPreprocessor(
-                            height=network_height,
-                            width=network_width,
-                            max_batch=batch_size,
-                            optimal_batch=batch_size,
-                            stream=session.stream,
-                        )
-                    )
-                preprocessor = preprocessors[preprocessor_key]
-            prepared: Iterator[PreparedImage] = _prepared_stream(
-                group, preprocessing_workers, network_height, network_width, not gpu_preprocessing
-            )
-            for batch in _batched(prepared, batch_size):
-                network_input: NetworkBatch | DeviceTensor
-                if preprocessor is None:
-                    network_input = np.ascontiguousarray(
-                        np.concatenate([item.network_image() for item in batch], axis=0), dtype=np.float32
-                    )
-                else:
-                    for slot, item in enumerate(batch):
-                        preprocessor.staging_bhwc[slot] = item.resized_bgr_hwc
-                    network_input = preprocessor.run(len(batch))
-                outputs: dict[str, ndarray] = session.run({ALIKED_IMAGE_BINDING: network_input})
-                _store_batch(database, batch, outputs, min_score=min_score, max_num_features=max_num_features)
     elapsed_seconds: float = time.perf_counter() - started
     return keypoint_counts(database_path, [task.image_id for task in tasks]), elapsed_seconds

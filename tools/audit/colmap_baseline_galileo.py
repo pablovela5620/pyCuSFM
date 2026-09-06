@@ -58,14 +58,8 @@ from serde import serde
 from colsfm.benchmark import ReconstructionMetrics, RigTrack, reconstruction_metrics, write_json_report
 from colsfm.export import RUNTIME_CSV_NAME, RuntimeRecord, append_runtime_record
 from colsfm.frames_meta import CameraParams, KeyframeMeta
-from tools.audit.galileo_metrics import (
-    GalileoReference,
-    TrajectoryScore,
-    image_center_score,
-    read_galileo_reference,
-    rig_track_from_reconstruction,
-    score_track_against_ground_truth,
-)
+from colsfm.trajectory import TrajectoryScore, image_center_score, rig_track_from_reconstruction, score_track_against_ground_truth
+from tools.audit.galileo_metrics import GalileoReference, read_galileo_reference
 
 FeatureChoice: TypeAlias = Literal["sift", "aliked"]
 """Which COLMAP feature stack to run: SIFT-GPU + brute force, or ALIKED + LightGlue."""
@@ -361,7 +355,7 @@ def main(config: ColmapBaselineConfig) -> None:
         raise RuntimeError("incremental_mapping returned no reconstruction")
     largest: pycolmap.Reconstruction = models[summaries[0].model_index]
 
-    center_score, alignment = image_center_score(largest, reference)
+    center_score, alignment = image_center_score(largest, reference.gt_center_by_image_name)
     rig_track: RigTrack = rig_track_from_reconstruction(largest, reference.frames_meta, alignment)
     rig_score: TrajectoryScore = score_track_against_ground_truth(rig_track, reference.ground_truth)
 

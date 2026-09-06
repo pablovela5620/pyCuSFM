@@ -1,10 +1,16 @@
 """The `raco` feature and matching backends: batched RaCo-ALIKED and LightGlue+.
 
-Same skip discipline as `tests/colsfm/test_tensorrt_backends.py`, plus one more
-thing to be missing: the two RaCo ONNX graphs live under `data/cusfm_models/`,
-which is gitignored, so a fresh clone has the code and not the weights. Rebuild
-them with `pixi run -e raco raco-export` and
-`pixi run -e raco raco-export --batched-extractor-path
+**Two halves, gated differently.** The first half is pure contracts — the
+normalisation round trip between extractor and matcher, the size grid, the
+profile bounds, the engine-selection rule, the batch-size guard. None of them
+loads an engine or reads a weight, so none of them is gated on one. They used to
+be, by a module-level `pytestmark`, which meant a fresh clone — where
+`data/cusfm_models/` is gitignored and therefore empty — ran none of this and
+reported it as skipped.
+
+The second half really does need the graphs and the GPU, and carries
+`requires_raco_models`. Rebuild the graphs with `pixi run -e raco raco-export`
+and `pixi run -e raco raco-export --batched-extractor-path
 data/cusfm_models/raco-aliked-b1-16.onnx`.
 
 The bands are the blob's own Galileo statistics again (feature_matcher_main.md
@@ -12,6 +18,10 @@ The bands are the blob's own Galileo statistics again (feature_matcher_main.md
 a *different* extractor, so this asserts that it lands in the same neighbourhood
 rather than on the same number — that is the "near-parity" claim, and a band is
 what near-parity means.
+
+The one timing claim — that the fixed engine beats the shape-dynamic one at the
+top of its profile, which is why `select_raco_engine` has an `auto` rule at all —
+is marked `perf` and skipped unless asked for; see `tests/colsfm/conftest.py`.
 """
 
 from __future__ import annotations
@@ -31,7 +41,9 @@ from colsfm.features import BLOB_MAX_KEYPOINTS, ExtractionReport, FeatureOptions
 from colsfm.frames_meta import FRAMES_META_NAME, CameraParams, FramesMeta, KeyframeMeta, read_frames_meta
 from colsfm.matching import MatchingOptions, MatchReport, match_pairs
 from colsfm.pairs import select_pairs
-from colsfm.pipeline import PipelineOptions, PipelineSummary, run_pipeline
+from colsfm.pipeline import run_pipeline
+from colsfm.run_config import PipelineOptions
+from colsfm.run_report import PipelineSummary
 
 pytest.importorskip("tensorrt", reason="the raco backend needs the tensorrt package")
 pytest.importorskip("cuda.bindings.runtime", reason="the raco backend allocates through cuda-python")
@@ -88,9 +100,16 @@ def _raco_models_available() -> bool:
     return True
 
 
-pytestmark = pytest.mark.skipif(
+requires_raco_models = pytest.mark.skipif(
     not _raco_models_available(), reason="the RaCo ONNX graphs or a CUDA device are missing"
 )
+"""Applied to the tests that load an engine, and to nothing else.
+
+The gate used to be a module-level `pytestmark`, which took the pure contracts
+below down with it."""
+
+
+# ── Pure contracts: no engine, no weights, no device ─────────────────────────
 
 
 def test_the_matcher_frame_is_the_exact_inverse_of_the_extractor_mapping() -> None:
@@ -224,6 +243,9 @@ def test_either_engine_can_be_forced_whatever_the_size() -> None:
     assert forced_fixed.maximum_batch_size == 16
 
 
+# ── Engine-backed: needs the RaCo graphs and a CUDA device ───────────────────
+
+
 @pytest.fixture(scope="module")
 def raco_stereo_frame(
     galileo_input: FramesMeta, galileo_input_dir: Path, tmp_path_factory: pytest.TempPathFactory
@@ -253,6 +275,7 @@ def raco_stereo_frame(
     return database_path, pairs, extraction, matching
 
 
+@requires_raco_models
 def test_the_batched_graph_stores_2048_keypoints_per_image(
     raco_stereo_frame: tuple[Path, list[ImagePair], ExtractionReport, MatchReport],
 ) -> None:
@@ -270,6 +293,7 @@ def test_the_batched_graph_stores_2048_keypoints_per_image(
     assert extraction.elapsed_seconds > 0.0
 
 
+@requires_raco_models
 def test_the_keypoints_land_inside_the_original_image(
     raco_stereo_frame: tuple[Path, list[ImagePair], ExtractionReport, MatchReport],
     galileo_input: FramesMeta,
@@ -287,6 +311,7 @@ def test_the_keypoints_land_inside_the_original_image(
         assert keypoints_xy[:, 1].max() <= camera.image_height
 
 
+@requires_raco_models
 def test_the_descriptors_round_trip_as_l2_normalised_floats(
     raco_stereo_frame: tuple[Path, list[ImagePair], ExtractionReport, MatchReport],
 ) -> None:
@@ -301,6 +326,7 @@ def test_the_descriptors_round_trip_as_l2_normalised_floats(
         assert np.allclose(norms, 1.0, atol=1e-2), f"image {image_id}: norms {norms.min()}-{norms.max()}"
 
 
+@requires_raco_models
 def test_lightglue_plus_matches_in_the_blobs_band(
     raco_stereo_frame: tuple[Path, list[ImagePair], ExtractionReport, MatchReport],
 ) -> None:
@@ -319,6 +345,7 @@ def test_lightglue_plus_matches_in_the_blobs_band(
     assert matching.median_retention >= 0.9
 
 
+@requires_raco_models
 def test_the_whole_pipeline_runs_on_the_raco_backend(
     galileo_input_dir: Path, tmp_path_factory: pytest.TempPathFactory
 ) -> None:
@@ -376,6 +403,7 @@ def _cropped_galileo_meta(
     )
 
 
+@requires_raco_models
 def test_a_640x480_crop_runs_at_its_own_size_and_stays_inside_it(
     galileo_input: FramesMeta, galileo_input_dir: Path, tmp_path: Path
 ) -> None:
@@ -407,6 +435,7 @@ def test_a_640x480_crop_runs_at_its_own_size_and_stays_inside_it(
     assert keypoints_xy[:, 1].max() <= 480.0 + FP16_EDGE_TOLERANCE_PX
 
 
+@requires_raco_models
 def test_galileo_at_the_profile_maximum_reproduces_the_legacy_stretch(
     galileo_input: FramesMeta, galileo_input_dir: Path, tmp_path: Path
 ) -> None:
@@ -471,6 +500,7 @@ The measured medians are 543 stretched and 574 native; the band is there to catc
 a collapse, not to pin a number that a re-export is allowed to move."""
 
 
+@requires_raco_models
 @pytest.mark.skipif(not KITTI_INPUT_DIR.is_dir(), reason="KITTI 06 input is not present")
 def test_kitti_survives_running_at_its_own_1226x370(tmp_path: Path) -> None:
     """A frame a fifth the profile's area keeps its keypoints and its matches.
@@ -507,3 +537,46 @@ def test_kitti_survives_running_at_its_own_1226x370(tmp_path: Path) -> None:
         medians[native_resolution] = matching.median_inliers
     assert min(medians.values()) >= MIN_KITTI_MEDIAN_INLIERS, medians
     assert medians[True] >= 0.9 * medians[False], medians
+
+
+# ── Timing: the measurement `select_raco_engine`'s `auto` rule rests on ───────
+
+
+@requires_raco_models
+@pytest.mark.perf
+def test_the_fixed_engine_beats_the_dynamic_one_at_the_profile_maximum(
+    galileo_input: FramesMeta, galileo_input_dir: Path, tmp_path: Path
+) -> None:
+    """Galileo is the shape-dynamic profile's maximum, and there the fixed engine wins.
+
+    This is the whole reason `select_raco_engine` decides per size group instead
+    of always taking the shape-dynamic engine: one profile's tactics have to
+    cover 256x256 to 1216x1920, and the host also pays a `cv2.resize` from 1200
+    to 1216 that the fixed path skips. Measured over 226 frames: 2.70 s fixed
+    against 4.96 s dynamic (`docs/gpu-preprocessing.md`).
+
+    Marked `perf` because the assertion is a ratio of wall clocks. It is a real
+    claim and worth checking on demand; it is not evidence of correctness and has
+    no business failing somebody's ordinary run.
+    """
+    from colsfm.features_raco import extract_raco
+
+    image_names: list[str] = [keyframe.image_name for keyframe in galileo_input.keyframes]
+    seconds: dict[RacoEngineChoice, float] = {}
+    for choice in ("fixed", "dynamic"):
+        database_path: Path = tmp_path / f"timing_{choice}.db"
+        create_database(database_path, galileo_input)
+        _counts, elapsed_seconds = extract_raco(
+            database_path,
+            galileo_input_dir,
+            image_names,
+            min_score=0.0,
+            max_num_features=BLOB_MAX_KEYPOINTS,
+            raco_engine=choice,  # type: ignore[arg-type]
+        )
+        seconds[choice] = elapsed_seconds
+    print(
+        f"[colsfm] raco {len(image_names)} frames | fixed {seconds['fixed']:.2f}s "
+        f"| dynamic {seconds['dynamic']:.2f}s | ratio {seconds['dynamic'] / seconds['fixed']:.2f}x"
+    )
+    assert seconds["dynamic"] > seconds["fixed"], seconds

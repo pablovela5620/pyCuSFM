@@ -16,10 +16,10 @@ from pathlib import Path
 import tyro
 
 from colsfm.matching import MatchingBackend, MatchingOptions
-from colsfm.pipeline import (
+from colsfm.run_config import PipelineOptions
+from colsfm.stages import (
     KeyframeSelectionStageResult,
     LoopClosureStageResult,
-    PipelineOptions,
     run_keyframe_selection_stage,
     run_loop_closure_stage,
 )
@@ -46,7 +46,7 @@ def main(args: ProfileArgs) -> None:
     options: PipelineOptions = PipelineOptions(
         input_dir=args.input_dir, output_dir=args.output_dir, matching_backend=args.backend, features_backend=args.backend
     )
-    selection: KeyframeSelectionStageResult = run_keyframe_selection_stage(options)
+    selection: KeyframeSelectionStageResult = run_keyframe_selection_stage(options.selection)
     verification = selection.config.matching_task_worker.verification
     matching_options: MatchingOptions = MatchingOptions(
         backend=args.backend,

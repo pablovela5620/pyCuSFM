@@ -20,11 +20,11 @@ from colsfm.matching import (
     BLOB_NUM_POINTS_TOLERANCE_FRACTION,
     BLOB_RANSAC_CONFIDENCE,
     MatchingOptions,
+    MatchLimitPolicy,
     MatchReport,
     MatchScores,
     PairMatchStats,
     match_pairs,
-    resolve_match_cap,
     select_by_square_covering,
     subsample_matches_by_coverage,
     verification_options,
@@ -318,19 +318,19 @@ def test_subsample_survives_an_empty_match_list() -> None:
 def test_matching_caps_the_verified_matches_written_to_the_database(
     galileo_input: FramesMeta, repo_root: Path, tmp_path: Path
 ) -> None:
-    """`max_matches_per_pair` reduces what the database stores, and None leaves it alone."""
+    """A fixed `match_limit` reduces what the database stores; `unlimited` leaves it alone."""
     keyframe_ids: list[int] = [keyframe_id for rig_frame in galileo_input.rig_frames()[:2] for keyframe_id in rig_frame.keyframe_ids][:4]
     image_root: Path = repo_root / "data" / "r2b_galileo"
 
     uncapped_db: Path = tmp_path / "uncapped.db"
     subset: FramesMeta = _prepare(uncapped_db, galileo_input, image_root, keyframe_ids)
     pairs: list[ImagePair] = select_pairs(subset, connected_keyframe_num=1)
-    uncapped: MatchReport = match_pairs(uncapped_db, pairs, MatchingOptions(max_matches_per_pair=None))
+    uncapped: MatchReport = match_pairs(uncapped_db, pairs, MatchingOptions(match_limit=MatchLimitPolicy.of("off", None)))
 
     capped_db: Path = tmp_path / "capped.db"
     _prepare(capped_db, galileo_input, image_root, keyframe_ids)
     cap: int = 40
-    capped: MatchReport = match_pairs(capped_db, pairs, MatchingOptions(max_matches_per_pair=cap))
+    capped: MatchReport = match_pairs(capped_db, pairs, MatchingOptions(match_limit=MatchLimitPolicy.of("fixed", cap)))
 
     for pair in pairs:
         stored: int = len(read_two_view_geometry(capped_db, pair[0], pair[1]).inlier_matches)
@@ -467,22 +467,26 @@ def test_square_covering_prefers_the_stronger_of_two_neighbours() -> None:
 
 def test_the_fixed_cap_mode_ignores_the_image_size() -> None:
     """`fixed` is the historical behaviour: 500 everywhere."""
-    options: MatchingOptions = MatchingOptions(match_cap_mode="fixed")
-    assert resolve_match_cap(options, 1920, 1200) == BLOB_MATCH_TOP_K
-    assert resolve_match_cap(options, 1241, 376) == BLOB_MATCH_TOP_K
+    policy: MatchLimitPolicy = MatchLimitPolicy.of("fixed", BLOB_MATCH_TOP_K)
+    assert policy.limit_for(1920, 1200) == BLOB_MATCH_TOP_K
+    assert policy.limit_for(1241, 376) == BLOB_MATCH_TOP_K
 
 
-def test_the_off_cap_mode_caps_nothing() -> None:
-    """`off` and a None budget both mean "keep every verified inlier"."""
-    assert resolve_match_cap(MatchingOptions(match_cap_mode="off"), 1920, 1200) is None
-    assert resolve_match_cap(MatchingOptions(max_matches_per_pair=None), 1920, 1200) is None
+def test_the_two_spellings_of_no_cap_resolve_to_one_policy() -> None:
+    """`off` and a None budget both mean "keep every verified inlier", and now say so once."""
+    off: MatchLimitPolicy = MatchLimitPolicy.of("off", BLOB_MATCH_TOP_K)
+    no_budget: MatchLimitPolicy = MatchLimitPolicy.of("fixed", None)
+    assert off == no_budget == MatchLimitPolicy(kind="unlimited", matches_per_pair=None)
+    assert not off.limits
+    assert off.limit_for(1920, 1200) is None
+    assert no_budget.limit_for(1920, 1200) is None
 
 
 def test_the_image_area_cap_mode_scales_with_resolution() -> None:
     """`image_area` keeps the calibration's density: 500 at 1920x1200, 101 on KITTI."""
-    options: MatchingOptions = MatchingOptions(match_cap_mode="image_area")
-    assert resolve_match_cap(options, 1920, 1200) == BLOB_MATCH_TOP_K
-    assert resolve_match_cap(options, 1241, 376) == 101
-    assert resolve_match_cap(options, 3840, 2400) == 4 * BLOB_MATCH_TOP_K
+    policy: MatchLimitPolicy = MatchLimitPolicy.of("image_area", BLOB_MATCH_TOP_K)
+    assert policy.limit_for(1920, 1200) == BLOB_MATCH_TOP_K
+    assert policy.limit_for(1241, 376) == 101
+    assert policy.limit_for(3840, 2400) == 4 * BLOB_MATCH_TOP_K
     # A degenerate size still resolves to a usable positive cap rather than 0.
-    assert resolve_match_cap(options, 1, 1) == 1
+    assert policy.limit_for(1, 1) == 1

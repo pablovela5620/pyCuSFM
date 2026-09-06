@@ -118,6 +118,9 @@ import pycolmap
 from jaxtyping import Bool, Float64, Int
 from numpy import ndarray
 
+from colsfm.loop_pairs import local_map_partners
+from colsfm.rig_geometry import RigFrameIndex, RigGeometry
+
 Matches: TypeAlias = Int[ndarray, "n_matches 2"]
 """Raw feature matches: keypoint index in the first image, keypoint index in the second."""
 
@@ -211,94 +214,6 @@ DEFAULT_RIG_POSE_CONFIG: RigPoseConfig = RigPoseConfig()
 
 
 @dataclass(frozen=True, slots=True)
-class RigGeometry:
-    """The rig itself: what the two generalized estimators take as their fixed arguments.
-
-    `cams_from_rig` and `cameras` are parallel to `camera_ids`, and a camera's position in
-    those tuples is the `camera_idx` both pycolmap estimators expect.
-    """
-
-    camera_ids: tuple[int, ...]
-    """cuSFM `camera_params_id` per rig sensor, ascending."""
-    cams_from_rig: tuple[pycolmap.Rigid3d, ...]
-    """`cam_T_vehicle` per camera, i.e. the inverse of the metadata's `vehicle_T_cam`; the
-    same convention `colsfm.reconstruction.build_rig` gives COLMAP."""
-    cameras: tuple[pycolmap.Camera, ...]
-    """Calibrated `pycolmap.Camera` per camera, `has_prior_focal_length` set."""
-    stereo_partner: Mapping[int, int] = field(default_factory=dict)
-    """The other camera of a declared stereo pair, per `camera_params_id`. Empty when the
-    metadata declares no pair, in which case the local map triangulates from the temporal
-    neighbours alone."""
-
-    def position_of(self, camera_id: int) -> int:
-        """Index of one camera in the parallel tuples.
-
-        Args:
-            camera_id: cuSFM `camera_params_id`.
-
-        Returns:
-            Its `camera_idx` for the generalized estimators.
-
-        Raises:
-            KeyError: When the rig holds no such camera.
-        """
-        try:
-            return self.camera_ids.index(camera_id)
-        except ValueError as error:
-            raise KeyError(f"camera {camera_id} is not part of this rig") from error
-
-
-@dataclass(frozen=True, slots=True)
-class RigFrameIndex:
-    """Rig frames in time order, their prior poses and their member images."""
-
-    sequence: tuple[int, ...]
-    """Rig ids in capture order; `neighbours` walks this, not the id arithmetic, because
-    `synced_sample_id` need not be contiguous."""
-    world_T_rig: Mapping[int, pycolmap.Rigid3d]
-    """Prior rig pose per rig id. Only *relative* poses inside a neighbourhood are read, so
-    session-scale drift in these is exactly what the loop edge is allowed to contradict."""
-    keyframe_by_rig_camera: Mapping[tuple[int, int], int]
-    """Image id per `(rig id, camera_params_id)`; a camera may be absent from a rig frame."""
-
-    def keyframe(self, rig_id: int, camera_id: int) -> int | None:
-        """The image one camera contributed to one rig frame.
-
-        Args:
-            rig_id: The rig frame's `synced_sample_id`.
-            camera_id: cuSFM `camera_params_id`.
-
-        Returns:
-            The image id, or None when that camera did not fire in that rig frame.
-        """
-        return self.keyframe_by_rig_camera.get((rig_id, camera_id))
-
-    def neighbours(self, rig_id: int, span: int) -> tuple[int, ...]:
-        """Rig frames within `span` steps of one rig frame, in time order.
-
-        Args:
-            rig_id: The rig frame to look around.
-            span: How many steps to reach in each direction.
-
-        Returns:
-            The neighbouring rig ids, excluding `rig_id` itself; empty when `span` is 0 or
-            the rig id is unknown.
-
-        Raises:
-            ValueError: When `span` is negative.
-        """
-        if span < 0:
-            raise ValueError(f"neighbour span must not be negative, got {span}")
-        try:
-            position: int = self.sequence.index(rig_id)
-        except ValueError:
-            return ()
-        lower: int = max(0, position - span)
-        upper: int = min(len(self.sequence), position + span + 1)
-        return tuple(self.sequence[step] for step in range(lower, upper) if step != position)
-
-
-@dataclass(frozen=True, slots=True)
 class AnchorLandmarks:
     """One anchor image's share of a local map, packed for the join in `_observations`.
 
@@ -362,31 +277,6 @@ class RigPoseRejection:
 
 RigPoseOutcome: TypeAlias = RigPoseEstimate | RigPoseRejection
 """What one rig pair produced: a measurement, or the gate that refused it."""
-
-
-def build_rig_geometry(
-    cameras: Mapping[int, pycolmap.Camera], vehicle_T_cam: Mapping[int, pycolmap.Rigid3d], stereo_partner: Mapping[int, int]
-) -> RigGeometry:
-    """Assemble the fixed arguments of the generalized estimators.
-
-    Args:
-        cameras: Calibrated `pycolmap.Camera` per `camera_params_id`.
-        vehicle_T_cam: Rig extrinsic per `camera_params_id`, camera to vehicle.
-        stereo_partner: The other camera of a declared stereo pair, per camera id.
-
-    Returns:
-        The rig geometry, cameras ordered by ascending id.
-
-    Raises:
-        KeyError: When a camera has no extrinsic.
-    """
-    camera_ids: tuple[int, ...] = tuple(sorted(cameras))
-    return RigGeometry(
-        camera_ids=camera_ids,
-        cams_from_rig=tuple(vehicle_T_cam[camera_id].inverse() for camera_id in camera_ids),
-        cameras=tuple(cameras[camera_id] for camera_id in camera_ids),
-        stereo_partner=dict(stereo_partner),
-    )
 
 
 def _ransac_options(config: RigPoseConfig) -> pycolmap.RANSACOptions:
@@ -725,17 +615,7 @@ class RigPoseEstimator:
             Image ids of the stereo partner inside the rig frame and of the same camera in
             every temporal neighbour, in a stable order.
         """
-        partners: list[int] = []
-        partner_camera: int | None = self.geometry.stereo_partner.get(camera_id)
-        if partner_camera is not None:
-            stereo_image: int | None = self.index.keyframe(rig_id, partner_camera)
-            if stereo_image is not None:
-                partners.append(stereo_image)
-        for neighbour in self.index.neighbours(rig_id, self.config.neighbour_span):
-            neighbour_image: int | None = self.index.keyframe(neighbour, camera_id)
-            if neighbour_image is not None:
-                partners.append(neighbour_image)
-        return partners
+        return local_map_partners(self.index, self.geometry, self.config.neighbour_span, rig_id, camera_id)
 
     def _anchor_tracks(self, rig_id: int, camera_id: int, anchor: int) -> tuple[dict[int, list[tuple[int, int]]], dict[int, Float64[ndarray, "3 4"]]]:
         """Match one anchor image against its partners and collect its feature tracks.

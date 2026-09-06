@@ -37,13 +37,16 @@ from colsfm.loop_closure import (
     LoopCandidate,
     LoopClosureConfig,
     LoopClosureResult,
+    LoopSearchPlan,
     MatchFunction,
     RetrievalHit,
     find_loop_edges,
     is_good_match,
     minimum_time_gap_seconds,
+    plan_loop_search,
     select_best_candidates,
     session_duration_seconds,
+    verify_loop_plan,
 )
 from colsfm.loop_pose import Keypoints, RigPoseConfig
 from colsfm.pose_graph import PoseGraphEdge, RigNode, gate_loop_edges, sequential_edges, solve_pose_graph
@@ -376,6 +379,94 @@ def match_fn(scene: SquareRigScene) -> MatchFunction:
 def loop_result(scene: SquareRigScene, match_fn: MatchFunction) -> LoopClosureResult:
     """The loop-closure run over the synthetic scene, with the stage switched on."""
     return find_loop_edges(scene.frames_meta, scene.database_path, scene.index, LoopClosureConfig(enabled=True), match_fn)
+
+
+# --------------------------------------------------------------------------------------
+# c. the search plan
+#
+# Written before the discovery run was deleted, and asserting against literals
+# captured from it: the pipeline used to learn the pair list by *running* the whole
+# search with a matcher that returned nothing, throwing the result away and running
+# it again. `plan_loop_search` has to name exactly the same pairs, and
+# `verify_loop_plan` has to produce exactly the same edges.
+# --------------------------------------------------------------------------------------
+
+
+def recording_matcher(recorded: set[tuple[int, int]]) -> MatchFunction:
+    """A matcher that records the pairs it is asked for and returns nothing.
+
+    Exactly the probe the pipeline used to run a whole search with. Kept here, in
+    the tests, so the plan can be compared against what the search really asks for.
+
+    Args:
+        recorded: Set the requested pairs are added to, normalised low-id first.
+
+    Returns:
+        A `match_fn` that always answers with an empty match array.
+    """
+
+    def record(image_id_a: int, image_id_b: int) -> Int[ndarray, "0 2"]:
+        """Record one pair and return no matches, so nothing verifies."""
+        recorded.add((min(image_id_a, image_id_b), max(image_id_a, image_id_b)))
+        return np.zeros((0, 2), dtype=np.int64)
+
+    return record
+
+
+def test_the_plan_names_exactly_the_pairs_the_search_asks_for(scene: SquareRigScene) -> None:
+    """`plan_loop_search` replaces a whole discovery run and must name the same pairs.
+
+    The old first pass ran retrieval, shortlisting, local-map triangulation and
+    `_observations` against a matcher that returned nothing, purely to collect the
+    pair list. The plan derives that list instead — local-map stereo and neighbour
+    pairs, then the source-to-target observation pairs — and this compares the two.
+    """
+    config: LoopClosureConfig = LoopClosureConfig(enabled=True)
+    plan: LoopSearchPlan = plan_loop_search(scene.frames_meta, scene.database_path, scene.index, config)
+    requested: set[tuple[int, int]] = set()
+    find_loop_edges(scene.frames_meta, scene.database_path, scene.index, config, recording_matcher(requested))
+    assert set(plan.image_pairs) == requested
+    assert list(plan.image_pairs) == sorted(requested), "the plan is sorted, as the old `sorted(requested)` was"
+    assert plan.image_pairs, "the synthetic scene has candidates, so it has pairs to match"
+
+
+def test_the_plan_keeps_the_shortlisted_rig_pairs_and_the_retrieval_diagnostics(scene: SquareRigScene) -> None:
+    """Retrieval runs once, so its funnel counters belong to the plan, not to a second pass."""
+    config: LoopClosureConfig = LoopClosureConfig(enabled=True)
+    plan: LoopSearchPlan = plan_loop_search(scene.frames_meta, scene.database_path, scene.index, config)
+    assert plan.rig_pairs, "the scene revisits its own track, so rig pairs are shortlisted"
+    normalised: set[tuple[int, int]] = {(min(pair), max(pair)) for pair in plan.rig_pairs}
+    assert len(normalised) == len(plan.rig_pairs), "the shortlist keeps one hit per unordered rig pair"
+    assert [source for source, _ in plan.rig_pairs] == sorted(source for source, _ in plan.rig_pairs), (
+        "the groups are walked in ascending source-rig order, as the serial pass walked them"
+    )
+    assert plan.queries > 0
+    assert plan.candidates_retrieved >= len(plan.rig_pairs)
+
+
+def test_planning_then_verifying_gives_the_same_edges_as_one_call(
+    scene: SquareRigScene, match_fn: MatchFunction, loop_result: LoopClosureResult
+) -> None:
+    """The two-step form is the one-step form; `find_loop_edges` is now their composition."""
+    config: LoopClosureConfig = LoopClosureConfig(enabled=True)
+    plan: LoopSearchPlan = plan_loop_search(scene.frames_meta, scene.database_path, scene.index, config)
+    stepwise: LoopClosureResult = verify_loop_plan(plan, match_fn)
+    assert [(edge.source, edge.target) for edge in stepwise.edges] == [
+        (edge.source, edge.target) for edge in loop_result.edges
+    ]
+    assert stepwise.diagnostics == loop_result.diagnostics
+
+
+def test_a_disabled_plan_asks_for_nothing(scene: SquareRigScene) -> None:
+    """`enabled=False` stays a clean no-op, and now costs no retrieval at all."""
+    plan: LoopSearchPlan = plan_loop_search(
+        scene.frames_meta, scene.database_path, scene.index, LoopClosureConfig(enabled=False)
+    )
+    assert plan.image_pairs == ()
+    assert plan.rig_pairs == ()
+    result: LoopClosureResult = verify_loop_plan(plan, make_match_function(scene))
+    assert result.edges == []
+    assert result.diagnostics.enabled is False
 
 
 # --------------------------------------------------------------------------------------

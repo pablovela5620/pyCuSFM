@@ -1,4 +1,20 @@
-"""Extract batched RaCo-ALIKED features into cuSFM keyframe protobufs."""
+"""Extract batched RaCo-ALIKED features into cuSFM keyframe protobufs.
+
+**The engine comes from `colsfm.tensorrt_runtime`.** This tool used to carry its
+own builder — its own flags, its own timing cache, its own content-addressed
+name under ``--engine-dir`` — and the two contracts drifted apart: the library
+keyed its cache on a build identity while this one keyed it on the ONNX digest,
+the profile bounds and the optimisation level, so the same graph produced two
+engines and a change neither name covered was invisible to both. There is one
+builder now, ``colsfm.tensorrt_runtime.resolve_engine``, and the engine is
+cached beside the ONNX graph rather than in a directory of its own.
+
+**Execution stays here**, deliberately. ``TensorRTExtractor`` measures
+device-only latency with CUDA events, pads a partial batch for a static engine,
+and concatenates the unrolled ``keypoints_0``/``keypoints_1`` outputs older
+exports emit — none of which ``colsfm.tensorrt_runtime.TensorRTSession`` does,
+and none of which the pipeline needs.
+"""
 
 from __future__ import annotations
 
@@ -29,6 +45,7 @@ from jaxtyping import Float32, UInt8
 from numpy import ndarray
 from numpy.typing import NDArray
 
+from colsfm.tensorrt_runtime import ShapeProfile, resolve_engine
 from tools.trt_runtime import check_cuda, percentile, sha256_file
 
 ImageRGB: TypeAlias = UInt8[ndarray, "h w 3"]
@@ -41,6 +58,9 @@ DescriptorsBND: TypeAlias = Float32[ndarray, "batch num_keypoints descriptor_dim
 
 REPO_ROOT: Path = Path(__file__).resolve().parent.parent
 """Repo root, so defaults resolve regardless of the working directory."""
+
+IMAGE_BINDING: str = "image"
+"""The RaCo graph's image input, as both the profile and the execution name it."""
 
 @dataclass
 class ExtractConfig:
@@ -62,8 +82,6 @@ class ExtractConfig:
     to a scratch path made both the extractor and its contract tests fail
     anywhere but the machine that first produced it. See
     ``data/cusfm_schema/README.md``."""
-    engine_dir: Path = REPO_ROOT / "data" / "cusfm_models" / "engines"
-    """Content-addressed TensorRT engine cache (gitignored; engines are per-GPU)."""
     result_path: Path = REPO_ROOT / "data" / "cusfm_models" / "extraction.json"
     """Machine-readable extraction or benchmark results (gitignored)."""
     batch_size: int = 8
@@ -319,102 +337,104 @@ def prepare_metadata_collection(
 
 
 
+def extraction_profile(config: ExtractConfig) -> dict[str, ShapeProfile]:
+    """The optimisation profile the batched RaCo graph is built with.
+
+    Args:
+        config: The tool's settings; its batch bounds and network size are the
+            profile.
+
+    Returns:
+        One ``(minimum, optimal, maximum)`` shape for the ``image`` binding.
+
+    Raises:
+        ValueError: When the batch bounds are not ``1 <= min <= opt <= max``.
+    """
+    if not 1 <= config.minimum_batch_size <= config.optimal_batch_size <= config.maximum_batch_size:
+        raise ValueError("Invalid TensorRT batch profile")
+    return {
+        IMAGE_BINDING: (
+            (config.minimum_batch_size, 3, config.network_height, config.network_width),
+            (config.optimal_batch_size, 3, config.network_height, config.network_width),
+            (config.maximum_batch_size, 3, config.network_height, config.network_width),
+        )
+    }
+
+
 def build_fp16_engine(config: ExtractConfig) -> Path:
-    """Build or reuse a content-addressed FP16 TensorRT engine."""
+    """Build or reuse the FP16 engine for this configuration, through the library cache.
+
+    ``colsfm.tensorrt_runtime.resolve_engine`` owns the builder, the timing
+    cache, the build identity and the atomic publication; a static graph whose
+    declared shape disagrees with the configured one is caught here, before the
+    build, because only this tool knows what shape it intends to execute.
+
+    No profile tag is passed, so a default run and ``colsfm``'s own ``raco``
+    backend — same graph, same profile, same builder settings — resolve to one
+    engine and build it once between them. A configuration that differs in any of
+    those gets its own identity, and its own engine.
+
+    Args:
+        config: The tool's settings.
+
+    Returns:
+        The serialised engine, beside the ONNX graph.
+
+    Raises:
+        FileNotFoundError: When the ONNX graph is missing.
+        ValueError: When the batch profile is invalid, or when a static graph's
+            declared input shape is not the configured execution shape.
+    """
     if not config.onnx_path.is_file():
         raise FileNotFoundError(config.onnx_path)
-    if not (
-        1 <= config.minimum_batch_size
-        <= config.optimal_batch_size
-        <= config.maximum_batch_size
-    ):
-        raise ValueError("Invalid TensorRT batch profile")
-    digest: str = sha256_file(config.onnx_path)
-    config.engine_dir.mkdir(parents=True, exist_ok=True)
-    engine_path: Path = config.engine_dir / (
-        f"raco-aliked-{digest[:16]}-trt-{trt.__version__}-fp16-"
-        f"b{config.minimum_batch_size}-{config.optimal_batch_size}-{config.maximum_batch_size}-"
-        f"o{config.builder_optimization_level}.engine"
-    )
-    if engine_path.is_file():
-        print(f"[engine] reusing {engine_path}")
-        return engine_path
-
-    logger: trt.Logger = trt.Logger(trt.Logger.INFO)
-    if not trt.init_libnvinfer_plugins(logger, ""):
-        raise RuntimeError("Could not initialize TensorRT's standard plugin registry")
-    builder: trt.Builder = trt.Builder(logger)
-    flags: int = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
-    network: trt.INetworkDefinition = builder.create_network(flags)
-    parser: trt.OnnxParser = trt.OnnxParser(network, logger)
-    if not parser.parse(config.onnx_path.read_bytes()):
-        errors: list[str] = [str(parser.get_error(index)) for index in range(parser.num_errors)]
-        raise RuntimeError("TensorRT ONNX parse failed:\n" + "\n".join(errors))
-
-    minimum_shape: tuple[int, int, int, int] = (
-        config.minimum_batch_size,
-        3,
-        config.network_height,
-        config.network_width,
-    )
-    optimal_shape: tuple[int, int, int, int] = (
-        config.optimal_batch_size,
-        3,
-        config.network_height,
-        config.network_width,
-    )
-    maximum_shape: tuple[int, int, int, int] = (
-        config.maximum_batch_size,
-        3,
-        config.network_height,
-        config.network_width,
-    )
-    input_tensor: trt.ITensor | None = network.get_input(0)
-    if input_tensor is None:
-        raise RuntimeError("TensorRT network has no image input")
-    declared_shape: tuple[int, ...] = tuple(int(dimension) for dimension in input_tensor.shape)
-    dynamic_input: bool = any(dimension < 0 for dimension in declared_shape)
-    if not dynamic_input and declared_shape != maximum_shape:
+    profiles: dict[str, ShapeProfile] = extraction_profile(config)
+    maximum_shape: tuple[int, ...] = profiles[IMAGE_BINDING][2]
+    declared_shape: tuple[int, ...] | None = declared_input_shape(config.onnx_path)
+    if declared_shape is not None and declared_shape != maximum_shape:
         raise ValueError(
             f"Static ONNX input is {declared_shape}, but configured execution shape is {maximum_shape}"
         )
-
-    builder_config: trt.IBuilderConfig = builder.create_builder_config()
-    builder_config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, config.workspace_gib << 30)
-    builder_config.profiling_verbosity = trt.ProfilingVerbosity.DETAILED
-    builder_config.set_flag(trt.BuilderFlag.FP16)
-    if not 0 <= config.builder_optimization_level <= 5:
-        raise ValueError("TensorRT builder optimization level must be in [0, 5]")
-    builder_config.builder_optimization_level = config.builder_optimization_level
-    timing_cache_path: Path = config.engine_dir / f"tensorrt-{trt.__version__}.timing-cache"
-    timing_cache_bytes: bytes = timing_cache_path.read_bytes() if timing_cache_path.is_file() else b""
-    timing_cache: trt.ITimingCache = builder_config.create_timing_cache(timing_cache_bytes)
-    if not builder_config.set_timing_cache(timing_cache, ignore_mismatch=False):
-        raise RuntimeError(f"Could not attach TensorRT timing cache {timing_cache_path}")
-    if dynamic_input:
-        profile: trt.IOptimizationProfile = builder.create_optimization_profile()
-        profile.set_shape("image", minimum_shape, optimal_shape, maximum_shape)
-        builder_config.add_optimization_profile(profile)
-    print(
-        f"[engine] building TensorRT {trt.__version__} FP16 "
-        + (
-            f"profile {minimum_shape} / {optimal_shape} / {maximum_shape}"
-            if dynamic_input
-            else f"static shape {declared_shape}"
-        )
+    engine_path: Path = resolve_engine(
+        config.onnx_path,
+        None if declared_shape is not None else profiles,
+        workspace_gib=config.workspace_gib,
+        optimization_level=config.builder_optimization_level,
     )
-    serialized: trt.IHostMemory | None = builder.build_serialized_network(network, builder_config)
-    if serialized is None:
-        raise RuntimeError("TensorRT engine build failed")
-    temporary_path: Path = engine_path.with_suffix(engine_path.suffix + ".tmp")
-    temporary_path.write_bytes(bytes(serialized))
-    temporary_path.replace(engine_path)
-    serialized_timing_cache: trt.IHostMemory = builder_config.get_timing_cache().serialize()
-    temporary_cache_path: Path = timing_cache_path.with_suffix(timing_cache_path.suffix + ".tmp")
-    temporary_cache_path.write_bytes(bytes(serialized_timing_cache))
-    temporary_cache_path.replace(timing_cache_path)
-    print(f"[engine] wrote {engine_path} ({engine_path.stat().st_size / 2**20:.1f} MiB)")
+    print(f"[engine] using {engine_path}")
     return engine_path
+
+
+def declared_input_shape(onnx_path: Path) -> tuple[int, ...] | None:
+    """The graph's ``image`` input shape when it is static, otherwise ``None``.
+
+    Parsed with TensorRT's own ``OnnxParser`` rather than ``onnx``, so this stays
+    usable from an environment that carries only TensorRT.
+
+    Args:
+        onnx_path: The graph to inspect.
+
+    Returns:
+        The declared shape, or ``None`` when any dimension is dynamic.
+
+    Raises:
+        RuntimeError: When the graph cannot be parsed or has no input.
+    """
+    logger: trt.Logger = trt.Logger(trt.Logger.ERROR)
+    if not trt.init_libnvinfer_plugins(logger, ""):
+        raise RuntimeError("Could not initialize TensorRT's standard plugin registry")
+    builder: trt.Builder = trt.Builder(logger)
+    network: trt.INetworkDefinition = builder.create_network(
+        1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+    )
+    parser: trt.OnnxParser = trt.OnnxParser(network, logger)
+    if not parser.parse(onnx_path.read_bytes()):
+        errors: list[str] = [str(parser.get_error(index)) for index in range(parser.num_errors)]
+        raise RuntimeError("TensorRT ONNX parse failed:\n" + "\n".join(errors))
+    input_tensor: trt.ITensor | None = network.get_input(0)
+    if input_tensor is None:
+        raise RuntimeError("TensorRT network has no image input")
+    shape: tuple[int, ...] = tuple(int(dimension) for dimension in input_tensor.shape)
+    return None if any(dimension < 0 for dimension in shape) else shape
 
 
 class TensorRTExtractor:
@@ -437,19 +457,19 @@ class TensorRTExtractor:
             config.network_height,
             config.network_width,
         )
-        declared_input_shape: tuple[int, ...] = tuple(self.engine.get_tensor_shape("image"))
-        self.dynamic_input: bool = any(dimension < 0 for dimension in declared_input_shape)
+        engine_input_shape: tuple[int, ...] = tuple(self.engine.get_tensor_shape(IMAGE_BINDING))
+        self.dynamic_input: bool = any(dimension < 0 for dimension in engine_input_shape)
         if self.dynamic_input:
             self.maximum_input_shape: tuple[int, ...] = configured_maximum_shape
             self.fixed_batch_size: int | None = None
-            if not self.context.set_input_shape("image", self.maximum_input_shape):
+            if not self.context.set_input_shape(IMAGE_BINDING, self.maximum_input_shape):
                 raise RuntimeError(f"Could not select maximum shape {self.maximum_input_shape}")
         else:
-            self.maximum_input_shape = declared_input_shape
-            self.fixed_batch_size = declared_input_shape[0]
-            if declared_input_shape != configured_maximum_shape:
+            self.maximum_input_shape = engine_input_shape
+            self.fixed_batch_size = engine_input_shape[0]
+            if engine_input_shape != configured_maximum_shape:
                 raise ValueError(
-                    f"Static engine input is {declared_input_shape}, configured {configured_maximum_shape}"
+                    f"Static engine input is {engine_input_shape}, configured {configured_maximum_shape}"
                 )
         self.device_pointers: dict[str, int] = {}
         self.maximum_shapes: dict[str, tuple[int, ...]] = {}
@@ -475,21 +495,21 @@ class TensorRTExtractor:
         expected_tail: tuple[int, int, int] = self.maximum_input_shape[1:]
         if images_bchw.shape[1:] != expected_tail:
             raise ValueError(f"Expected image tail {expected_tail}, got {images_bchw.shape}")
-        if images_bchw.dtype != self.dtypes["image"]:
-            raise ValueError(f"Expected input dtype {self.dtypes['image']}, got {images_bchw.dtype}")
+        if images_bchw.dtype != self.dtypes[IMAGE_BINDING]:
+            raise ValueError(f"Expected input dtype {self.dtypes[IMAGE_BINDING]}, got {images_bchw.dtype}")
         if not images_bchw.flags.c_contiguous:
             raise ValueError("TensorRT input must be contiguous")
         current_shape: tuple[int, ...] = tuple(images_bchw.shape)
         if not self.dynamic_input and current_shape != self.maximum_input_shape:
             raise ValueError(f"Static TensorRT engine requires {self.maximum_input_shape}, got {current_shape}")
-        if self.dynamic_input and not self.context.set_input_shape("image", current_shape):
+        if self.dynamic_input and not self.context.set_input_shape(IMAGE_BINDING, current_shape):
             raise ValueError(f"TensorRT profile rejected {current_shape}")
 
     def _copy_input(self, images_bchw: ImagesBCHW) -> None:
         """Copy one selected batch to the reusable device buffer."""
         check_cuda(
             cudart.cudaMemcpyAsync(
-                self.device_pointers["image"],
+                self.device_pointers[IMAGE_BINDING],
                 images_bchw.ctypes.data,
                 images_bchw.nbytes,
                 cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,

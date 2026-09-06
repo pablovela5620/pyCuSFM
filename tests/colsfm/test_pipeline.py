@@ -13,38 +13,38 @@ enough for a smoke test. The 226-frame run is the benchmark, not a unit test.
 
 from __future__ import annotations
 
+import dataclasses
+import shutil
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import pycolmap
 import pytest
-from serde.json import from_json
+from serde.json import from_json, to_json
 
-from colsfm.benchmark import rig_rigidity_spread_millimeters
+from colsfm.benchmark import read_run, rig_rigidity_spread_millimeters
 from colsfm.config import CusfmConfig, read_config_directory
 from colsfm.export import KEYFRAME_METADATA_SUBPATH, RUNTIME_CSV_NAME, RuntimeRecord, read_runtime_records
 from colsfm.frames_meta import FRAMES_META_NAME, FramesMeta, read_frames_meta
 from colsfm.geometry import MILLIMETRES_PER_METRE
-from colsfm.matching import MatchingOptions
-from colsfm.pipeline import (
+from colsfm.matching import MatchingOptions, MatchLimitPolicy
+from colsfm.pipeline import StageResult, run_pipeline, run_stage
+from colsfm.run_config import DEFAULT_CONFIG_DIR, PipelineOptions, ResolvedRun, SelectionOptions, resolve_run
+from colsfm.run_lifecycle import (
     ALL_STAGE_NAMES,
-    DEFAULT_CONFIG_DIR,
     LOOP_EDGES_NAME,
+    RUN_STATE_NAME,
     STAGE_NAMES,
     SUMMARY_NAME,
-    ExtrinsicChange,
-    LoopClosureStageResult,
-    LoopEdgeRecord,
-    PipelineOptions,
-    PipelineSummary,
-    PoseGraphStageResult,
-    StageClock,
-    run_loop_closure_stage,
-    run_pipeline,
-    run_pose_graph_stage,
+    RunState,
+    StageLedger,
+    read_run_state,
     stage_names,
     timed_stage,
 )
+from colsfm.run_report import ExtrinsicChange, LoopEdgeRecord, PipelineSummary
+from colsfm.stages import LoopClosureStageResult, PoseGraphStageResult, run_loop_closure_stage, run_pose_graph_stage
 
 SMOKE_MIN_INTER_FRAME_DISTANCE_M: float = 0.5
 """`feature_extractor_main`'s own default gate; keeps 34 of Galileo's 226 keyframes."""
@@ -402,22 +402,179 @@ def test_a_stage_that_raises_records_no_timing_and_claims_no_finish(tmp_path: Pa
     `runtime.csv` is the run's evidence of what completed, so a stage that raised
     belongs nowhere in it. The exception still reaches the caller.
     """
-    clock: StageClock = StageClock(output_dir=tmp_path)
-    with pytest.raises(RuntimeError, match="stage body failed"), timed_stage(clock, "matching"):
+    ledger: StageLedger = StageLedger(output_dir=tmp_path)
+    with pytest.raises(RuntimeError, match="stage body failed"), timed_stage(ledger, "matching"):
         raise RuntimeError("stage body failed")
 
-    assert clock.seconds_by_stage == {}
+    assert ledger.seconds_by_stage == {}
     assert not (tmp_path / RUNTIME_CSV_NAME).exists()
     assert "finished" not in capsys.readouterr().out
 
 
 def test_a_stage_that_returns_records_its_timing_and_says_it_finished(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """The success path is untouched: one `runtime.csv` row, one "finished" line."""
-    clock: StageClock = StageClock(output_dir=tmp_path)
-    with timed_stage(clock, "matching"):
+    ledger: StageLedger = StageLedger(output_dir=tmp_path)
+    with timed_stage(ledger, "matching"):
         pass
 
-    assert set(clock.seconds_by_stage) == {"matching"}
+    assert set(ledger.seconds_by_stage) == {"matching"}
     records: list[RuntimeRecord] = read_runtime_records(tmp_path / RUNTIME_CSV_NAME)
     assert [record.command for record in records] == ["matching"]
     assert "matching finished in" in capsys.readouterr().out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration is resolved and validated once, before anything is created
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_a_bad_caspar_override_stops_the_run_before_the_workspace_exists(
+    galileo_input_dir: Path, tmp_path: Path
+) -> None:
+    """`solver_iter_max=2.9` is refused, and nothing is created on the way to refusing it.
+
+    The strings used to be parsed after keyframe selection, feature extraction,
+    matching, loop closure and the pose graph — and the value was then cast with
+    `int(...)`, so 2.9 silently became 2 and a solve nobody asked for ran.
+    """
+    if not (galileo_input_dir / FRAMES_META_NAME).is_file():
+        pytest.skip(f"missing {galileo_input_dir / FRAMES_META_NAME}")
+    output_dir: Path = tmp_path / "never_created"
+    options: PipelineOptions = PipelineOptions(
+        input_dir=galileo_input_dir,
+        output_dir=output_dir,
+        ba_backend="caspar",
+        caspar_option=("solver_iter_max=2.9",),
+    )
+    with pytest.raises(ValueError, match="integer solver knob"):
+        run_pipeline(options)
+    assert not output_dir.exists(), "a refused run must not leave a workspace behind"
+
+
+def test_an_unknown_caspar_override_stops_the_run_too(galileo_input_dir: Path, tmp_path: Path) -> None:
+    """A typo in an option name is cheap to catch and expensive to discover at the solve."""
+    if not (galileo_input_dir / FRAMES_META_NAME).is_file():
+        pytest.skip(f"missing {galileo_input_dir / FRAMES_META_NAME}")
+    output_dir: Path = tmp_path / "never_created"
+    options: PipelineOptions = PipelineOptions(
+        input_dir=galileo_input_dir, output_dir=output_dir, caspar_option=("solver_iterations=10",)
+    )
+    with pytest.raises(ValueError, match="not a numeric CASPAR solver option"):
+        run_pipeline(options)
+    assert not output_dir.exists()
+
+
+def test_the_resolved_run_gives_both_match_stages_one_matcher(galileo_input_dir: Path, tmp_path: Path) -> None:
+    """Stage 4 and stage 5's batch match take the same resolved `MatchingOptions`."""
+    options: PipelineOptions = PipelineOptions(
+        input_dir=galileo_input_dir, output_dir=tmp_path / "cusfm", match_cap_mode="image_area"
+    )
+    resolved: ResolvedRun = resolve_run(options)
+    config: CusfmConfig = read_config_directory(DEFAULT_CONFIG_DIR)
+    assert resolved.matching_options(config) == resolved.matching_options(config)
+    assert resolved.match_limit == MatchLimitPolicy.of("image_area", options.max_matches_per_pair)
+
+
+def test_the_two_spellings_of_an_uncapped_run_resolve_to_the_same_policy(
+    galileo_input_dir: Path, tmp_path: Path
+) -> None:
+    """`--match-cap-mode off` and `--max-matches-per-pair None` are one state, not two."""
+    by_mode: ResolvedRun = resolve_run(
+        PipelineOptions(input_dir=galileo_input_dir, output_dir=tmp_path / "a", match_cap_mode="off")
+    )
+    by_budget: ResolvedRun = resolve_run(
+        PipelineOptions(input_dir=galileo_input_dir, output_dir=tmp_path / "b", max_matches_per_pair=None)
+    )
+    assert by_mode.match_limit == by_budget.match_limit
+    assert not by_mode.match_limit.limits
+
+
+def test_the_metadata_stages_need_no_output_directory(galileo_input_dir: Path) -> None:
+    """`python -m colsfm stage` takes `SelectionOptions`, which has no workspace in it.
+
+    The two cheap stages read metadata, touch no image and write nothing; asking
+    them for an output directory asked for a workspace nobody would fill.
+    """
+    if not (galileo_input_dir / FRAMES_META_NAME).is_file():
+        pytest.skip(f"missing {galileo_input_dir / FRAMES_META_NAME}")
+    fields: set[str] = {field.name for field in dataclasses.fields(SelectionOptions)}
+    assert "output_dir" not in fields
+    result: StageResult = run_stage(
+        SelectionOptions(input_dir=galileo_input_dir, min_inter_frame_distance=SMOKE_MIN_INTER_FRAME_DISTANCE_M),
+        "pair_selection",
+    )
+    assert result.num_selected_keyframes > 0
+    assert result.num_pairs > 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The publication boundary, end to end
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_a_published_run_says_it_succeeded(galileo_run: PipelineSummary) -> None:
+    """A run directory is only published once it is whole, and it says so."""
+    state: RunState | None = read_run_state(galileo_run.options.output_dir)
+    assert state is not None, f"a colsfm run writes {RUN_STATE_NAME}"
+    assert state.status == "succeeded"
+    assert state.stages_completed == tuple(STAGE_NAMES)
+    assert state.stages_planned == tuple(STAGE_NAMES)
+    assert state.failure is None
+
+
+def test_a_failed_rerun_leaves_the_previous_run_whole(galileo_input_dir: Path, tmp_path: Path) -> None:
+    """The defect the staging workspace exists for: no directory of two runs.
+
+    A first run publishes. A second run over the same destination fails at stage 1
+    — its config directory does not exist — and the destination must still hold the
+    first run, byte for byte, rather than a mixture with `runtime.csv` cleared and
+    the database deleted.
+    """
+    if not (galileo_input_dir / FRAMES_META_NAME).is_file():
+        pytest.skip(f"missing {galileo_input_dir / FRAMES_META_NAME}")
+    output_dir: Path = tmp_path / "cusfm"
+    good: PipelineOptions = PipelineOptions(
+        input_dir=galileo_input_dir,
+        output_dir=output_dir,
+        min_inter_frame_distance=SMOKE_MIN_INTER_FRAME_DISTANCE_M,
+        loop_closure=False,
+    )
+    run_pipeline(good)
+    before: dict[str, int] = {
+        str(path.relative_to(output_dir)): path.stat().st_size for path in sorted(output_dir.rglob("*")) if path.is_file()
+    }
+    assert before, "the first run wrote something"
+
+    doomed: PipelineOptions = replace(good, config_dir=tmp_path / "no_such_config_profile")
+    with pytest.raises(FileNotFoundError):
+        run_pipeline(doomed)
+
+    after: dict[str, int] = {
+        str(path.relative_to(output_dir)): path.stat().st_size for path in sorted(output_dir.rglob("*")) if path.is_file()
+    }
+    assert after == before, "a failed rerun must not touch the destination"
+    assert read_run_state(output_dir) is not None
+    published: RunState | None = read_run_state(output_dir)
+    assert published is not None and published.status == "succeeded"
+
+
+def test_a_benchmark_reader_refuses_a_run_that_did_not_finish(galileo_run: PipelineSummary, tmp_path: Path) -> None:
+    """`colsfm.benchmark.read_run` checks provenance, not just file presence."""
+    published: Path = galileo_run.options.output_dir
+    unfinished: Path = tmp_path / "unfinished"
+    shutil.copytree(published, unfinished)
+    state: RunState = read_run_state(unfinished)  # type: ignore[assignment]
+    (unfinished / RUN_STATE_NAME).write_text(to_json(replace(state, status="failed", failure="boom")) + "\n")
+
+    with pytest.raises(ValueError, match="holds a run that failed"):
+        read_run(unfinished, "unfinished")
+    # The same directory reads fine while it says it succeeded.
+    read_run(published, "published")
+
+
+def test_a_reference_run_without_a_state_file_still_reads(galileo_run: PipelineSummary, tmp_path: Path) -> None:
+    """A `pycusfm` run has no `run_state.json`; the reader must not demand one."""
+    foreign: Path = tmp_path / "blob_style"
+    shutil.copytree(galileo_run.options.output_dir, foreign)
+    (foreign / RUN_STATE_NAME).unlink()
+    read_run(foreign, "blob_style")

@@ -12,7 +12,11 @@ results.
 |---|---|
 | `__init__.py` | Package docstring and `REPO_ROOT`. Turns on the beartype claw when `PIXI_DEV_MODE=1`. |
 | `__main__.py` | The tyro CLI. Two subcommands: `run` (all eight stages) and `stage` (one metadata-only stage, no images and no GPU). |
-| `pipeline.py` | The eight stages wired into one run. The replacement for `pycusfm.cusfm_runner.CusfmRunner.run_all`, down to the `runtime.csv` layout. |
+| `pipeline.py` | The one runner, and `PipelineObserver` — the seam a viewer or a notebook watches a run through, instead of sequencing the stages itself. The replacement for `pycusfm.cusfm_runner.CusfmRunner.run_all`, down to the `runtime.csv` layout. |
+| `run_config.py` | `PipelineOptions` as the command line spells it, `SelectionOptions` for the two metadata-only stages, and the `ResolvedRun` every stage actually takes. Resolution happens once, before the workspace exists, and validates as it goes. |
+| `run_lifecycle.py` | The stage vocabulary, the `StageLedger` that `runtime.csv` and `summary.json` both come from, and the staging workspace a run publishes across with `RunWorkspace.publish`, so a failed rerun cannot leave a directory holding two runs. |
+| `run_report.py` | `summary.json` and `loop_edges.json`: what a finished run says about itself, as data a benchmark or a viewer can read. |
+| `stages.py` | One `run_*_stage` function per stage and the typed result each returns. They carry no timing and write no `runtime.csv` row, so a caller stepping through a dataset one stage at a time reuses exactly the code a full run executes. |
 | `schema.py` | Runtime protobuf message classes built from the vendored `data/cusfm_schema/cusfm_protos.fdset`, so cuSFM protos are read by protobuf itself and not by guesswork. |
 | `config.py` | cuSFM's protobuf-text configs as typed frozen dataclasses. |
 | `frames_meta.py` | Typed access to `frames_meta.json` (`KeyframesMetadataCollection`), including the grouping of keyframes into rig frames by `synced_sample_id`. |
@@ -25,16 +29,27 @@ results.
 | `features_trt.py` | The same stage through the blob's own `aliked.onnx` and its FP16 engine, with the blob's preprocessing and pixel mapping. `--features-backend tensorrt`. |
 | `features_raco.py` | The same stage through fabio-sim's RaCo-ALIKED on a batch-dynamic FP16 engine, 8 images per execution; reuses `features_trt`'s preprocessing and pixel mapping unchanged. `--features-backend raco`. |
 | `pairs.py` | Which image pairs get matched. The replacement for `feature_matcher_task_builder_main`. |
-| `matching.py` | LightGlue matching plus COLMAP's geometric verification, then the spatial subsample. The replacement for `feature_matcher_main`. Also owns the blob's real SSC (`select_by_square_covering`) and the cap modes (`resolve_match_cap`). |
+| `matching.py` | LightGlue matching plus COLMAP's geometric verification, then the spatial subsample. The replacement for `feature_matcher_main`. Also owns the blob's real SSC (`select_by_square_covering`) and `MatchLimitPolicy`, the one answer to how many matches a pair may keep. |
 | `matching_trt.py` | The same stage through the blob's own `lightglue_aliked.onnx` and its FP16 engine. The only path with the per-match score, so it runs the real SSC before verification instead of the score-free grid subsample. `--matching-backend tensorrt`. |
 | `matching_raco.py` | The same stage through LightGlue+, the matcher fabio-sim trained against RaCo-ALIKED. `match_pairs_tensorrt` does the work; this module supplies the graph and the normalised keypoint frame it wants. `--matching-backend raco`. |
 | `retrieval.py` | Image retrieval for loop closure, brute force or vocabulary tree. The replacement for `generate_bow_vocabulary_main` and `generate_bow_index_main`. |
-| `loop_closure.py` | Loop-closure candidate selection, gating and rig-edge assembly. The replacement for `generate_association_main`'s `RetrievalLoopAssociations`. |
+| `loop_pairs.py` | Which image pairs a loop measurement will ask for, derived from the rig geometry and the shortlist before any of it runs. Shared by the planner and the estimator so the two cannot drift. |
+| `loop_shortlist.py` | The retrieval half of the loop funnel — the gates, the `|dt|` banding, the rig-pair deduplication and the counters they fill. It reads no match at all, which is why the loop stage no longer has to run itself twice to learn its pair list. |
+| `loop_closure.py` | Loop-closure candidate selection, gating and rig-edge assembly. The replacement for `generate_association_main`'s `RetrievalLoopAssociations`. `plan_loop_search` decides which rig pairs to measure and which image pairs that needs *without matching anything*; `verify_loop_plan` is the only pass that reads a match. |
 | `loop_pose.py` | The metric rig-to-rig relative pose a loop edge carries: a local triangulated map in the source rig frame, then generalized resection of the target rig. The replacement for `StereoPoseEstimator`. |
 | `pose_graph.py` | Rig-level pose graph optimisation on pyceres with a Python residual. The replacement for `pose_graph_main`. |
 | `ceres_pose.py` | The pyceres plumbing `pose_graph` and `extrinsic_refinement` share: the linear-solver vocabulary, quaternion priming, the manifold, `SolverOptions` and summary unpacking. |
+| `rig_geometry.py` | The rig the two generalized estimators take as fixed arguments — `RigGeometry`, `RigFrameIndex` and the constructors that build them from `frames_meta.json`. |
 | `reconstruction.py` | A `pycolmap.Reconstruction` built from `frames_meta.json`: the rig, the frames and the images. The rig's reference sensor is the vehicle body by default, or a named camera when `reference_camera_params_id` is given — which is what extrinsic refinement needs, because COLMAP freezes every `sensor_from_rig` of a rig whose reference sensor owns no images. `RigReference` inverts that change of basis. |
 | `mapping.py` | Triangulation and global bundle adjustment. The replacement for `keypoints_mapper_main`. Takes the `PosedModel` `reconstruction` builds, so the reconstruction and its `RigReference` can never be mispaired. With `optimize_extrinsics` it also refines the rig extrinsics through pycolmap's rig BA, holding the gauge camera fixed, and reports them as `MappingResult.refined_extrinsics` — the unregularised path, kept for comparison behind `--no-regularised-extrinsics`. `--ba-backend caspar` swaps Ceres for COLMAP's GPU bundle adjustment, which needs the `colsfm-caspar` environment and falls back to Ceres, loudly, when the build, the camera model or `--optimize-extrinsics` rules it out — which camera models are in is measured from the build at run time, so the OPENCV_FISHEYE adapter of `colsfm-caspar-fisheye` is used where it exists (`docs/caspar-fisheye-adapter.md`); a CASPAR run then ends on one Ceres global bundle adjustment over the final model (`--no-caspar-ceres-polish` to ablate), which is what buys Ceres' accuracy at a third of its mapping time. |
+| `ba_backend.py` | Which bundle-adjustment backend a run gets, and what this build's CASPAR can do. `CasparCapability` distinguishes an absent build from a failed probe from a measured one; `BaExecutionPlan` records the effective backend and the reason for any fallback, so `summary.json` can say why a run that asked for the GPU solved on the CPU. |
+| `correspondences.py` | Reading the database's verified two-view geometries into the graph the triangulator walks; the mapper's input. |
+| `point_filters.py` | The guards that run after a solve: a point outside the world, a point inside a camera, a projection that is not finite. |
+| `mapping_result.py` | What a mapping pass reports: its rounds, its closing Ceres polish and its final model. |
+| `solver_report.py` | The one reader of Ceres' brief report. Unavailable statistics stay `None` rather than becoming a zero-cost solve — which is the normal outcome on the CASPAR backend, since it writes no Ceres line at all. |
+| `extrinsic_observations.py` | The observation graph the refinement solves over: which image saw which point and where, indexed once per stage and folded in per round. |
+| `extrinsic_costs.py` | What Ceres gets from one residual block: the rig reprojection cost with its analytic pose Jacobian, and the repeated-Cauchy loss. |
+| `extrinsic_solve.py` | Problem assembly: `ExtrinsicRefinementOptions`, the three block builders and `solve_extrinsics`. |
 | `extrinsic_refinement.py` | Regularised rig-extrinsic refinement: cuSFM's absolute (Eq. 14) and inter-camera relative (Eq. 6) extrinsic priors in pyceres, alternated with pycolmap's own bundle adjustment. What `--optimize-extrinsics` runs by default, because pycolmap's rig BA carries no prior term. |
 | `export.py` | Writers for the four artifacts a cuSFM run leaves behind: the `sparse/` model, `kpmap/keyframes/frames_meta.json`, the TUM pose files and `runtime.csv`. The replacement for `kpmap_to_colmap`, `extract_pose_from_map_main` and `update_keyframe_pose_main`. |
 | `benchmark.py` | Metrics that compare two runs in the cuSFM output layout, plus the acceptance bounds. It reads both runs the same way and knows nothing about which producer wrote which. Re-exports the names `alignment` and `runtime` own, so one import still covers a whole comparison. |
@@ -43,6 +58,11 @@ results.
 | `bench_report.py` | The markdown rendering of a comparison. |
 | `bench_cli.py` | The tyro CLI over `benchmark`. Writes the markdown report, the JSON report and the Rerun recording. |
 | `rerun_log.py` | Logs a two-run comparison into one Rerun recording: two exoego rigs, two clouds, the trajectory polylines and the report. |
+| `walkthrough.py` | The stage-by-stage Rerun walkthrough's CLI and its `WalkthroughObserver`, which draws a `run_pipeline` run rather than running one of its own. |
+| `walkthrough_stages.py` | What a walkthrough stage *is*: its prose, its timeline index, its entity root, and the palette every panel shares. |
+| `walkthrough_draw.py` | The drawing primitives — frusta, arcs, imagery — and the Markdown notes document each panel closes with. |
+| `walkthrough_panels.py` | One `log_*` per stage: what that stage produced, drawn into the recording. |
+| `walkthrough_blueprint.py` | The tab-per-stage layout, sent once at the end because stage 2's sample panes are not known before the run. |
 
 ## Stage order
 
@@ -55,10 +75,10 @@ row per stage under these names:
 | 2 | `feature_extraction` | `database`, `cameras`, `features`, `features_trt`, `features_raco` | `feature_extractor_main` (per-image half) |
 | 3 | `pair_selection` | `pairs` | `feature_matcher_task_builder_main` |
 | 4 | `matching` | `matching`, `matching_trt`, `matching_raco` | `feature_matcher_main` |
-| 5 | `loop_closure` | `retrieval`, `loop_closure`, `loop_pose` | `generate_bow_*_main` + `generate_association_main` |
+| 5 | `loop_closure` | `retrieval`, `loop_shortlist`, `loop_closure`, `loop_pose` | `generate_bow_*_main` + `generate_association_main` |
 | 6 | `pose_graph` | `pose_graph` | `pose_graph_main` |
-| 7 | `reconstruction` | `reconstruction`, `mapping` | `keypoints_mapper_main` |
-| 7b | `extrinsic_refinement` | `reconstruction`, `mapping`, `extrinsic_refinement` | `keypoints_mapper_main --optimize_extrinsics=True` (only with `--optimize-extrinsics`) |
+| 7 | `reconstruction` | `reconstruction`, `mapping`, `correspondences`, `point_filters`, `ba_backend` | `keypoints_mapper_main` |
+| 7b | `extrinsic_refinement` | `reconstruction`, `mapping`, `extrinsic_refinement`, `extrinsic_observations`, `extrinsic_costs`, `extrinsic_solve` | `keypoints_mapper_main --optimize_extrinsics=True` (only with `--optimize-extrinsics`) |
 | 8 | `export` | `export` | `kpmap_to_colmap`, `extract_pose_from_map_main`, `update_keyframe_pose_main` |
 
 Each stage is a `run_<stage>_stage` function returning a small result dataclass, and

@@ -31,6 +31,7 @@ from colsfm.geometry import rigid3d_from_axis_angle_degrees
 from colsfm.pose_graph import (
     Information6,
     PoseGraphEdge,
+    PoseGraphResult,
     PoseGraphSolveOptions,
     RelativePoseCost,
     RigNode,
@@ -659,29 +660,79 @@ def test_archived_loop_edge_weights_follow_the_documented_score_convention() -> 
 
 
 # --------------------------------------------------------------------------------------
-# runtime
+# the thousand-node solve: what it recovers, and how long it took
 # --------------------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(
-    os.environ.get("PIXI_DEV_MODE") == "1",
-    reason="PIXI_DEV_MODE=1 puts beartype's claw on every call in the Ceres inner loop; timing is meaningless there",
-)
-def test_a_thousand_node_graph_solves_within_one_second() -> None:
-    """Budget from the task: the blob solves 1132 nodes in 6.5 ms; we allow 1.0 s."""
+@dataclass(frozen=True, slots=True)
+class ThousandNodeSolve:
+    """One `solve_pose_graph` call over a 1000-node square loop closed by 50 loop edges."""
+
+    result: PoseGraphResult
+    """What the solver returned."""
+    n_edges: int
+    """Edges in the graph: 999 sequential plus 50 truth loop edges."""
+    error_before_m: Float[np.ndarray, "n_nodes"]
+    """Per-node position error against the truth before the solve, in metres."""
+    error_after_m: Float[np.ndarray, "n_nodes"]
+    """Per-node position error against the truth after the solve, in metres."""
+    elapsed_s: float
+    """Wall-clock seconds the solve took. Only the `perf` test reads this."""
+
+
+@pytest.fixture(scope="module")
+def thousand_node_solve() -> ThousandNodeSolve:
+    """Solve the largest graph in the suite once, and hand back both what and how long.
+
+    The measurement and the recovery come from the same solve on purpose: two
+    tests read this, and running the graph twice would double the suite's
+    slowest pose-graph work to no end.
+
+    Returns:
+        The solved graph, its error before and after, and its wall-clock time.
+    """
     loop: SquareLoop = make_square_loop(n_nodes=1000, rotation_bias_deg=0.004)
     edges: list[PoseGraphEdge] = sequential_edges(loop.odometry, connected_keyframe_num=1)
     assert len(edges) == 999
     for index in range(50):
         edges.append(truth_loop_edge(loop, source=999 - index, target=index, information=np.eye(6) * 10.0))
 
-    before: Float[np.ndarray, "n"] = position_errors({node.rig_id: node.world_T_rig for node in loop.odometry}, loop.truth)
+    before: Float[np.ndarray, "n_nodes"] = position_errors(
+        {node.rig_id: node.world_T_rig for node in loop.odometry}, loop.truth
+    )
     started: float = time.perf_counter()
-    result = solve_pose_graph(loop.odometry, edges, options=PoseGraphSolveOptions())
+    result: PoseGraphResult = solve_pose_graph(loop.odometry, edges, options=PoseGraphSolveOptions())
     elapsed_s: float = time.perf_counter() - started
-    after: Float[np.ndarray, "n"] = position_errors(result.world_T_rig, loop.truth)
+    after: Float[np.ndarray, "n_nodes"] = position_errors(result.world_T_rig, loop.truth)
 
-    print(f"solve_pose_graph: {len(loop.odometry)} nodes, {len(edges)} edges, {result.iterations} iterations, {elapsed_s * 1e3:.1f} ms")
-    assert result.termination == "CONVERGENCE"
-    assert after.max() * 5.0 < before.max(), "the solve must actually close the loop, not just terminate"
-    assert elapsed_s < 1.0, f"{elapsed_s:.3f} s"
+    print(
+        f"solve_pose_graph: {len(loop.odometry)} nodes, {len(edges)} edges, "
+        f"{result.iterations} iterations, {elapsed_s * 1e3:.1f} ms"
+    )
+    return ThousandNodeSolve(
+        result=result, n_edges=len(edges), error_before_m=before, error_after_m=after, elapsed_s=elapsed_s
+    )
+
+
+def test_a_thousand_node_graph_closes_its_loop(thousand_node_solve: ThousandNodeSolve) -> None:
+    """The solve converges and cuts the worst position error at least fivefold.
+
+    This is the numerical claim, and it holds on any machine: a graph this size
+    must actually close, not merely terminate. Its wall-clock cost is a separate
+    test below, because a deadline measures the machine as much as the code.
+    """
+    assert thousand_node_solve.n_edges == 1049
+    assert thousand_node_solve.result.termination == "CONVERGENCE"
+    assert thousand_node_solve.error_after_m.max() * 5.0 < thousand_node_solve.error_before_m.max(), (
+        "the solve must actually close the loop, not just terminate"
+    )
+
+
+@pytest.mark.perf
+@pytest.mark.skipif(
+    os.environ.get("PIXI_DEV_MODE") == "1",
+    reason="PIXI_DEV_MODE=1 puts beartype's claw on every call in the Ceres inner loop; timing is meaningless there",
+)
+def test_a_thousand_node_graph_solves_within_one_second(thousand_node_solve: ThousandNodeSolve) -> None:
+    """Budget from the task: the blob solves 1132 nodes in 6.5 ms; we allow 1.0 s."""
+    assert thousand_node_solve.elapsed_s < 1.0, f"{thousand_node_solve.elapsed_s:.3f} s"

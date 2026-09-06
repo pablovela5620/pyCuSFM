@@ -2,30 +2,42 @@
 
 cuSFM runs ALIKED and LightGlue as TensorRT engines built from the two ONNX
 graphs in `pycusfm/models/aliked_lightglue/`, caching each engine next to its
-graph under `<stem>_fp16_<digest>_<trt-version>_sm_<arch>.engine`
+graph under `<stem>_fp16[_<profile tag>]_<identity>_<trt-version>_sm_<arch>.engine`
 (feature_matcher_main.md §5.2). This module owns that cache and the buffer
 management around one execution context; the two backends above own the
-pre- and post-processing.
+pre- and post-processing. `tools/raco_extract.py` builds through this cache too,
+rather than keeping a second builder of its own.
 
-`tools/raco_extract.py` is the working prior art — the same builder flags, the
-same content-addressed timing cache, the same `set_tensor_address` +
-`execute_async_v3` loop. Two things differ here:
+**The cache key is a complete build identity.** `engine_build_identity` digests
+every input that decides what the serialised bytes are: the graph's own SHA-256,
+the optimisation profiles as `(min, opt, max)` per binding, the precision flag,
+the tactic workspace ceiling, the builder optimisation level, the full TensorRT
+runtime version and the target compute capability. Anything less would let a
+changed input reuse a stale engine — which is exactly what a name built from the
+file name alone did, and what a digest of the graph alone still does when the
+caller re-tunes a profile.
 
-* **Prebuilt blob engines are accepted by name, explicitly.** The cache key is
-  the graph's own digest, as it is there, so replacing an ONNX in place cannot
-  reuse the engine built from the previous one. On top of that `resolve_engine`
-  accepts the blob's undigested spelling for the two graphs under `MODEL_DIR`:
-  `aliked_fp16_10_13_3_9_sm_12_0.engine` and
-  `lightglue_aliked_fp16_10_13_3_9_sm_12_0.engine` were built by cuSFM itself,
-  deserialise under this TensorRT and this GPU, and cost about 205 s each to
-  rebuild.
-* **The session is generic.** `TensorRTExtractor` hard-codes ALIKED's
-  `image`/`keypoints`/`descriptors` binding names; LightGlue has four inputs and
-  two outputs, so `TensorRTSession` takes the bindings by name and grows its
-  device buffers when a larger shape arrives.
-* **It runs in the `colsfm` environment**, which carries `tensorrt-cu13` and
-  `cuda-python` but not `onnx`; nothing here imports `onnx`, and the ONNX graph
-  is parsed by TensorRT's own `OnnxParser`.
+**Prebuilt blob engines are accepted by name, explicitly.** `resolve_engine`
+accepts the blob's undigested spelling for the two graphs it ships,
+`aliked_fp16_10_13_3_9_sm_12_0.engine` and
+`lightglue_aliked_fp16_10_13_3_9_sm_12_0.engine`: they were built by cuSFM
+itself, deserialise under this TensorRT and this GPU, and cost about 205 s each
+to rebuild. The allowance is narrow on purpose — `TRUSTED_PREBUILT_GRAPHS` names
+the two stems, and only inside `MODEL_DIR` — so nothing else can pick up an
+engine whose provenance is a file name.
+
+**Publication is atomic and collision-free.** Every build writes to a unique
+temporary file in the destination directory and renames it into place, so two
+processes building the same engine cannot interleave into one file and a crashed
+build leaves no half-written engine for the next run to deserialise.
+
+**The session is generic.** LightGlue has four inputs and two outputs, so
+`TensorRTSession` takes its bindings by name and grows its device buffers when a
+larger shape arrives.
+
+**It runs in the `colsfm` environment**, which carries `tensorrt-cu13` and
+`cuda-python` but not `onnx`; nothing here imports `onnx`, and the ONNX graph is
+parsed by TensorRT's own `OnnxParser`.
 
 TensorRT and `cuda.bindings` are imported at module scope, so importing this
 module is itself the availability probe: `colsfm.features` and
@@ -37,10 +49,12 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import os
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Final, Self, TypeAlias
+from typing import Any, Final, Literal, Self, TypeAlias
 
 import numpy as np
 import tensorrt as trt
@@ -52,6 +66,13 @@ from colsfm import REPO_ROOT
 
 ShapeProfile: TypeAlias = tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]
 """One optimisation profile for one input: its minimum, optimal and maximum shape."""
+
+EnginePrecision: TypeAlias = Literal["fp16"]
+"""The precisions this cache builds at.
+
+One, today, and named rather than implied: the precision is part of an engine's
+build identity, so it has to be a value the identity can carry rather than a
+constant baked into a format string."""
 
 MODEL_DIR: Final[Path] = REPO_ROOT / "pycusfm" / "models" / "aliked_lightglue"
 """Where the blob keeps `aliked.onnx`, `lightglue_aliked.onnx` and their engines."""
@@ -72,7 +93,25 @@ PREPROCESS_ENGINE_DIR: Final[Path] = REPO_ROOT / "data" / "cusfm_models"
 """Where the generated preprocessing engines are cached; gitignored, like the RaCo graphs."""
 
 ONNX_DIGEST_CHARACTERS: Final[int] = 12
-"""Hex characters of the graph's SHA-256 that go into the engine's file name."""
+"""Hex characters of the build identity's SHA-256 that go into the engine's file name."""
+
+PUBLISHED_FILE_MODE: Final[int] = 0o644
+"""Permissions a published engine or timing cache carries.
+
+`tempfile.mkstemp` opens at 0600; these are build products in a shared cache
+directory, so they are made world-readable on the way out."""
+
+DEFAULT_PRECISION: Final[EnginePrecision] = "fp16"
+"""What `build_fp16_engine` builds at, and the `_fp16` the shipped engines are named with."""
+
+TRUSTED_PREBUILT_GRAPHS: Final[frozenset[str]] = frozenset({"aliked", "lightglue_aliked"})
+"""The graph stems whose cuSFM-built engines are accepted without a build identity.
+
+Exactly the two `pycusfm/models/aliked_lightglue/` ships. Their engines carry no
+digest, cost about 205 s each to rebuild, and deserialise under this TensorRT and
+this GPU — so accepting them is a deliberate allowance for trusted prebuilt
+blobs. Naming the stems, rather than accepting anything inside `MODEL_DIR`, is
+what keeps that allowance from spreading to a graph somebody drops in later."""
 
 BGR_TO_RGB_INDICES: Final[tuple[int, int, int]] = (2, 1, 0)
 """The channel permutation the host used to do with `resized_bgr_hwc[..., ::-1]`."""
@@ -249,19 +288,133 @@ def tensorrt_version_tag() -> str:
     return "_".join(numeric[:4])
 
 
+def tensorrt_runtime_version() -> str:
+    """The full TensorRT version string an engine is only valid under.
+
+    Separate from `tensorrt_version_tag`, which drops the wheel's packaging
+    suffix to reproduce the blob's engine-file spelling. The build identity wants
+    the whole thing, because `10.13.3.9.post1` and `10.13.3.9` are different
+    installations even when they name the same TensorRT.
+
+    Returns:
+        `tensorrt.__version__`.
+    """
+    return str(trt.__version__)
+
+
 def onnx_digest(onnx_path: Path) -> str:
-    """A short content hash of one ONNX graph, for the engine's file name.
+    """The full content hash of one ONNX graph.
 
     Args:
         onnx_path: The graph to digest.
 
     Returns:
-        The first `ONNX_DIGEST_CHARACTERS` hex characters of its SHA-256.
+        The hex SHA-256 of its bytes.
 
     Raises:
         FileNotFoundError: When the graph is missing.
     """
-    return hashlib.sha256(onnx_path.read_bytes()).hexdigest()[:ONNX_DIGEST_CHARACTERS]
+    return hashlib.sha256(onnx_path.read_bytes()).hexdigest()
+
+
+def _canonical_profiles(profiles: Mapping[str, ShapeProfile] | None) -> str:
+    """Spell one optimisation-profile mapping as a stable string.
+
+    Sorted by binding name so two equal mappings built in different orders digest
+    the same, and written out in full so a re-tuned `opt` shape — which changes
+    which tactics TensorRT picks, and therefore the engine — is a different
+    identity.
+
+    Args:
+        profiles: Optimisation profile per dynamic input, or `None` for a graph
+            built at its declared shapes.
+
+    Returns:
+        `"none"`, or `name:min|opt|max` per binding joined by `;`.
+    """
+    if not profiles:
+        return "none"
+    return ";".join(
+        f"{name}:{tuple(profiles[name][0])}|{tuple(profiles[name][1])}|{tuple(profiles[name][2])}"
+        for name in sorted(profiles)
+    )
+
+
+def engine_build_identity(
+    onnx_path: Path,
+    profiles: Mapping[str, ShapeProfile] | None = None,
+    *,
+    precision: EnginePrecision = DEFAULT_PRECISION,
+    workspace_gib: int = DEFAULT_WORKSPACE_GIB,
+    optimization_level: int = DEFAULT_OPTIMIZATION_LEVEL,
+    device_index: int = 0,
+) -> str:
+    """Digest everything that decides what one engine's bytes are.
+
+    Every input to `build_fp16_engine`, plus the two facts that make a serialised
+    engine non-portable. Leaving any of them out is what lets a stale engine be
+    reused: a name built from the file name alone survives replacing the graph,
+    and a name built from the graph's digest alone survives re-tuning a profile
+    or dropping the builder's optimisation level.
+
+    Args:
+        onnx_path: The graph to build from; its bytes are hashed.
+        profiles: Optimisation profile per dynamic input.
+        precision: The builder precision flag.
+        workspace_gib: Tactic workspace ceiling in GiB.
+        optimization_level: TensorRT builder search level.
+        device_index: CUDA device the engine is built for.
+
+    Returns:
+        The first `ONNX_DIGEST_CHARACTERS` hex characters of the identity's SHA-256.
+
+    Raises:
+        FileNotFoundError: When the graph is missing.
+    """
+    fields: str = "\n".join(
+        [
+            f"graph={onnx_digest(onnx_path)}",
+            f"profiles={_canonical_profiles(profiles)}",
+            f"precision={precision}",
+            f"workspace_gib={workspace_gib}",
+            f"optimization_level={optimization_level}",
+            f"tensorrt={tensorrt_runtime_version()}",
+            f"architecture={compute_capability(device_index)}",
+        ]
+    )
+    return hashlib.sha256(fields.encode()).hexdigest()[:ONNX_DIGEST_CHARACTERS]
+
+
+def publish_atomically(path: Path, payload: bytes) -> None:
+    """Write a complete file through a unique temporary and one rename.
+
+    `path.with_suffix(".tmp")` is not enough: two processes building the same
+    engine would write the same temporary, and the loser's partial bytes could be
+    renamed over the winner's. A `mkstemp` name in the destination's own
+    directory is unique per process and on the same filesystem, so the rename is
+    atomic and a reader never sees a half-written engine.
+
+    Args:
+        path: Destination.
+        payload: The whole file's bytes.
+
+    Raises:
+        OSError: When the write or the rename fails; the temporary is removed
+            first, so a failure leaves the destination as it was.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(dir=path.parent, prefix=f"{path.name}.", suffix=".tmp")
+    temporary_path: Path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+        # `mkstemp` opens at 0600; an engine cache is not a secret, and a shared
+        # `data/cusfm_models` has to stay readable by whoever built it second.
+        temporary_path.chmod(PUBLISHED_FILE_MODE)
+        temporary_path.replace(path)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
 
 
 def blob_engine_path_for(onnx_path: Path, *, profile_tag: str = "", device_index: int = 0) -> Path:
@@ -282,31 +435,56 @@ def blob_engine_path_for(onnx_path: Path, *, profile_tag: str = "", device_index
     return onnx_path.with_name(f"{onnx_path.stem}_fp16{tag}_{tensorrt_version_tag()}_sm_{compute_capability(device_index)}.engine")
 
 
-def engine_path_for(onnx_path: Path, *, profile_tag: str = "", device_index: int = 0) -> Path:
-    """Where the engine built from one ONNX graph lives.
+def engine_path_for(
+    onnx_path: Path,
+    profiles: Mapping[str, ShapeProfile] | None = None,
+    *,
+    profile_tag: str = "",
+    device_index: int = 0,
+    precision: EnginePrecision = DEFAULT_PRECISION,
+    workspace_gib: int = DEFAULT_WORKSPACE_GIB,
+    optimization_level: int = DEFAULT_OPTIMIZATION_LEVEL,
+) -> Path:
+    """Where the engine built from one ONNX graph and one set of build settings lives.
 
-    The name carries a digest of the graph's bytes, so replacing an ONNX file in
-    place names a different engine instead of silently reusing the one built from
-    the previous graph. A graph that is not on disk has no bytes to digest — the
-    prebuilt-engine case — and keeps the blob's own spelling.
+    The name carries `engine_build_identity`, so nothing that changes the engine's
+    bytes — the graph, the profiles, the precision, the workspace, the
+    optimisation level, the TensorRT version or the GPU architecture — can reuse
+    an engine built from something else. A graph that is not on disk has nothing
+    to digest — the prebuilt-engine case — and keeps the blob's own spelling.
+
+    The human-readable `_<trt version>_sm_<arch>` suffix stays even though the
+    identity already covers both: it is the blob's own spelling, and it makes an
+    engine directory legible without recomputing a digest.
 
     Args:
         onnx_path: The graph, e.g. `pycusfm/models/aliked_lightglue/aliked.onnx`.
-        profile_tag: A short name for the optimisation profile, inserted after
-            `_fp16`. A shape-dynamic graph must pass one: its engine is only valid
-            for the bounds it was built with, and the digest says nothing about
-            those — they come from the caller, not from the graph.
+        profiles: Optimisation profile per dynamic input; part of the identity.
+        profile_tag: A short readable name for the profile, inserted after the
+            precision. Optional now that the profiles themselves are digested,
+            but it is what tells two engines apart in a directory listing.
         device_index: CUDA device the engine is built for.
+        precision: The builder precision flag.
+        workspace_gib: Tactic workspace ceiling in GiB.
+        optimization_level: TensorRT builder search level.
 
     Returns:
-        `<onnx dir>/<stem>_fp16[_<profile tag>]_<digest>_<trt version>_sm_<arch>.engine`,
+        `<onnx dir>/<stem>_<precision>[_<profile tag>]_<identity>_<trt version>_sm_<arch>.engine`,
         or `blob_engine_path_for`'s answer when the graph is missing.
     """
     if not onnx_path.is_file():
         return blob_engine_path_for(onnx_path, profile_tag=profile_tag, device_index=device_index)
     tag: str = f"_{profile_tag}" if profile_tag else ""
-    identity: str = f"{onnx_digest(onnx_path)}_{tensorrt_version_tag()}_sm_{compute_capability(device_index)}"
-    return onnx_path.with_name(f"{onnx_path.stem}_fp16{tag}_{identity}.engine")
+    identity: str = engine_build_identity(
+        onnx_path,
+        profiles,
+        precision=precision,
+        workspace_gib=workspace_gib,
+        optimization_level=optimization_level,
+        device_index=device_index,
+    )
+    machine: str = f"{tensorrt_version_tag()}_sm_{compute_capability(device_index)}"
+    return onnx_path.with_name(f"{onnx_path.stem}_{precision}{tag}_{identity}_{machine}.engine")
 
 
 def build_fp16_engine(
@@ -321,7 +499,7 @@ def build_fp16_engine(
 
     Args:
         onnx_path: The ONNX graph to parse.
-        engine_path: Destination; a `.tmp` sibling is renamed onto it.
+        engine_path: Destination; `publish_atomically` renames a unique temporary onto it.
         profiles: Optimisation profile per dynamic input, as
             `(minimum, optimal, maximum)` shapes. Inputs absent from the mapping
             keep the shape the graph declares, which is what a fully static graph
@@ -371,31 +549,60 @@ def build_fp16_engine(
     serialized: trt.IHostMemory | None = builder.build_serialized_network(network, builder_config)
     if serialized is None:
         raise RuntimeError(f"TensorRT engine build failed for {onnx_path}")
-    engine_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path: Path = engine_path.with_suffix(engine_path.suffix + ".tmp")
-    temporary_path.write_bytes(bytes(serialized))
-    temporary_path.replace(engine_path)
-    temporary_cache_path: Path = timing_cache_path.with_suffix(timing_cache_path.suffix + ".tmp")
-    temporary_cache_path.write_bytes(bytes(builder_config.get_timing_cache().serialize()))
-    temporary_cache_path.replace(timing_cache_path)
+    publish_atomically(engine_path, bytes(serialized))
+    publish_atomically(timing_cache_path, bytes(builder_config.get_timing_cache().serialize()))
     print(f"[colsfm] wrote {engine_path} ({engine_path.stat().st_size / 2**20:.1f} MiB)")
     return engine_path
 
 
+def trusted_prebuilt_engine(onnx_path: Path, *, profile_tag: str = "", device_index: int = 0) -> Path | None:
+    """The cuSFM-built engine for one of the blob's own graphs, when there is one.
+
+    The one place an engine is accepted on a file name rather than on a build
+    identity, and deliberately narrow: the graph has to be one of
+    `TRUSTED_PREBUILT_GRAPHS`, it has to sit in `MODEL_DIR`, the engine has to
+    exist, and its name still has to carry this TensorRT version and this GPU
+    architecture. Those engines were serialised by cuSFM itself and cost about
+    205 s each to rebuild.
+
+    Args:
+        onnx_path: The ONNX graph.
+        profile_tag: A short name for the optimisation profile.
+        device_index: CUDA device the engine is built for.
+
+    Returns:
+        The prebuilt engine, or `None` when this graph has no trusted one.
+    """
+    if onnx_path.parent != MODEL_DIR or onnx_path.stem not in TRUSTED_PREBUILT_GRAPHS:
+        return None
+    prebuilt: Path = blob_engine_path_for(onnx_path, profile_tag=profile_tag, device_index=device_index)
+    return prebuilt if prebuilt.is_file() else None
+
+
 def resolve_engine(
-    onnx_path: Path, profiles: Mapping[str, ShapeProfile] | None = None, *, profile_tag: str = "", device_index: int = 0
+    onnx_path: Path,
+    profiles: Mapping[str, ShapeProfile] | None = None,
+    *,
+    profile_tag: str = "",
+    device_index: int = 0,
+    precision: EnginePrecision = DEFAULT_PRECISION,
+    workspace_gib: int = DEFAULT_WORKSPACE_GIB,
+    optimization_level: int = DEFAULT_OPTIMIZATION_LEVEL,
 ) -> Path:
-    """Return the cached engine for one graph, building it when it is absent.
+    """Return the cached engine for one graph and one set of build settings.
 
     Two names are accepted, in this order:
 
-    1. The digest-named engine of `engine_path_for`, which is what any build here
-       writes and the only name a locally generated graph — RaCo's, the
-       preprocessing ones — can hit.
-    2. The blob's own spelling, but **only** for a graph in `MODEL_DIR`. Those
-       engines were built by cuSFM itself from the two graphs it ships, cost
-       about 205 s each to rebuild, and carry no digest; accepting them is a
-       deliberate allowance for trusted prebuilt engines, not a fallback.
+    1. The identity-named engine of `engine_path_for`, which is what any build
+       here writes and the only name a locally generated graph — RaCo's, the
+       preprocessing ones — can hit. Every input to the build is in that name, so
+       a hit really is an engine built from these bytes with these settings.
+    2. The blob's own spelling, for the two graphs `TRUSTED_PREBUILT_GRAPHS`
+       names; see `trusted_prebuilt_engine`.
+
+    Otherwise the engine is built, with the same settings the name was computed
+    from — so the file the caller gets back always matches the name it was
+    looked up under.
 
     Args:
         onnx_path: The ONNX graph.
@@ -403,17 +610,30 @@ def resolve_engine(
         profile_tag: Names the profile in the cached engine's file name; see
             `engine_path_for`.
         device_index: CUDA device the engine is built for.
+        precision: The builder precision flag.
+        workspace_gib: Tactic workspace ceiling in GiB.
+        optimization_level: TensorRT builder search level, 0 to 5.
 
     Returns:
         The engine file.
     """
-    engine_path: Path = engine_path_for(onnx_path, profile_tag=profile_tag, device_index=device_index)
+    engine_path: Path = engine_path_for(
+        onnx_path,
+        profiles,
+        profile_tag=profile_tag,
+        device_index=device_index,
+        precision=precision,
+        workspace_gib=workspace_gib,
+        optimization_level=optimization_level,
+    )
     if engine_path.is_file():
         return engine_path
-    prebuilt: Path = blob_engine_path_for(onnx_path, profile_tag=profile_tag, device_index=device_index)
-    if onnx_path.parent == MODEL_DIR and prebuilt.is_file():
+    prebuilt: Path | None = trusted_prebuilt_engine(onnx_path, profile_tag=profile_tag, device_index=device_index)
+    if prebuilt is not None:
         return prebuilt
-    return build_fp16_engine(onnx_path, engine_path, profiles)
+    return build_fp16_engine(
+        onnx_path, engine_path, profiles, workspace_gib=workspace_gib, optimization_level=optimization_level
+    )
 
 
 class TensorRTSession:
@@ -631,7 +851,7 @@ def build_preprocess_engine(
     one `numpy` used to build (`tests/colsfm/test_features_trt_gpu_preprocess.py`).
 
     Args:
-        engine_path: Destination; a `.tmp` sibling is renamed onto it.
+        engine_path: Destination; `publish_atomically` renames a unique temporary onto it.
         height: Input height, matching the consumer engine.
         width: Input width, matching the consumer engine.
         max_batch: The profile's `max` batch.
@@ -679,10 +899,7 @@ def build_preprocess_engine(
     serialized: trt.IHostMemory | None = builder.build_serialized_network(network, builder_config)
     if serialized is None:
         raise RuntimeError(f"TensorRT could not build the uint8 preprocessing engine for {height}x{width}")
-    engine_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path: Path = engine_path.with_suffix(engine_path.suffix + ".tmp")
-    temporary_path.write_bytes(bytes(serialized))
-    temporary_path.replace(engine_path)
+    publish_atomically(engine_path, bytes(serialized))
     return engine_path
 
 
