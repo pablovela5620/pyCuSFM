@@ -276,18 +276,16 @@ from colsfm.config import PoseGraphConfig
 from colsfm.database import ImagePair, read_keypoints_batch
 from colsfm.frames_meta import FramesMeta, KeyframeMeta
 from colsfm.geometry import MICROSECONDS_PER_SECOND
+from colsfm.loop_pairs import required_image_pairs
 from colsfm.loop_pose import (
     DEFAULT_RIG_POSE_CONFIG,
     Keypoints,
     MatchFunction,
-    RigFrameIndex,
-    RigGeometry,
     RigPoseConfig,
     RigPoseEstimate,
     RigPoseEstimator,
     RigPoseOutcome,
     RigPoseRejection,
-    required_image_pairs,
 )
 from colsfm.loop_shortlist import (
     FunnelCounters,
@@ -298,7 +296,7 @@ from colsfm.loop_shortlist import (
 )
 from colsfm.pose_graph import Information6, PoseGraphEdge, gate_loop_edges, loop_edge_information
 from colsfm.retrieval import GOOD_SCORE_THRESHOLD, RetrievalIndex
-from colsfm.rig_geometry import rig_frame_index, rig_geometry
+from colsfm.rig_geometry import RigFrameIndex, RigGeometry, rig_frame_index, rig_geometry
 
 __all__ = [
     "FunnelCounters",
@@ -536,7 +534,7 @@ class LoopSearchPlan:
     Nothing in the first pass needed matches. Retrieval, the score and time gates,
     the `|dt|` banding and the rig-pair deduplication read the index and the
     timestamps; the pair list follows from the rig geometry and the shortlist
-    (`colsfm.loop_pose.required_image_pairs`). So the plan is simply that work, done
+    (`colsfm.loop_pairs.required_image_pairs`). So the plan is simply that work, done
     once, and `verify_loop_plan` is the only pass that matches anything.
     """
 
@@ -668,7 +666,9 @@ def plan_loop_search(
         config=config,
         enabled=True,
         rig_pairs=rig_pairs,
-        image_pairs=required_image_pairs(rig_index, empty_geometry, pixels, config.rig_pose, rig_pairs),
+        image_pairs=required_image_pairs(
+            rig_index, empty_geometry, pixels, config.rig_pose.neighbour_span, rig_pairs
+        ),
         groups=tuple(groups),
         geometry=empty_geometry,
         rig_index=rig_index,

@@ -11,11 +11,126 @@ extrinsics work needs the same rig.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+
 import pycolmap
 
 from colsfm.cameras import colmap_cameras
 from colsfm.frames_meta import FramesMeta, KeyframeMeta, RigFrame
-from colsfm.loop_pose import RigFrameIndex, RigGeometry, build_rig_geometry
+
+
+@dataclass(frozen=True, slots=True)
+class RigGeometry:
+    """The rig itself: what the two generalized estimators take as their fixed arguments.
+
+    `cams_from_rig` and `cameras` are parallel to `camera_ids`, and a camera's position in
+    those tuples is the `camera_idx` both pycolmap estimators expect.
+    """
+
+    camera_ids: tuple[int, ...]
+    """cuSFM `camera_params_id` per rig sensor, ascending."""
+    cams_from_rig: tuple[pycolmap.Rigid3d, ...]
+    """`cam_T_vehicle` per camera, i.e. the inverse of the metadata's `vehicle_T_cam`; the
+    same convention `colsfm.reconstruction.build_rig` gives COLMAP."""
+    cameras: tuple[pycolmap.Camera, ...]
+    """Calibrated `pycolmap.Camera` per camera, `has_prior_focal_length` set."""
+    stereo_partner: Mapping[int, int] = field(default_factory=dict)
+    """The other camera of a declared stereo pair, per `camera_params_id`. Empty when the
+    metadata declares no pair, in which case the local map triangulates from the temporal
+    neighbours alone."""
+
+    def position_of(self, camera_id: int) -> int:
+        """Index of one camera in the parallel tuples.
+
+        Args:
+            camera_id: cuSFM `camera_params_id`.
+
+        Returns:
+            Its `camera_idx` for the generalized estimators.
+
+        Raises:
+            KeyError: When the rig holds no such camera.
+        """
+        try:
+            return self.camera_ids.index(camera_id)
+        except ValueError as error:
+            raise KeyError(f"camera {camera_id} is not part of this rig") from error
+
+
+@dataclass(frozen=True, slots=True)
+class RigFrameIndex:
+    """Rig frames in time order, their prior poses and their member images."""
+
+    sequence: tuple[int, ...]
+    """Rig ids in capture order; `neighbours` walks this, not the id arithmetic, because
+    `synced_sample_id` need not be contiguous."""
+    world_T_rig: Mapping[int, pycolmap.Rigid3d]
+    """Prior rig pose per rig id. Only *relative* poses inside a neighbourhood are read, so
+    session-scale drift in these is exactly what the loop edge is allowed to contradict."""
+    keyframe_by_rig_camera: Mapping[tuple[int, int], int]
+    """Image id per `(rig id, camera_params_id)`; a camera may be absent from a rig frame."""
+
+    def keyframe(self, rig_id: int, camera_id: int) -> int | None:
+        """The image one camera contributed to one rig frame.
+
+        Args:
+            rig_id: The rig frame's `synced_sample_id`.
+            camera_id: cuSFM `camera_params_id`.
+
+        Returns:
+            The image id, or None when that camera did not fire in that rig frame.
+        """
+        return self.keyframe_by_rig_camera.get((rig_id, camera_id))
+
+    def neighbours(self, rig_id: int, span: int) -> tuple[int, ...]:
+        """Rig frames within `span` steps of one rig frame, in time order.
+
+        Args:
+            rig_id: The rig frame to look around.
+            span: How many steps to reach in each direction.
+
+        Returns:
+            The neighbouring rig ids, excluding `rig_id` itself; empty when `span` is 0 or
+            the rig id is unknown.
+
+        Raises:
+            ValueError: When `span` is negative.
+        """
+        if span < 0:
+            raise ValueError(f"neighbour span must not be negative, got {span}")
+        try:
+            position: int = self.sequence.index(rig_id)
+        except ValueError:
+            return ()
+        lower: int = max(0, position - span)
+        upper: int = min(len(self.sequence), position + span + 1)
+        return tuple(self.sequence[step] for step in range(lower, upper) if step != position)
+
+
+def build_rig_geometry(
+    cameras: Mapping[int, pycolmap.Camera], vehicle_T_cam: Mapping[int, pycolmap.Rigid3d], stereo_partner: Mapping[int, int]
+) -> RigGeometry:
+    """Assemble the fixed arguments of the generalized estimators.
+
+    Args:
+        cameras: Calibrated `pycolmap.Camera` per `camera_params_id`.
+        vehicle_T_cam: Rig extrinsic per `camera_params_id`, camera to vehicle.
+        stereo_partner: The other camera of a declared stereo pair, per camera id.
+
+    Returns:
+        The rig geometry, cameras ordered by ascending id.
+
+    Raises:
+        KeyError: When a camera has no extrinsic.
+    """
+    camera_ids: tuple[int, ...] = tuple(sorted(cameras))
+    return RigGeometry(
+        camera_ids=camera_ids,
+        cams_from_rig=tuple(vehicle_T_cam[camera_id].inverse() for camera_id in camera_ids),
+        cameras=tuple(cameras[camera_id] for camera_id in camera_ids),
+        stereo_partner=dict(stereo_partner),
+    )
 
 
 def calibrated_cameras(frames_meta: FramesMeta) -> dict[int, pycolmap.Camera]:
