@@ -478,7 +478,11 @@ class StageClock:
 
 @contextlib.contextmanager
 def timed_stage(clock: StageClock, stage: StageName) -> Iterator[None]:
-    """Time the enclosed block and record it as one stage.
+    """Time the enclosed block and record it as one stage, only when it succeeds.
+
+    A stage that raises records nothing: `runtime.csv` and the summary's
+    `stage_seconds` are the run's evidence of what completed, and a half-run stage
+    completed nothing. The exception propagates unchanged.
 
     Args:
         clock: The clock to record into.
@@ -489,12 +493,10 @@ def timed_stage(clock: StageClock, stage: StageName) -> Iterator[None]:
     """
     started: float = time.perf_counter()
     print(f"[colsfm] stage {clock.stages.index(stage) + 1}/{len(clock.stages)}: {stage}")
-    try:
-        yield
-    finally:
-        elapsed: float = time.perf_counter() - started
-        clock.record(stage, elapsed)
-        print(f"[colsfm] {stage} finished in {elapsed:.2f}s")
+    yield
+    elapsed: float = time.perf_counter() - started
+    clock.record(stage, elapsed)
+    print(f"[colsfm] {stage} finished in {elapsed:.2f}s")
 
 
 def git_sha(repo_root: Path = REPO_ROOT) -> str:
