@@ -83,7 +83,14 @@ class SelectionOptions:
 @serde
 @dataclass(frozen=True, slots=True)
 class PipelineOptions:
-    """Everything one run needs, mirroring `CusfmRunner`'s constructor arguments."""
+    """Everything one run needs, mirroring `CusfmRunner`'s constructor arguments.
+
+    The defaults are the **fast full pipeline** (NOTES.md decision 17, 2026-09-06):
+    `--features-backend raco --matching-backend raco --ba-backend caspar
+    --optimize-extrinsics --loop-closure`, with the closing Ceres polish and the
+    regularised refinement. Every field below says what its own ablation costs, and
+    this class is also the CLI's help text, so the two cannot drift.
+    """
 
     input_dir: Path
     """Directory holding `frames_meta.json` and the images its `image_name`s name."""
@@ -146,8 +153,8 @@ class PipelineOptions:
     a machine without CASPAR nothing but a message. It needs a CASPAR-enabled pycolmap — the
     `colsfm-caspar*` environments — and falls back to `ceres`, loudly, when that is
     missing, when `--no-regularised-extrinsics` asks the mapper itself to free
-    `sensor_from_rig`, or when a camera model
-    is one this build's CASPAR has no adapter for. Which models those are is measured at
+    `sensor_from_rig`, or when a camera model is one this build's CASPAR has no
+    adapter for. Which models those are is measured at
     run time (`colsfm.mapping.caspar_supported_camera_models`): PINHOLE and SIMPLE_RADIAL
     in `colsfm-caspar` and `colsfm-caspar64`, plus OPENCV_FISHEYE in
     `colsfm-caspar-fisheye` (`docs/caspar-fisheye-adapter.md`). It also drops the robust
