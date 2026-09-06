@@ -1084,13 +1084,14 @@ because the stock environment has no CASPAR build to fall back from silently.
    `123.456789012345` comes back as `123.45679`) and stores whatever column count it is handed.
    COLMAP writes Nx2, Nx4 or Nx6, but Nx1, Nx3, Nx5 and Nx8 all round-trip unchanged. A
    malformed width is a silent corruption downstream, not an error at write time.
-10. **`demo_rerun.read_colmap_model` mis-parses a model with a zero-observation image.**
+10. **`demo_rerun.read_colmap_model` mis-parsed a model with a zero-observation image (fixed).**
     COLMAP writes two lines per image, and an image with no 2D points has an *empty* second
-    line. The parser filters empty lines before taking every second line, so the pose/points
-    alternation shifts from that point on and `POINTS2D` lines are read as poses. It does not
+    line. The parser filtered empty lines before taking every second line, so the pose/points
+    alternation shifted from that point on and `POINTS2D` lines were read as poses. It did not
     raise: on a three-image model it returned a nonsense entry with a 201 m translation and
-    dropped a real pose. `colsfm.benchmark` reads models with
-    `pycolmap.Reconstruction.read_text` instead. `demo_rerun.py` is not changed here.
+    dropped a real pose. `demo_rerun.parse_colmap_images_text` now skips comments only and
+    consumes strict (pose, POINTS2D) pairs. `colsfm.benchmark` keeps reading models with
+    `pycolmap.Reconstruction.read_text`.
 11. **The 10 s loop gate rejects every candidate on Galileo.** `generate_association_main`
     drops candidates with `|dt| < loop_interval_threshold_in_seconds` (10 s), while
     `pose_graph_main` drops `|dt| < loop_closure_interval_ratio * session_duration` (0.08 of

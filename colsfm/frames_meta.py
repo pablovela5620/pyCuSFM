@@ -6,11 +6,14 @@ equal to their default are omitted**: 29 of Galileo's 226 keyframes carry no
 goes through protobuf's own `json_format` against the schema in `colsfm.schema`,
 so defaults are supplied by protobuf rather than by hand.
 
-`FramesMeta` keeps the parsed message alongside the typed view. Writers copy that
-message and replace only what changed, so fields the pipeline never models —
+`FramesMeta` keeps the parsed message alongside the typed view, but the **typed
+fields are the authority**: `FramesMeta.current_message` copies the message as a
+template and writes the typed fields over it, so an edit made with
+`dataclasses.replace` reaches serialisation, filtering and both update methods
+alike. Only differing fields are written, so fields the pipeline never models —
 `pose_covariance`, `car_mask_polygon`, `chroma`, `raw_image_cropping` — survive a
 round trip untouched, exactly as `update_keyframe_pose_main` preserves them
-(export.md §5.2).
+(export.md §5.2), and an unedited collection re-serialises byte for byte.
 
 Conventions (export.md §2, keypoints_mapper_main.md §4.3):
 
@@ -24,7 +27,7 @@ Conventions (export.md §2, keypoints_mapper_main.md §4.3):
 from __future__ import annotations
 
 import copy
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Literal, TypeAlias
@@ -53,6 +56,9 @@ CameraMatrix: TypeAlias = Float64[ndarray, "3 3"]
 
 DistortionCoefficients: TypeAlias = Float64[ndarray, "num_coefficients"]
 """Distortion coefficients in OpenCV order, however many the calibration carries."""
+
+ScalarField: TypeAlias = bool | int | float | str
+"""A protobuf scalar this module writes back; `int` stays distinct from `float` for beartype."""
 
 JSON_INDENT: Final[int] = 2
 """Indent cuSFM's own writer uses, so our output diffs cleanly against the blob's."""
@@ -168,7 +174,10 @@ class FramesMeta:
     local_sector_key: str
     """Map sector key; empty in both shipped datasets."""
     message: Message
-    """The parsed `KeyframesMetadataCollection`, so writers can copy it verbatim."""
+    """The parsed `KeyframesMetadataCollection`, kept as the template writers copy.
+
+    It carries the fields above as they were read plus the ones this module does not
+    model; the typed fields win wherever the two disagree (see `current_message`)."""
 
     def keyframe_by_id(self) -> dict[int, KeyframeMeta]:
         """Index the keyframes by their `id`.
@@ -226,17 +235,42 @@ class FramesMeta:
             )
         return tuple(rig_frames)
 
+    def current_message(self) -> Message:
+        """The source message with the typed fields written over it.
+
+        The typed fields are the authority: `dataclasses.replace` on this frozen
+        collection (or on one of its cameras or keyframes) has to reach every
+        consumer. `message` stays the template, so the fields the pipeline never
+        models — `pose_covariance`, `car_mask_polygon`, `chroma`,
+        `raw_image_cropping` — survive untouched.
+
+        Each field is written only when it differs from what the template already
+        holds, which keeps an unedited collection byte-identical through
+        `to_json`: no write, no protobuf presence change, no axis-angle rounding.
+
+        Returns:
+            A fresh copy of `message`, never `message` itself.
+        """
+        message: Message = copy.deepcopy(self.message)
+        _apply_keyframes(message, self.keyframes)
+        _apply_cameras(message, self.cameras)
+        _apply_stereo_pairs(message, self.stereo_pairs)
+        _apply_collection_fields(message, self)
+        return message
+
     def to_json(self) -> str:
         """Serialise back to proto3 JSON in cuSFM's own layout.
 
-        Field names stay snake_case and default-valued fields stay omitted, so the
-        output diffs against a blob-written file down to map entry order (protobuf
-        maps have none) and the enum values cuSFM prints even at their default.
+        Serialisation goes through `current_message`, so an edited typed field is
+        what lands in the file. Field names stay snake_case and default-valued
+        fields stay omitted, so the output diffs against a blob-written file down
+        to map entry order (protobuf maps have none) and the enum values cuSFM
+        prints even at their default.
 
         Returns:
             The JSON text, without a trailing newline.
         """
-        return json_format.MessageToJson(self.message, indent=JSON_INDENT, preserving_proto_field_name=True)
+        return json_format.MessageToJson(self.current_message(), indent=JSON_INDENT, preserving_proto_field_name=True)
 
     def with_camera_to_world(
         self,
@@ -257,7 +291,7 @@ class FramesMeta:
         Returns:
             A new `FramesMeta`.
         """
-        message: Message = copy.deepcopy(self.message)
+        message: Message = self.current_message()
         for entry in message.keyframes_metadata:
             pose: pycolmap.Rigid3d | None = world_T_cam_by_keyframe_id.get(int(entry.id))
             if pose is None:
@@ -286,7 +320,7 @@ class FramesMeta:
         Returns:
             A new `FramesMeta`.
         """
-        message: Message = copy.deepcopy(self.message)
+        message: Message = self.current_message()
         for camera_params_id, camera_sensor in message.camera_params_id_to_camera_params.items():
             pose: pycolmap.Rigid3d | None = vehicle_T_cam_by_camera_params_id.get(int(camera_params_id))
             if pose is None:
@@ -314,7 +348,7 @@ class FramesMeta:
             A new `FramesMeta` holding only the kept keyframes.
         """
         kept: set[int] = set(keyframe_ids)
-        message: Message = copy.deepcopy(self.message)
+        message: Message = self.current_message()
         if synced_sample_id_by_keyframe_id is not None:
             for entry in message.keyframes_metadata:
                 if int(entry.id) in kept:
@@ -357,6 +391,212 @@ def write_rigid_transform(transform: Message, pose: pycolmap.Rigid3d) -> None:
     transform.translation.x = float(axis_angle.translation_xyz[0])
     transform.translation.y = float(axis_angle.translation_xyz[1])
     transform.translation.z = float(axis_angle.translation_xyz[2])
+
+
+def _set_scalar(message: Message, field_name: str, value: ScalarField) -> None:
+    """Write a scalar field only when it differs from what the message holds.
+
+    Args:
+        message: The message to update.
+        field_name: Scalar field to write.
+        value: The typed model's value for that field.
+    """
+    if getattr(message, field_name) != value:
+        setattr(message, field_name, value)
+
+
+def _set_enum(message: Message, field_name: str, value_name: str) -> None:
+    """Write an enum field from its symbolic name, only when it differs.
+
+    Args:
+        message: The message to update.
+        field_name: Enum field to write.
+        value_name: Symbolic value name, e.g. `PINHOLE`.
+
+    Raises:
+        KeyError: When the enum has no value of that name.
+    """
+    number: int = message.DESCRIPTOR.fields_by_name[field_name].enum_type.values_by_name[value_name].number
+    if getattr(message, field_name) != number:
+        setattr(message, field_name, number)
+
+
+def _set_rigid_transform(transform: Message, pose: pycolmap.Rigid3d) -> None:
+    """Write a `RigidTransform3d` only when it differs from the pose it holds.
+
+    Skipping the equal case matters: axis-angle to `Rigid3d` and back does not
+    round trip bit for bit, so rewriting an unchanged pose would move the digits.
+
+    Args:
+        transform: A `protos.common.geometry.RigidTransform3d` to update.
+        pose: The typed model's pose for that field.
+    """
+    if not np.array_equal(_rigid_transform(transform).matrix(), pose.matrix()):
+        write_rigid_transform(transform, pose)
+
+
+def _set_matrix(matrix_message: Message, matrix: Float64[ndarray, "rows cols"] | None, row_count: int, column_count: int) -> None:
+    """Write a `MatrixD` of known shape only when it differs from what it holds.
+
+    A None typed value clears the field, but only when the message currently
+    carries a matrix of the expected shape: anything else is a calibration this
+    module does not model, and clearing it would lose it.
+
+    Args:
+        matrix_message: A `protos.common.geometry.MatrixD` to update.
+        matrix: The typed model's matrix, or None when the calibration omits it.
+        row_count: Rows the field is expected to carry.
+        column_count: Columns the field is expected to carry.
+    """
+    current: Float64[ndarray, "rows cols"] | None = _matrix(matrix_message, row_count, column_count)
+    if matrix is None:
+        if current is not None:
+            matrix_message.Clear()
+        return
+    if current is not None and np.array_equal(current, matrix):
+        return
+    del matrix_message.data[:]
+    matrix_message.data.extend(float(value) for value in matrix.reshape(-1))
+    matrix_message.row_count = row_count
+    matrix_message.column_count = column_count
+
+
+def _set_distortion(matrix_message: Message, coefficients: DistortionCoefficients) -> None:
+    """Write the distortion coefficients only when they differ.
+
+    Their count is the calibration's own, so `row_count`/`column_count` stay as
+    the template wrote them.
+
+    Args:
+        matrix_message: The `distortion_coefficients` `MatrixD` to update.
+        coefficients: The typed model's coefficients; empty when there are none.
+    """
+    if np.array_equal(np.array(list(matrix_message.data), dtype=np.float64), coefficients):
+        return
+    del matrix_message.data[:]
+    matrix_message.data.extend(float(value) for value in coefficients)
+
+
+def _set_string_map(message: Message, field_name: str, values: Mapping[int, str]) -> None:
+    """Rewrite an int-to-string map field only when it differs.
+
+    Args:
+        message: The message holding the map.
+        field_name: Name of the map field.
+        values: The typed model's mapping.
+    """
+    entries: MutableMapping[int, str] = getattr(message, field_name)
+    if {int(key): value for key, value in entries.items()} == dict(values):
+        return
+    entries.clear()
+    for key, value in values.items():
+        entries[key] = value
+
+
+def _apply_keyframes(message: Message, keyframes: Sequence[KeyframeMeta]) -> None:
+    """Write the typed keyframes over `keyframes_metadata`.
+
+    Membership and order come from the typed tuple; each surviving entry keeps
+    the template's unmodelled fields, matched by keyframe id.
+
+    Args:
+        message: The collection message to update.
+        keyframes: The typed keyframes, in the order they should appear.
+    """
+    template_by_id: dict[int, bytes] = {int(entry.id): entry.SerializeToString() for entry in message.keyframes_metadata}
+    if [int(entry.id) for entry in message.keyframes_metadata] != [keyframe.keyframe_id for keyframe in keyframes]:
+        del message.keyframes_metadata[:]
+        for keyframe in keyframes:
+            entry: Message = message.keyframes_metadata.add()
+            encoded: bytes | None = template_by_id.get(keyframe.keyframe_id)
+            if encoded is not None:
+                entry.ParseFromString(encoded)
+    for entry, keyframe in zip(message.keyframes_metadata, keyframes, strict=True):
+        _set_scalar(entry, "id", keyframe.keyframe_id)
+        _set_scalar(entry, "camera_params_id", keyframe.camera_params_id)
+        _set_scalar(entry, "timestamp_microseconds", keyframe.timestamp_microseconds)
+        _set_scalar(entry, "image_name", keyframe.image_name)
+        _set_scalar(entry, "synced_sample_id", keyframe.synced_sample_id)
+        _set_scalar(entry, "track_id", keyframe.track_id)
+        _set_rigid_transform(entry.camera_to_world, keyframe.world_T_cam)
+
+
+def _apply_camera(camera_sensor: Message, camera: CameraParams) -> None:
+    """Write one typed `CameraParams` over its `CameraSensor` message.
+
+    Args:
+        camera_sensor: A `protos.common.sensor.CameraSensor` to update.
+        camera: The typed camera parameters for it.
+    """
+    sensor_meta_data: Message = camera_sensor.sensor_meta_data
+    _set_scalar(sensor_meta_data, "sensor_name", camera.sensor_name)
+    _set_scalar(sensor_meta_data, "model_name", camera.model_name)
+    _set_scalar(sensor_meta_data, "sensor_id", camera.sensor_id)
+    _set_scalar(sensor_meta_data, "frequency", camera.frequency_hz)
+    _set_rigid_transform(sensor_meta_data.sensor_to_vehicle_transform, camera.vehicle_T_cam)
+    calibration: Message = camera_sensor.calibration_parameters
+    _set_scalar(calibration, "image_width", camera.image_width)
+    _set_scalar(calibration, "image_height", camera.image_height)
+    _set_scalar(calibration, "rolling_shutter_delay_microseconds", camera.rolling_shutter_delay_microseconds)
+    _set_matrix(calibration.projection_matrix, camera.projection_matrix, 3, 4)
+    _set_matrix(calibration.camera_matrix, camera.camera_matrix, 3, 3)
+    _set_distortion(calibration.distortion_coefficients, camera.distortion_coefficients)
+    _set_enum(camera_sensor, "camera_projection_model_type", camera.projection_model)
+
+
+def _apply_cameras(message: Message, cameras: Mapping[int, CameraParams]) -> None:
+    """Write the typed cameras over `camera_params_id_to_camera_params`.
+
+    Args:
+        message: The collection message to update.
+        cameras: The typed cameras, keyed by `camera_params_id`.
+    """
+    sensors: MutableMapping[int, Message] = message.camera_params_id_to_camera_params
+    for camera_params_id in [int(key) for key in sensors if int(key) not in cameras]:
+        del sensors[camera_params_id]
+    for camera_params_id, camera in cameras.items():
+        _apply_camera(sensors[camera_params_id], camera)
+
+
+def _apply_stereo_pairs(message: Message, stereo_pairs: Sequence[StereoPair]) -> None:
+    """Write the typed stereo pairs over `stereo_pair`, only when they differ.
+
+    Args:
+        message: The collection message to update.
+        stereo_pairs: The typed stereo pairs, in the order they should appear.
+    """
+    current: tuple[tuple[int, int, float], ...] = tuple(
+        (int(pair.left_camera_param_id), int(pair.right_camera_param_id), float(pair.baseline_meters))
+        for pair in message.stereo_pair
+    )
+    wanted: tuple[tuple[int, int, float], ...] = tuple(
+        (pair.left_camera_params_id, pair.right_camera_params_id, pair.baseline_meters) for pair in stereo_pairs
+    )
+    if current == wanted:
+        return
+    del message.stereo_pair[:]
+    for pair in stereo_pairs:
+        entry: Message = message.stereo_pair.add()
+        entry.left_camera_param_id = pair.left_camera_params_id
+        entry.right_camera_param_id = pair.right_camera_params_id
+        entry.baseline_meters = pair.baseline_meters
+
+
+def _apply_collection_fields(message: Message, frames_meta: FramesMeta) -> None:
+    """Write the typed collection-level fields over the message.
+
+    Args:
+        message: The collection message to update.
+        frames_meta: The typed collection those fields belong to.
+    """
+    _set_enum(message, "initial_pose_type", frames_meta.initial_pose_type)
+    _set_enum(message, "detector_type", frames_meta.detector_type)
+    _set_enum(message, "descriptor_type", frames_meta.descriptor_type)
+    _set_scalar(message, "keypoint_feature_has_depth", frames_meta.keypoint_feature_has_depth)
+    _set_scalar(message, "local_sector_key", frames_meta.local_sector_key)
+    _set_string_map(message, "camera_params_id_to_session_name", frames_meta.session_name_by_camera_params_id)
+    _set_string_map(message, "track_id_to_track_name", frames_meta.track_name_by_track_id)
+    _set_string_map(message, "track_id_to_bag_name", frames_meta.bag_name_by_track_id)
 
 
 def _matrix(matrix_message: Message, row_count: int, column_count: int) -> Float64[ndarray, "rows cols"] | None:

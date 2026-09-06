@@ -7,8 +7,8 @@ publishes *trained against RaCo-ALIKED* — upstream's
 `data/cusfm_models/raco/aliked_lightglue/lightglue_aliked.onnx`, exported by
 `tools/export_cusfm_raco.py` in the `raco` Pixi environment; the engine is built
 and cached in the `colsfm` environment's TensorRT 10.13 by
-`colsfm.tensorrt_runtime.resolve_engine`, under the same
-`<stem>_fp16_<trt-version>_sm_<arch>.engine` name the blob uses.
+`colsfm.tensorrt_runtime.resolve_engine`, under its
+`<stem>_fp16_<digest>_<trt-version>_sm_<arch>.engine` name.
 
 **Everything except the input frame is `colsfm.matching_trt`.** Same four
 bindings, same `[n, 2]` int32 `matches0` and `[n]` float32 `mscores0` with a

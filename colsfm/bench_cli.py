@@ -16,10 +16,15 @@ acceptance bounds of `docs/open-pipeline-plan.md` are checked against B on every
 dataset: they are all relative to run A, so they mean the same thing wherever a
 reference run exists, and `check_acceptance` drops the rows a dataset cannot
 support — RoboCap ships no `ground_truth.txt`, so it gets no ATE row.
+
+The command's **exit status is the acceptance result**: 0 when every measurable
+bound is met, 1 when any is not. A bound that could not be measured is printed
+and counted separately but does not fail the run; see `acceptance_exit_code`.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -111,9 +116,35 @@ def run(config: BenchConfig) -> Comparison:
     return comparison
 
 
+def acceptance_exit_code(checks: Sequence[AcceptanceCheck]) -> int:
+    """The process status the acceptance checks imply.
+
+    The policy, in one place because it is the contract a CI job reads:
+
+    * every measurable bound met — including the case of no bounds at all — is 0;
+    * any measurable bound failed is 1, however many others passed;
+    * a bound that could not be measured (`passed is None`) is reported in the
+      report and the console tally but **does not** fail the run. A missing
+      ground truth or a run that reported no timings is a gap in the evidence,
+      not evidence of a regression.
+
+    Args:
+        checks: The comparison's acceptance checks.
+
+    Returns:
+        0 or 1, for `SystemExit`.
+    """
+    return 1 if any(check.passed is False for check in checks) else 0
+
+
 def main() -> None:
-    """Entry point for `python -m colsfm.bench_cli`."""
-    run(tyro.cli(BenchConfig))
+    """Entry point for `python -m colsfm.bench_cli`.
+
+    Raises:
+        SystemExit: Always, carrying `acceptance_exit_code`'s status.
+    """
+    comparison: Comparison = run(tyro.cli(BenchConfig))
+    raise SystemExit(acceptance_exit_code(comparison.acceptance))
 
 
 if __name__ == "__main__":

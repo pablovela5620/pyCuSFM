@@ -2,20 +2,23 @@
 
 cuSFM runs ALIKED and LightGlue as TensorRT engines built from the two ONNX
 graphs in `pycusfm/models/aliked_lightglue/`, caching each engine next to its
-graph under `<stem>_fp16_<trt-version>_sm_<arch>.engine`
+graph under `<stem>_fp16_<digest>_<trt-version>_sm_<arch>.engine`
 (feature_matcher_main.md §5.2). This module owns that cache and the buffer
 management around one execution context; the two backends above own the
 pre- and post-processing.
 
 `tools/raco_extract.py` is the working prior art — the same builder flags, the
 same content-addressed timing cache, the same `set_tensor_address` +
-`execute_async_v3` loop. Three things differ here:
+`execute_async_v3` loop. Two things differ here:
 
-* **The cache key is the blob's file name, not a content hash.** The point is to
-  *reuse the engines that ship in the repo*: `aliked_fp16_10_13_3_9_sm_12_0.engine`
-  and `lightglue_aliked_fp16_10_13_3_9_sm_12_0.engine` were built by the blob
-  itself, deserialise under this TensorRT and this GPU, and cost about 205 s
-  each to rebuild. A content hash would have missed both.
+* **Prebuilt blob engines are accepted by name, explicitly.** The cache key is
+  the graph's own digest, as it is there, so replacing an ONNX in place cannot
+  reuse the engine built from the previous one. On top of that `resolve_engine`
+  accepts the blob's undigested spelling for the two graphs under `MODEL_DIR`:
+  `aliked_fp16_10_13_3_9_sm_12_0.engine` and
+  `lightglue_aliked_fp16_10_13_3_9_sm_12_0.engine` were built by cuSFM itself,
+  deserialise under this TensorRT and this GPU, and cost about 205 s each to
+  rebuild.
 * **The session is generic.** `TensorRTExtractor` hard-codes ALIKED's
   `image`/`keypoints`/`descriptors` binding names; LightGlue has four inputs and
   two outputs, so `TensorRTSession` takes the bindings by name and grows its
@@ -33,8 +36,9 @@ the tests skip on `ImportError`.
 from __future__ import annotations
 
 import ctypes
+import hashlib
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final, Self, TypeAlias
 
@@ -66,6 +70,9 @@ PREPROCESS_IMAGE_BINDING: Final[str] = "image"
 
 PREPROCESS_ENGINE_DIR: Final[Path] = REPO_ROOT / "data" / "cusfm_models"
 """Where the generated preprocessing engines are cached; gitignored, like the RaCo graphs."""
+
+ONNX_DIGEST_CHARACTERS: Final[int] = 12
+"""Hex characters of the graph's SHA-256 that go into the engine's file name."""
 
 BGR_TO_RGB_INDICES: Final[tuple[int, int, int]] = (2, 1, 0)
 """The channel permutation the host used to do with `resized_bgr_hwc[..., ::-1]`."""
@@ -132,6 +139,66 @@ class PinnedHostBuffer:
         self.close()
 
 
+@dataclass(slots=True)
+class DeviceBufferPool:
+    """The device buffers one execution context owns, one per binding name.
+
+    Buffers only ever grow, so a run whose shapes change from call to call pays
+    one allocation per new high-water mark rather than one per call.
+
+    Ownership is exception-safe in both directions. `ensure` allocates the
+    replacement **before** it gives up the old one, so a failed `cudaMalloc`
+    leaves the pool owning exactly what it owned before — still valid, still
+    bindable — rather than a freed address recorded at its old capacity. `close`
+    drops each record before freeing it, so no pointer can be freed twice even if
+    one `cudaFree` fails.
+    """
+
+    pointers: dict[str, int] = field(default_factory=dict)
+    """Device address per binding name; only the bindings that have a buffer."""
+    capacities: dict[str, int] = field(default_factory=dict)
+    """Bytes owned per binding name; always the same keys as `pointers`."""
+
+    def ensure(self, name: str, byte_count: int) -> int:
+        """Guarantee a buffer of at least `byte_count` bytes for one binding.
+
+        Args:
+            name: The binding.
+            byte_count: Bytes the current call needs; zero is rounded up to one,
+                because `cudaMalloc(0)` has no useful address to bind.
+
+        Returns:
+            The device pointer, reallocated when the buffer had to grow.
+
+        Raises:
+            RuntimeError: When `cudaMalloc` fails. The pool then still owns the
+                buffer it had, unchanged.
+        """
+        wanted: int = max(byte_count, 1)
+        if self.capacities.get(name, 0) >= wanted:
+            return self.pointers[name]
+        pointer: int = int(check_cuda(cudart.cudaMalloc(wanted), f"cudaMalloc({name})")[0])
+        previous: int | None = self.pointers.get(name)
+        self.pointers[name] = pointer
+        self.capacities[name] = wanted
+        if previous is not None:
+            check_cuda(cudart.cudaFree(previous), f"cudaFree({name})")
+        return pointer
+
+    def close(self) -> None:
+        """Free every buffer this pool owns; safe to call twice.
+
+        Raises:
+            RuntimeError: When a `cudaFree` fails. The buffers freed before it
+                stay freed and forgotten; the ones after it are still owned.
+        """
+        while self.pointers:
+            name: str = next(iter(self.pointers))
+            pointer: int = self.pointers.pop(name)
+            self.capacities.pop(name, None)
+            check_cuda(cudart.cudaFree(pointer), f"cudaFree({name})")
+
+
 def check_cuda(result: tuple[Any, ...] | Any, operation: str) -> tuple[Any, ...]:
     """Raise on a failed `cudart` call and return its payload.
 
@@ -182,17 +249,30 @@ def tensorrt_version_tag() -> str:
     return "_".join(numeric[:4])
 
 
-def engine_path_for(onnx_path: Path, *, profile_tag: str = "", device_index: int = 0) -> Path:
-    """Where the engine built from one ONNX graph lives.
+def onnx_digest(onnx_path: Path) -> str:
+    """A short content hash of one ONNX graph, for the engine's file name.
+
+    Args:
+        onnx_path: The graph to digest.
+
+    Returns:
+        The first `ONNX_DIGEST_CHARACTERS` hex characters of its SHA-256.
+
+    Raises:
+        FileNotFoundError: When the graph is missing.
+    """
+    return hashlib.sha256(onnx_path.read_bytes()).hexdigest()[:ONNX_DIGEST_CHARACTERS]
+
+
+def blob_engine_path_for(onnx_path: Path, *, profile_tag: str = "", device_index: int = 0) -> Path:
+    """The name cuSFM's own runtime gives the engine it builds for one graph.
+
+    Only the prebuilt engines under `MODEL_DIR` carry it; `resolve_engine`
+    accepts those and nothing else builds under this name any more.
 
     Args:
         onnx_path: The graph, e.g. `pycusfm/models/aliked_lightglue/aliked.onnx`.
-        profile_tag: A short name for the optimisation profile, inserted after
-            `_fp16`. Empty — the default — keeps the blob's own naming and
-            therefore hits the two engines already in the repo. A shape-dynamic
-            graph must pass one: its engine is only valid for the bounds it was
-            built with, and those bounds are not recoverable from the file name
-            otherwise.
+        profile_tag: A short name for the optimisation profile, inserted after `_fp16`.
         device_index: CUDA device the engine is built for.
 
     Returns:
@@ -200,6 +280,33 @@ def engine_path_for(onnx_path: Path, *, profile_tag: str = "", device_index: int
     """
     tag: str = f"_{profile_tag}" if profile_tag else ""
     return onnx_path.with_name(f"{onnx_path.stem}_fp16{tag}_{tensorrt_version_tag()}_sm_{compute_capability(device_index)}.engine")
+
+
+def engine_path_for(onnx_path: Path, *, profile_tag: str = "", device_index: int = 0) -> Path:
+    """Where the engine built from one ONNX graph lives.
+
+    The name carries a digest of the graph's bytes, so replacing an ONNX file in
+    place names a different engine instead of silently reusing the one built from
+    the previous graph. A graph that is not on disk has no bytes to digest — the
+    prebuilt-engine case — and keeps the blob's own spelling.
+
+    Args:
+        onnx_path: The graph, e.g. `pycusfm/models/aliked_lightglue/aliked.onnx`.
+        profile_tag: A short name for the optimisation profile, inserted after
+            `_fp16`. A shape-dynamic graph must pass one: its engine is only valid
+            for the bounds it was built with, and the digest says nothing about
+            those — they come from the caller, not from the graph.
+        device_index: CUDA device the engine is built for.
+
+    Returns:
+        `<onnx dir>/<stem>_fp16[_<profile tag>]_<digest>_<trt version>_sm_<arch>.engine`,
+        or `blob_engine_path_for`'s answer when the graph is missing.
+    """
+    if not onnx_path.is_file():
+        return blob_engine_path_for(onnx_path, profile_tag=profile_tag, device_index=device_index)
+    tag: str = f"_{profile_tag}" if profile_tag else ""
+    identity: str = f"{onnx_digest(onnx_path)}_{tensorrt_version_tag()}_sm_{compute_capability(device_index)}"
+    return onnx_path.with_name(f"{onnx_path.stem}_fp16{tag}_{identity}.engine")
 
 
 def build_fp16_engine(
@@ -280,6 +387,16 @@ def resolve_engine(
 ) -> Path:
     """Return the cached engine for one graph, building it when it is absent.
 
+    Two names are accepted, in this order:
+
+    1. The digest-named engine of `engine_path_for`, which is what any build here
+       writes and the only name a locally generated graph — RaCo's, the
+       preprocessing ones — can hit.
+    2. The blob's own spelling, but **only** for a graph in `MODEL_DIR`. Those
+       engines were built by cuSFM itself from the two graphs it ships, cost
+       about 205 s each to rebuild, and carry no digest; accepting them is a
+       deliberate allowance for trusted prebuilt engines, not a fallback.
+
     Args:
         onnx_path: The ONNX graph.
         profiles: Optimisation profile per dynamic input; see `build_fp16_engine`.
@@ -293,6 +410,9 @@ def resolve_engine(
     engine_path: Path = engine_path_for(onnx_path, profile_tag=profile_tag, device_index=device_index)
     if engine_path.is_file():
         return engine_path
+    prebuilt: Path = blob_engine_path_for(onnx_path, profile_tag=profile_tag, device_index=device_index)
+    if onnx_path.parent == MODEL_DIR and prebuilt.is_file():
+        return prebuilt
     return build_fp16_engine(onnx_path, engine_path, profiles)
 
 
@@ -347,32 +467,11 @@ class TensorRTSession:
             self.engine.get_tensor_name(index): np.dtype(trt.nptype(self.engine.get_tensor_dtype(self.engine.get_tensor_name(index))))
             for index in range(self.engine.num_io_tensors)
         }
-        self.device_pointers: dict[str, int] = {}
-        self.capacities: dict[str, int] = {}
+        self.buffers: DeviceBufferPool = DeviceBufferPool()
         self.reuse_output_buffers: bool = reuse_output_buffers
         self.host_outputs: dict[str, ndarray] = {}
         self.stream: int = int(check_cuda(cudart.cudaStreamCreate(), "cudaStreamCreate")[0])
         self.closed: bool = False
-
-    def _ensure_capacity(self, name: str, byte_count: int) -> int:
-        """Guarantee a device buffer of at least `byte_count` bytes for one binding.
-
-        Args:
-            name: The binding.
-            byte_count: Bytes the current call needs.
-
-        Returns:
-            The device pointer, reallocated when the buffer had to grow.
-        """
-        wanted: int = max(byte_count, 1)
-        if self.capacities.get(name, 0) >= wanted:
-            return self.device_pointers[name]
-        if name in self.device_pointers:
-            check_cuda(cudart.cudaFree(self.device_pointers[name]), f"cudaFree({name})")
-        pointer: int = int(check_cuda(cudart.cudaMalloc(wanted), f"cudaMalloc({name})")[0])
-        self.device_pointers[name] = pointer
-        self.capacities[name] = wanted
-        return pointer
 
     def _host_output(self, name: str, shape: tuple[int, ...]) -> ndarray:
         """A host array of `shape` for one output binding, reused when allowed.
@@ -435,7 +534,7 @@ class TensorRTSession:
             if isinstance(supplied, DeviceTensor):
                 self.context.set_tensor_address(name, supplied.pointer)
                 continue
-            pointer: int = self._ensure_capacity(name, supplied.nbytes)
+            pointer: int = self.buffers.ensure(name, supplied.nbytes)
             self.context.set_tensor_address(name, pointer)
             check_cuda(
                 cudart.cudaMemcpyAsync(
@@ -454,7 +553,7 @@ class TensorRTSession:
                 raise RuntimeError(f"TensorRT left output {name} with an unresolved shape {shape}")
             host: ndarray = self._host_output(name, shape)
             outputs[name] = host
-            self.context.set_tensor_address(name, self._ensure_capacity(name, max(host.nbytes, 1)))
+            self.context.set_tensor_address(name, self.buffers.ensure(name, max(host.nbytes, 1)))
         if not self.context.execute_async_v3(self.stream):
             raise RuntimeError("TensorRT execution failed")
         for name, host in outputs.items():
@@ -463,7 +562,7 @@ class TensorRTSession:
             check_cuda(
                 cudart.cudaMemcpyAsync(
                     host.ctypes.data,
-                    self.device_pointers[name],
+                    self.buffers.pointers[name],
                     host.nbytes,
                     cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
                     self.stream,
@@ -479,10 +578,7 @@ class TensorRTSession:
             return
         self.closed = True
         check_cuda(cudart.cudaStreamDestroy(self.stream), "cudaStreamDestroy")
-        for name, pointer in self.device_pointers.items():
-            check_cuda(cudart.cudaFree(pointer), f"cudaFree({name})")
-        self.device_pointers.clear()
-        self.capacities.clear()
+        self.buffers.close()
 
     def __enter__(self) -> Self:
         """Return the session itself, so `with TensorRTSession(...) as session` works."""
@@ -646,16 +742,17 @@ class GpuPreprocessor:
         self.width: int = width
         self.max_batch: int = max_batch
         self.stream: int = stream
+        self.closed: bool = False
+        self.buffers: DeviceBufferPool = DeviceBufferPool()
         self.staging: PinnedHostBuffer = PinnedHostBuffer((max_batch, height, width, 3), np.dtype(np.uint8))
         self.staging_bhwc: UInt8[ndarray, "max_batch height width 3"] = self.staging.array
-        self.input_pointer: int = int(
-            check_cuda(cudart.cudaMalloc(self.staging.nbytes), "cudaMalloc(image_u8)")[0]
-        )
         self.output_nbytes: int = max_batch * 3 * height * width * np.dtype(np.float32).itemsize
-        self.output_pointer: int = int(
-            check_cuda(cudart.cudaMalloc(self.output_nbytes), "cudaMalloc(image)")[0]
-        )
-        self.closed: bool = False
+        try:
+            self.input_pointer: int = self.buffers.ensure(PREPROCESS_IMAGE_U8_BINDING, self.staging.nbytes)
+            self.output_pointer: int = self.buffers.ensure(PREPROCESS_IMAGE_BINDING, self.output_nbytes)
+        except BaseException:
+            self.close()
+            raise
 
     def run(self, count: int) -> DeviceTensor:
         """Convert the first `count` staged frames and leave the result on the device.
@@ -696,14 +793,17 @@ class GpuPreprocessor:
         return DeviceTensor(pointer=self.output_pointer, shape=(count, 3, self.height, self.width))
 
     def close(self) -> None:
-        """Free the device buffers and the page-locked staging; safe to call twice."""
+        """Free the device buffers and the page-locked staging; safe to call twice.
+
+        Also the constructor's unwind path, so it releases whatever was acquired
+        rather than assuming every allocation happened.
+        """
         if self.closed:
             return
         self.closed = True
         del self.staging_bhwc
         self.staging.close()
-        check_cuda(cudart.cudaFree(self.input_pointer), "cudaFree(image_u8)")
-        check_cuda(cudart.cudaFree(self.output_pointer), "cudaFree(image)")
+        self.buffers.close()
 
     def __enter__(self) -> Self:
         """Return the preprocessor itself, so `with GpuPreprocessor(...)` works."""

@@ -1189,6 +1189,60 @@ class ColmapModel:
     """Per-point colour."""
 
 
+@dataclass(frozen=True, slots=True)
+class ColmapImage:
+    """One registered image, as written on a pose line of ``images.txt``."""
+
+    image_id: int
+    """COLMAP's ``IMAGE_ID``, the first field of the pose line."""
+    name: str
+    """``NAME``: the path as it appears in ``frames_meta.json``. May contain spaces."""
+    world_T_cam: Float64[ndarray, "4 4"]
+    """Camera pose in world, i.e. the inverse of COLMAP's stored ``cam_T_world``."""
+
+
+def parse_colmap_images_text(text: str) -> list[ColmapImage]:
+    """Parse the contents of a COLMAP ``images.txt`` into pose records.
+
+    The format writes **two** lines per image: a pose line, then that image's
+    2D observations. An image that registered no points still gets its second
+    line, and that line is empty. Dropping empty lines before pairing therefore
+    shifts every later image onto an observation line, which silently discards
+    it; the lines are consumed in strict pairs instead, and only the header
+    comments are skipped.
+
+    Args:
+        text: The whole file, header comments included.
+
+    Returns:
+        One `ColmapImage` per pose line, in file order.
+    """
+    lines: list[str] = [line for line in text.splitlines() if not line.lstrip().startswith("#")]
+    # Padding between the header and the first record would offset the pairing;
+    # blank lines only carry meaning once the records have started.
+    while lines and not lines[0].strip():
+        lines.pop(0)
+
+    images: list[ColmapImage] = []
+    for index in range(0, len(lines), 2):  # lines[index + 1] holds the observations
+        fields: list[str] = lines[index].split()
+        if len(fields) < 10:  # trailing blank line, or a truncated record
+            continue
+        quaternion_wxyz: Float64[ndarray, "4"] = np.asarray(fields[1:5], dtype=np.float64)
+        cam_R_world: Float64[ndarray, "3 3"] = Rotation.from_quat(
+            np.roll(quaternion_wxyz, -1)  # COLMAP stores wxyz; scipy wants xyzw
+        ).as_matrix()
+        cam_t_world: Float64[ndarray, "3"] = np.asarray(fields[5:8], dtype=np.float64)
+        images.append(
+            ColmapImage(
+                image_id=int(fields[0]),
+                name=" ".join(fields[9:]),
+                world_T_cam=np.linalg.inv(compose(cam_R_world, cam_t_world)),
+            )
+        )
+    return images
+
+
 def read_colmap_model(sparse_dir: Path) -> ColmapModel:
     """Load a COLMAP sparse model from ``images.txt`` + ``points3D.txt``.
 
@@ -1208,21 +1262,8 @@ def read_colmap_model(sparse_dir: Path) -> ColmapModel:
             )
         raise FileNotFoundError(f"no COLMAP model at {sparse_dir}")
 
-    world_T_cam: dict[str, Float64[ndarray, "4 4"]] = {}
-    # images.txt alternates: a pose line, then that image's 2D points (ignored).
-    pose_lines: list[str] = [
-        line for line in images_path.read_text().splitlines() if line and not line.startswith("#")
-    ][::2]
-    for line in pose_lines:
-        fields: list[str] = line.split()
-        if len(fields) < 10:
-            continue
-        quaternion_wxyz: Float64[ndarray, "4"] = np.asarray(fields[1:5], dtype=np.float64)
-        cam_R_world: Float64[ndarray, "3 3"] = Rotation.from_quat(
-            np.roll(quaternion_wxyz, -1)  # COLMAP stores wxyz; scipy wants xyzw
-        ).as_matrix()
-        cam_t_world: Float64[ndarray, "3"] = np.asarray(fields[5:8], dtype=np.float64)
-        world_T_cam[" ".join(fields[9:])] = np.linalg.inv(compose(cam_R_world, cam_t_world))
+    images: list[ColmapImage] = parse_colmap_images_text(images_path.read_text())
+    world_T_cam: dict[str, Float64[ndarray, "4 4"]] = {image.name: image.world_T_cam for image in images}
 
     positions: list[list[float]] = []
     colours: list[list[int]] = []
@@ -1230,7 +1271,7 @@ def read_colmap_model(sparse_dir: Path) -> ColmapModel:
         for line in points_path.read_text().splitlines():
             if not line or line.startswith("#"):
                 continue
-            fields = line.split()
+            fields: list[str] = line.split()
             if len(fields) < 7:
                 continue
             positions.append([float(value) for value in fields[1:4]])

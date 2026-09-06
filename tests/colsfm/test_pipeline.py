@@ -38,10 +38,12 @@ from colsfm.pipeline import (
     PipelineOptions,
     PipelineSummary,
     PoseGraphStageResult,
+    StageClock,
     run_loop_closure_stage,
     run_pipeline,
     run_pose_graph_stage,
     stage_names,
+    timed_stage,
 )
 
 SMOKE_MIN_INTER_FRAME_DISTANCE_M: float = 0.5
@@ -392,3 +394,30 @@ def test_the_pose_graph_stage_carries_its_solver_summary(
     )
     assert single.edges == []
     assert single.solve is None
+
+
+def test_a_stage_that_raises_records_no_timing_and_claims_no_finish(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A failing stage leaves `runtime.csv` alone and never claims it finished.
+
+    `runtime.csv` is the run's evidence of what completed, so a stage that raised
+    belongs nowhere in it. The exception still reaches the caller.
+    """
+    clock: StageClock = StageClock(output_dir=tmp_path)
+    with pytest.raises(RuntimeError, match="stage body failed"), timed_stage(clock, "matching"):
+        raise RuntimeError("stage body failed")
+
+    assert clock.seconds_by_stage == {}
+    assert not (tmp_path / RUNTIME_CSV_NAME).exists()
+    assert "finished" not in capsys.readouterr().out
+
+
+def test_a_stage_that_returns_records_its_timing_and_says_it_finished(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """The success path is untouched: one `runtime.csv` row, one "finished" line."""
+    clock: StageClock = StageClock(output_dir=tmp_path)
+    with timed_stage(clock, "matching"):
+        pass
+
+    assert set(clock.seconds_by_stage) == {"matching"}
+    records: list[RuntimeRecord] = read_runtime_records(tmp_path / RUNTIME_CSV_NAME)
+    assert [record.command for record in records] == ["matching"]
+    assert "matching finished in" in capsys.readouterr().out
