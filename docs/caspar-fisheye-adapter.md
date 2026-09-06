@@ -642,6 +642,14 @@ recordings alongside as `.rrd`.
 | rig poses vs input, RMSE (mm) | 334.10 | 462.35 | 381.88 |
 | rig poses vs blob, RMSE (mm) / rotation (deg) | — | 278.19 / 2.750 | 210.78 / 2.108 |
 
+**The 0.25 s row is a skipped stage, not a fast one.** Loop closure was off, so
+colsfm built no vocabulary and searched for no loops; its pose graph solved a 1131-edge
+chain that the input poses already satisfy (cost 1e-27, one iteration). The blob's
+705.66 s built a vocabulary, searched, found 90 loop edges and optimised with them. The
+0.21x total inherits that asymmetry. `data/bench/robocap_loops_compare.md` is the
+comparison with loop closure on (pycolmap backend, pre-CASPAR): the loop stage costs
+colsfm 721 s against the blob's 76 + 243 s, and the run ends 1.52x the blob.
+
 **Speed.** 237.6 s is 0.21x the blob and 0.81x the same pipeline under Ceres. The
 mapping stage fell from 161.8 s to 103.8 s, of which the Ceres polish is 48.6 s (73
 iterations, reprojection 1.570 to 1.520 px): on this map the fp32 solve stops further
