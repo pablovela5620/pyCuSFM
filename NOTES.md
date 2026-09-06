@@ -551,6 +551,7 @@ shipped configs, and A/B re-runs of the real binaries. `colsfm/` implements the 
 | 14 | **The match cap is a mode, not a number** | `--match-cap-mode {fixed,image_area,off}` alongside `--max-matches-per-pair`. `fixed` is decision 7's 500 and stays the default, because it is what Galileo's four acceptance bounds were measured against. `image_area` keeps that calibration's *density* instead of its count — one kept match per `1920*1200/500 = 4608` px of image, so a KITTI 1241x376 frame gets 101 — and `off` keeps every verified inlier. The KITTI follow-up (`docs/kitti-06-results.md` §8) is what the modes exist for, and it settled the question the other way: on sequence 06 the fixed 500 discards 80 % of the verified inliers, but removing the cap makes the trajectory **worse** (Sim(3) ATE 1.822 m against 1.552 m) at 2.3x the runtime, and `image_area` (101 matches per pair there) is worse again at 2.103 m. 500 sits between two worse answers on both datasets, so it stays the default and the other two modes are there because the question was worth answering with numbers. |
 | 15 | **Loop closure is what KITTI 06 was missing, and it works through the mapper, not the pose graph** | `docs/kitti-06-results.md` §8.3. `--loop-closure` takes sequence 06 from 1.552 to **0.736** Sim(3) ATE — past the blob's 1.328 and past the paper's own 0.783 — from the same cuVSLAM SLAM initialisation. Every one of those runs reports **0 loop edges**: the shipped KITTI config leaves both `gate_loop_edges` thresholds at 0.0, so no pose-graph constraint survives. What closes the loop is that the stage matches its 1344 candidate pairs into the same database and `colsfm.mapping.load_correspondences` reads *every* verified two-view geometry, so the loop pairs reach triangulation and bundle adjustment as ordinary tracks. Opening the gates to 5 m / 60 deg admits 279 edges and makes it **worse** (0.895 -> 1.428), which is deviation 5's 408 mm loop-pose error showing up at 1231 m scale. So: turn loop closure on, leave the pose-graph loop gates closed. |
 | 16 | **The fisheye COLMAP fork travels as two committed patches, not as a build-time generation step** | `packages/pycolmap-caspar-fisheye` built `source: path:` a local unpushed fork, so the package was unbuildable anywhere else and the recipe's pinned `colmap_rev` controlled nothing. It now builds `colmap/colmap` @ `be5e2916` plus `patches/add-opencv-fisheye-caspar-adapter.patch` (44 KB, hand-written) and `patches/add-opencv-fisheye-generated-f32.patch` (3.1 MB, Symforce output), the asmk pattern from rerun-io/examples-monorepo. The Codex review asked for build-time generation instead, at ~40 KB of carried source: **conda-forge has no `symforce` package at any version** (checked 2026-09-05), so it cannot go in the recipe's `requirements.build`, and a pip install inside the build script would put an unpinned PyPI dependency in the build path. Instead the generator environment is committed next to the patch (`packages/pycolmap-caspar-fisheye/generator/pixi.{toml,lock}`, symforce 0.12.0) and `tools/caspar_fisheye_patch.sh regen` regenerates fp32 and fails unless the committed files match byte for byte. The fp64 tree (another 3.3 MB) is not committed: no package compiles it. The patches are hash-gated rather than trusted — the applier inside the backend (flickzeug 0.5.2) can skip a hunk with a *warning*, so `patches/SHA256SUMS` covers all 232 patched files and the recipe checks it before cmake. `docs/caspar-fisheye-adapter.md` §4.1. |
+| 17 | **The fast full pipeline is the default** (2026-09-06) | Pablo: the default configuration *is* the fast full pipeline. `python -m colsfm run --input-dir X --output-dir Y` with no other flag now runs `--features-backend raco --matching-backend raco --ba-backend caspar --optimize-extrinsics --loop-closure`, with the Ceres polish and the regularised refinement, where it used to run pycolmap / pycolmap / ceres and no refinement. Those are the two configurations `docs/full-pipeline-results.md` measured, and the RaCo one is the cheaper of them: 20.0 s of Galileo against the blob's 32.4 s, 153.2 s of KITTI 06 against 1596.1 s, 477.9 s of RoboCap against 1133.5 s, at 5.08 mm ATE / 0.933 m Sim(3) ATE / 265 mm against the input trajectory. The two defaults that look mutually exclusive are not: CASPAR throws when a bundle adjustment frees `sensor_from_rig`, and the regularised refinement never asks one to — it moves the extrinsics in pyceres and holds them fixed inside every pycolmap solve — so stage 7 maps on the GPU and stage 7b alternates on the CPU. `--no-regularised-extrinsics` is the one ablation that takes the mapper off CASPAR. The two defaults that need something unshipped behave differently on purpose: a missing `CASPAR_ENABLED` build **falls back to Ceres**, loudly, with the reason in `summary.json`, because both solvers minimise the same objective; missing RaCo graphs **stop the run** and name `pixi run -e raco raco-export` and the `--features-backend pycolmap --matching-backend pycolmap` ablation, because a silent change of extractor is a different experiment wearing the same name (`colsfm.model_assets`). Every previous default is still reachable as a named ablation, and `colsfm/README.md` § "The default: the fast full pipeline" tabulates what each one costs. |
 
 ### Results: blob against colsfm
 
@@ -1135,29 +1136,45 @@ because the stock environment has no CASPAR build to fall back from silently.
 ### How to run
 
 ```bash
-pixi run colsfm-galileo    # 226 frames, 8 pinhole cameras, about 19 s
-pixi run colsfm-robocap    # 4528 frames, 4 fisheye cameras, about 7 min
+pixi run -e colsfm-caspar-fisheye colsfm-galileo    # 226 frames, 8 pinhole cameras, about 20 s
+pixi run -e colsfm-caspar-fisheye colsfm-robocap    # 4528 frames, 4 fisheye cameras, about 8 min
+pixi run colsfm-galileo-ablation                    # the same, on COLMAP's own ALIKED and Ceres
 pixi run colsfm-test       # tests/colsfm
 pixi run colsfm-probe      # tests/colsfm_probes, the pycolmap capability suite
 pixi run colsfm-lint       # ruff over colsfm and tests/colsfm
 ```
 
-Both tasks call `python -m colsfm run`, which takes the same `--input-dir` as
-`cusfm_cli` and writes the same output layout. Useful flags:
+Both run tasks call `python -m colsfm run` with **no backend flags at all**, because since
+2026-09-06 the default is the fast full pipeline (decision 17): RaCo features, LightGlue+
+matching, loop closure, CASPAR with its Ceres polish, and the regularised extrinsic
+refinement. They are shown in `colsfm-caspar-fisheye` because that is the environment whose
+pycolmap has CASPAR *and* the OPENCV_FISHEYE adapter; in plain `colsfm` the same two tasks
+run and the mapper falls back to Ceres, loudly, with the reason in `summary.json`. The RaCo
+graphs are the one thing that does not fall back — export them first:
 
 ```bash
+pixi run -e raco raco-export
+pixi run -e raco raco-export --batched-extractor-path data/cusfm_models/raco-aliked-b1-16.onnx
+```
+
+Every previous default is a named ablation:
+
+```bash
+--features-backend pycolmap    # COLMAP's own ALIKED; the no-GPU-engine path, needs no graph
+--matching-backend pycolmap    # ... and its LightGlue, without the per-match score SSC needs
+--features-backend tensorrt    # the blob's aliked.onnx on the blob's engine (decision 13)
+--matching-backend tensorrt    # ... and its lightglue_aliked.onnx, with the blob's real SSC
+--ba-backend ceres             # the CPU mapper; CASPAR is the default since decision 17
+--no-caspar-ceres-polish       # drop the closing Ceres solve a CASPAR run finishes on
+--no-optimize-extrinsics       # drop stage 7b; 2.5 s on Galileo, 118-128 s on RoboCap
+--no-regularised-extrinsics    # keep stage 7b without cuSFM's priors, which overfits
+                               # (deviation 9) — and the one flag that takes CASPAR off the GPU
+--extrinsic-refinement-rounds  # ceiling on the alternation; 20, stops on its own tolerances
 --no-loop-closure              # skip stage 5; on by default since 2026-09-05 (decision 10)
 --no-use-gpu                   # force the ONNX CPU provider
 --max-matches-per-pair 500     # verified matches kept per pair; None keeps every inlier
 --match-cap-mode off           # fixed (default) | image_area | off (decision 14)
---features-backend tensorrt    # the blob's aliked.onnx on the blob's engine (decision 13)
---matching-backend tensorrt    # ... and its lightglue_aliked.onnx, with the blob's real SSC
---features-backend raco        # RaCo-ALIKED, batch-dynamic engine, 8 images at once
---matching-backend raco        # ... and LightGlue+, the matcher trained against it
 --ba-num-threads 1             # a bit-reproducible Ceres solve
---optimize-extrinsics          # second mapping pass with sensor_from_rig free (deviation 9)
---no-regularised-extrinsics    # ... without cuSFM's extrinsic priors, which overfits
---extrinsic-refinement-rounds  # ceiling on the alternation; 20, stops on its own tolerances
 ```
 
 `python -m colsfm stage --stage pair_selection` runs a metadata-only stage. It needs neither

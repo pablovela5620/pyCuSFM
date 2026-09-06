@@ -38,6 +38,7 @@ from colsfm.matching import (
     MatchingOptions,
     MatchLimitPolicy,
 )
+from colsfm.model_assets import check_raco_graphs
 from colsfm.run_lifecycle import (
     DATABASE_NAME,
 )
@@ -96,12 +97,24 @@ class PipelineOptions:
     """Keyframe rotation gate in degrees, OR-combined with the distance gate."""
     sample_sync_threshold_microseconds: int = 100
     """Rig grouping window in microseconds; the isaac demo's value, not the gflag default."""
-    optimize_extrinsics: bool = False
-    """Refine `sensor_from_rig` during bundle adjustment; cuSFM's `--optimize_extrinsics`."""
+    optimize_extrinsics: bool = True
+    """Refine `sensor_from_rig` after mapping; cuSFM's `--optimize_extrinsics`. On by default.
+
+    Stage 7b, `colsfm.extrinsic_refinement`, run on the model stage 7 left behind
+    (NOTES.md decision 17). It is not a second mapping pass and it does not free the
+    extrinsics inside the mapper: the alternation moves them in pyceres with the
+    blob's priors and holds them fixed in every bundle adjustment, which is why the
+    default can ask for CASPAR and this in the same run. `--no-optimize-extrinsics`
+    is the ablation; it drops the stage, which costs 2.5 s on Galileo and 118-128 s
+    on RoboCap (`docs/full-pipeline-results.md`)."""
     regularised_extrinsics: bool = True
     """Carry the blob's extrinsic priors through `colsfm.extrinsic_refinement`. False falls
     back to pycolmap's own rig bundle adjustment, which has no prior terms and on Galileo
-    overfits (NOTES.md deviation 9). Only read when `optimize_extrinsics` is set."""
+    overfits (NOTES.md deviation 9). Only read when `optimize_extrinsics` is set.
+
+    It is also the one thing that takes `--ba-backend caspar` off the GPU: the
+    unregularised path *is* `run_mapping(..., optimize_extrinsics=True)`, and CASPAR
+    throws when asked to refine `sensor_from_rig` (`colsfm.ba_backend`)."""
     extrinsic_refinement_rounds: int = 20
     """Ceiling on the extrinsics-then-poses rounds the regularised refinement may take; it
     stops early on its own tolerances, after 19 rounds and 3.2 s on Galileo."""
@@ -125,10 +138,15 @@ class PipelineOptions:
     worker processes, not the threads inside one: the runner launches one process per
     camera. COLMAP has a single process, so 1 serialises JPEG decode against the GPU and
     costs 4.4x on Galileo (33.9 s against 7.6 s, measured)."""
-    ba_backend: BaBackend = "ceres"
+    ba_backend: BaBackend = "caspar"
     """Which implementation solves the bundle adjustments — Ceres on the CPU, or COLMAP's
-    CASPAR on the GPU. `caspar` needs a CASPAR-enabled pycolmap and falls back to `ceres`,
-    loudly, when it is missing, when `--optimize-extrinsics` is set, or when a camera model
+    CASPAR on the GPU. `caspar` by default (NOTES.md decision 17): with the closing Ceres
+    polish below it is a third of the Ceres mapping time at Ceres' accuracy, and where the
+    build cannot honour it the run says so and solves on Ceres anyway, so the default costs
+    a machine without CASPAR nothing but a message. It needs a CASPAR-enabled pycolmap — the
+    `colsfm-caspar*` environments — and falls back to `ceres`, loudly, when that is
+    missing, when `--no-regularised-extrinsics` asks the mapper itself to free
+    `sensor_from_rig`, or when a camera model
     is one this build's CASPAR has no adapter for. Which models those are is measured at
     run time (`colsfm.mapping.caspar_supported_camera_models`): PINHOLE and SIMPLE_RADIAL
     in `colsfm-caspar` and `colsfm-caspar64`, plus OPENCV_FISHEYE in
@@ -158,13 +176,24 @@ class PipelineOptions:
     `colsfm.matching.MatchLimitPolicy`. `fixed` is the 500 every run before the KITTI
     follow-up used, `image_area` scales it with the frame's resolution, `off` keeps every
     verified inlier."""
-    features_backend: FeatureBackend = "pycolmap"
-    """Which ALIKED runs: COLMAP's own ONNX one, or the blob's TensorRT engine
-    (`colsfm.features_trt`). See `colsfm.features.FeatureBackend`."""
-    matching_backend: MatchingBackend = "pycolmap"
-    """Which LightGlue runs: COLMAP's own ONNX one, or the blob's TensorRT engine
-    (`colsfm.matching_trt`), which is the only path with the per-match score the blob's
-    SSC spatial NMS needs. See `colsfm.matching.MatchingBackend`."""
+    features_backend: FeatureBackend = "raco"
+    """Which ALIKED runs: RaCo-ALIKED on its own engine (`colsfm.features_raco`), COLMAP's
+    own ONNX one, or the blob's TensorRT engine (`colsfm.features_trt`).
+
+    `raco` by default (NOTES.md decision 17): 2.6 s of Galileo's 20.0 s total against
+    6.0 s for the blob's engine and 8.3 s for COLMAP's, at the same accuracy. It needs
+    the graphs under `data/cusfm_models/`, which are gitignored; a checkout without them
+    is told to export them or to ask for `--features-backend pycolmap`
+    (`colsfm.model_assets`), never quietly given another extractor.
+    See `colsfm.features.FeatureBackend`."""
+    matching_backend: MatchingBackend = "raco"
+    """Which LightGlue runs: LightGlue+ (`colsfm.matching_raco`), COLMAP's own ONNX one, or
+    the blob's TensorRT engine (`colsfm.matching_trt`).
+
+    `raco` by default, as the matcher fabio-sim trained against RaCo-ALIKED: pairing the
+    default extractor with COLMAP's own matcher would match descriptors it was not trained
+    on. Like the `tensorrt` path it sees the per-match score the blob's SSC spatial NMS
+    needs, which the `pycolmap` path cannot. See `colsfm.matching.MatchingBackend`."""
 
     @property
     def selection(self) -> SelectionOptions:
@@ -281,15 +310,24 @@ def resolve_run(options: PipelineOptions) -> ResolvedRun:
         The resolved settings for every stage.
 
     Raises:
+        FileNotFoundError: When a `raco` backend was asked for — which is the
+            default — and this checkout has none of its graphs.
         ValueError: When a `--caspar-option` item is malformed, names an option
             that is not a settable numeric CASPAR knob, or gives an integer knob a
             fractional value.
     """
+    check_raco_graphs(options.features_backend, options.matching_backend)
     ba_plan: BaExecutionPlan = resolve_ba_plan(
         options.ba_backend,
         options.caspar_option,
         ceres_polish=options.caspar_ceres_polish,
-        optimize_extrinsics=options.optimize_extrinsics,
+        # Not `options.optimize_extrinsics`: the *regularised* refinement — the
+        # default — never asks a bundle adjuster to free `sensor_from_rig`. It
+        # moves the extrinsics in pyceres and holds them fixed in every pycolmap
+        # solve, so the mapping pass stays on the GPU. Only the unregularised
+        # ablation is `run_mapping(..., optimize_extrinsics=True)`, which is the
+        # call CASPAR throws on.
+        optimize_extrinsics=options.optimize_extrinsics and not options.regularised_extrinsics,
     )
     return ResolvedRun(
         selection=options.selection,

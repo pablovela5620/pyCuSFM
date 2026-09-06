@@ -361,6 +361,11 @@ def test_the_whole_pipeline_runs_on_the_raco_backend(
         min_inter_frame_distance=SMOKE_MIN_INTER_FRAME_DISTANCE_M,
         features_backend="raco",
         matching_backend="raco",
+        # The backend is what this module measures; the rest of the default
+        # configuration is not, so the mapper stays on Ceres with the rig fixed
+        # (`tests/colsfm/test_pipeline.py` PYCOLMAP_ABLATION).
+        ba_backend="ceres",
+        optimize_extrinsics=False,
     )
     summary: PipelineSummary = run_pipeline(options)
     mean_matches: float = summary.mapping.num_observations / max(summary.num_pairs, 1)

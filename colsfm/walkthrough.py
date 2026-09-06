@@ -100,11 +100,12 @@ from pathlib import Path
 import rerun as rr
 import tyro
 
+from colsfm.ba_backend import BaBackend
 from colsfm.database import ImagePair
-from colsfm.features import ExtractionReport
+from colsfm.features import ExtractionReport, FeatureBackend
 from colsfm.frames_meta import FramesMeta
 from colsfm.mapping import MappingResult
-from colsfm.matching import MatchReport
+from colsfm.matching import MatchingBackend, MatchReport
 from colsfm.pipeline import PipelineObserver, run_pipeline
 from colsfm.run_config import DEFAULT_CONFIG_DIR, PipelineOptions
 from colsfm.run_lifecycle import StageName
@@ -158,7 +159,11 @@ class WalkthroughConfig:
     work_dir: Path | None = None
     """cuSFM-layout workspace the run writes into; a directory under `data/bench` by default."""
     optimize_extrinsics: bool = False
-    """Run stage 7b, the regularised rig-extrinsic refinement, and log its shift arrows."""
+    """Run stage 7b, the regularised rig-extrinsic refinement, and log its shift arrows.
+
+    Off here, on in the pipeline: the two walkthroughs — with the stage and without —
+    are what the recording is *for*, so this flag chooses which one is drawn rather
+    than following the pipeline's own default."""
     loop_closure: bool = True
     """Run the retrieval loop-closure search. On by default here, unlike the pipeline:
     the whole point of stage 5's panel is the rejection funnel, and a disabled stage
@@ -179,6 +184,19 @@ class WalkthroughConfig:
     """A run whose loop closure found revisits, drawn beside Galileo's empty stage 5."""
     dataset: str = "galileo"
     """Label for this dataset; it names the recording and the benchmark report, nothing else."""
+    features_backend: FeatureBackend = "pycolmap"
+    """Which ALIKED the drawn run uses. `pycolmap` here, not the pipeline's `raco` default.
+
+    The walkthrough is the teaching artifact: it has to draw on a bare checkout, where
+    `data/cusfm_models/` is empty (`colsfm.model_assets`), and every panel it draws is
+    the same whichever extractor filled the database. Pass `raco` to draw the default
+    pipeline instead."""
+    matching_backend: MatchingBackend = "pycolmap"
+    """Which LightGlue the drawn run uses; `pycolmap` for the same reason."""
+    ba_backend: BaBackend = "ceres"
+    """Which bundle adjuster the drawn run uses. `ceres`, not the pipeline's `caspar`:
+    the `colsfm-caspar*` environments are the ones with that build, and this recording
+    is made wherever a viewer is."""
 
     @property
     def resolved_work_dir(self) -> Path:
@@ -204,6 +222,9 @@ class WalkthroughConfig:
             optimize_extrinsics=self.optimize_extrinsics,
             loop_closure=self.loop_closure,
             use_gpu=self.use_gpu,
+            features_backend=self.features_backend,
+            matching_backend=self.matching_backend,
+            ba_backend=self.ba_backend,
         )
 
 

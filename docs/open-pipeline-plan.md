@@ -101,7 +101,19 @@ rerun-viewer-validation skill (pixel evidence).
 - Branch: `feat/pycolmap-open-pipeline`. Specs in `docs/spec/`, scratch in `data/cusfm_re/`.
 - Workers: Opus 5 for reverse engineering, specs, implementation, and review (user decision).
 
-## Status (2026-09-05)
+## Status (2026-09-06)
+
+**The default is the fast full pipeline.** `python -m colsfm run --input-dir X
+--output-dir Y`, with no other flag, runs RaCo-ALIKED features, LightGlue+ matching, loop
+closure, CASPAR bundle adjustment with its closing Ceres polish, and the regularised
+rig-extrinsic refinement (NOTES.md decision 17, 2026-09-06). That is
+`docs/full-pipeline-results.md`'s "RaCo + CASPAR" configuration, the cheaper of the two
+measured there: Galileo 20.0 s / 5.08 mm ATE, KITTI 06 153.2 s / 0.933 m Sim(3) ATE,
+RoboCap 477.9 s / 265 mm against the input trajectory, against the blob's 32.4 s, 1596.1 s
+and 1133.5 s. Everything below this paragraph, and every measurement in it that names a
+"default", describes the earlier `pycolmap` + Ceres configuration, which is still reachable
+as `--features-backend pycolmap --matching-backend pycolmap --ba-backend ceres
+--no-optimize-extrinsics` and is what the acceptance table at the end was measured on.
 
 **Done.** All eight stages run end to end from `python -m colsfm run`, over the same
 `--input-dir` and into the same output layout as `cusfm_cli`, with `runtime.csv`,
@@ -123,8 +135,11 @@ and **4.28 mm** ATE, against 1.334 px / 4.33 mm with the extrinsics fixed and 0.
 5.70 mm unregularised — the priors buy back all of the trajectory accuracy the free
 extrinsics were costing, and keep the extrinsics inside 2.8 mm where the unregularised solve
 walked 234 mm. **4/4 acceptance bounds**, 3.2 s for the stage. `--no-regularised-extrinsics`
-keeps the plain pycolmap path for comparison. The flag stays off by default: the gain over a
-fixed-extrinsic run is 0.4 px of reprojection and 0.02 mm of ATE.
+keeps the plain pycolmap path for comparison. The flag was off by default until 2026-09-06
+on the grounds that the gain over a fixed-extrinsic run is 0.4 px of reprojection and
+0.02 mm of ATE on Galileo; it is on now (decision 17), because on RoboCap the same stage
+takes the disagreement with the input trajectory from 278 mm to 265 mm
+(`docs/full-pipeline-results.md`).
 
 `--ba-backend caspar` runs the bundle adjustments on COLMAP's GPU CASPAR solver instead of
 Ceres, in the `colsfm-caspar` environment's from-source pycolmap (`docs/caspar-build.md`),
@@ -133,7 +148,10 @@ falling back to Ceres with a message wherever the build, the camera model or
 with loops it takes the mapping stage from **148.5 s to 31.5 s** (4.7x, total 338.0 s to
 208.6 s) and the Sim(3) ATE from 0.895 m to 1.299 m; an ablation puts that on CASPAR's
 float32 solve rather than on the robust loss it drops, since Ceres without that loss scores
-0.899 m. On Galileo it is a wash (1.76 s against 1.82 s). Off by default.
+0.899 m. On Galileo it is a wash (1.76 s against 1.82 s). It was off by default until
+2026-09-06 and is on now (decision 17): the closing Ceres polish, added after this
+paragraph was written, recovers the accuracy — KITTI 06 goes to 0.904 m for 9.8 s of polish
+on top of 31.5 s of CASPAR rounds, against the Ceres mapper's 0.895 m in 148.5 s.
 
 **Acceptance, Galileo** (`data/bench/galileo_compare.md`), B relative to A:
 

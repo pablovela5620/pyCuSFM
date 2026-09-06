@@ -20,6 +20,18 @@ Several modules read shipped cuSFM runs under `data/`. Each skips with the missi
 named rather than failing, so a checkout without the data is still green — and a run that
 reports more skips than usual is telling you which datasets are absent.
 
+**The suite does not run the default configuration, on purpose.** Since 2026-09-06 a run
+with no flags asks for RaCo, LightGlue+ and CASPAR (NOTES.md decision 17), which need the
+gitignored graphs under `data/cusfm_models/` and a `CASPAR_ENABLED` pycolmap — neither of
+which a fresh clone has. `test_pipeline.py` therefore builds every run from
+`PYCOLMAP_ABLATION`, the `--features-backend pycolmap --matching-backend pycolmap
+--ba-backend ceres --no-optimize-extrinsics` path, and states that once. What the defaults
+*are* is pinned separately, as pure assertions on `PipelineOptions` and on `resolve_run`'s
+`ResolvedRun`, which need no engine and no GPU. The engines themselves are exercised by
+`test_raco_backend.py` and `test_tensorrt_backends.py` behind their own skips, and CASPAR by
+`test_mapping_ba_backend.py`, which asserts *both* branches — the GPU solve where the build
+has it, and the loud Ceres fallback with its reason in `MappingStats` where it does not.
+
 ## The type-checked run
 
 `colsfm/__init__.py` turns on beartype's claw only when `PIXI_DEV_MODE=1`:
@@ -49,29 +61,14 @@ through it means nothing. Its numerical half,
 
 ### What the checked run currently reports
 
-**5 failed, 522 passed, 14 skipped** (2026-09-06). The default run is green, so every one
-of these is an annotation the default run does not check. Both causes are in production
-code and neither is fixed here:
+**532 passed, 14 skipped** (2026-09-06), the same as the default run and 160 s against its
+93 s. It was 5 failed / 522 passed until the two annotation defects it exists to find were
+fixed: `colsfm.colmap_text_model.parse_colmap_points_text` declared `Int[ndarray,
+"n_points 3"]` and returned `uint8` RGB, and a `publish_atomically` test expected a
+`TypeError` beartype pre-empts with `BeartypeCallHintParamViolation`.
 
-* Four in `test_colmap_text_model.py`. `colsfm.colmap_text_model.parse_colmap_points_text`
-  declares its second return as `Int[ndarray, "n_points 3"]` and returns the `uint8` RGB
-  triples it read. `Int` does not admit an unsigned dtype, so the annotation is wrong
-  about the function's own output — exactly the defect a checked run exists to find.
-* One in `test_tensorrt_engine_cache.py`. `test_a_failed_publication_leaves_the_previous_file_intact`
-  hands `publish_atomically` a `str` where `bytes` is declared and expects the function's
-  own `TypeError`. Under the claw beartype rejects the argument first, and
-  `BeartypeCallHintParamViolation` is not a `TypeError`. Worth noting that the test also
-  proves *less* under the claw: the call never reaches the write it is supposed to roll
-  back, so the rollback claim needs a failure beartype cannot pre-empt.
-
-### The task to add
-
-`pixi.toml` should carry this as a named task, so the checked run is one word rather than
-an environment variable somebody has to remember. Add it under `[feature.colsfm.tasks]`,
-next to `colsfm-test`:
-
-```toml
-colsfm-test-typed = { cmd = "python -m pytest tests/colsfm -q", description = "Run the colsfm suite with runtime type checking", env = { PIXI_DEV_MODE = "1" } }
+```shell
+pixi run colsfm-test-typed
 ```
 
 ## The performance tests
@@ -115,7 +112,7 @@ reasons. It is now five, and reading one of them no longer means reading all fiv
 |---|---|
 | `mapping_helpers.py` | Not a test module. The synthetic rig every mapping scene is built from: known poses, known points, noisy observations, the COLMAP database that carries them, and the bookkeeping that matches a triangulated track back to the point that generated it. |
 | `test_mapping.py` | What the mapper does to a scene. Correspondence loading, point recovery against ground truth, the outer loop's two stopping rules, pose recovery from a perturbed trajectory, single-thread determinism, the per-round callback. Synthetic input only. |
-| `test_mapping_ba_backend.py` | Which bundle adjuster a run gets. The three CASPAR fallbacks (camera model, `--optimize-extrinsics`, a build without `CASPAR_ENABLED`), the capability probe and its cache, the solver-option cast, and the single Ceres bundle adjustment that finishes a CASPAR run. |
+| `test_mapping_ba_backend.py` | Which bundle adjuster a run gets. The three CASPAR fallbacks (camera model, a bundle adjustment asked to free `sensor_from_rig` — i.e. `--no-regularised-extrinsics` — and a build without `CASPAR_ENABLED`), the capability probe and its cache, the solver-option cast, and the single Ceres bundle adjustment that finishes a CASPAR run. |
 | `test_mapping_point_filters.py` | The two pre-solve guards, `filter_degenerate_points` and `filter_projection_failures`. Pure functions over a triangulated model; no solver, no backend, no dataset. |
 | `test_mapping_extrinsics.py` | `--optimize_extrinsics`: what an unregularised rig refinement recovers from a 20 mm perturbation, and the drift it costs on weakly covisible cameras. Real Galileo matches, because a synthetic rig cannot settle the question. |
 | `test_mapping_galileo_parity.py` | The integration run: the shipped cuSFM blob's own keyframes, matches and input poses, so the only difference from cuSFM's output is the mapper. The slowest mapping module, and the only one that needs a dataset on disk. |

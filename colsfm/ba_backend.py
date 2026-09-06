@@ -465,10 +465,18 @@ def apply_caspar_options(caspar: pycolmap.CasparBundleAdjustmentOptions, overrid
 
 
 EXTRINSICS_FALLBACK_REASON: Final[str] = (
-    "CASPAR holds `sensor_from_rig` fixed and throws when asked to refine it, "
-    "so `--optimize-extrinsics` solves on Ceres"
+    "CASPAR holds `sensor_from_rig` fixed and throws when asked to refine it, so a bundle "
+    "adjustment that frees it -- which is what `--no-regularised-extrinsics` asks for -- "
+    "solves on Ceres"
 )
-"""Why `--ba-backend caspar --optimize-extrinsics` ends up on Ceres."""
+"""Why a solve that refines `sensor_from_rig` ends up on Ceres.
+
+Not the default configuration's refinement. `--optimize-extrinsics` is on by default
+and stays on CASPAR, because the regularised path never asks a bundle adjuster to
+free the extrinsics: `colsfm.extrinsic_refinement` moves them in pyceres and holds
+them fixed in every pycolmap solve. What reaches this sentence is
+`--no-regularised-extrinsics`, whose refinement *is*
+`run_mapping(..., optimize_extrinsics=True)`."""
 
 CASPAR_BUILD_FALLBACK_REASON: Final[str] = (
     "this pycolmap is built without CASPAR_ENABLED, so the GPU backend cannot solve "
@@ -508,7 +516,8 @@ def resolve_backend(
 
     Args:
         requested: The backend the caller asked for.
-        optimize_extrinsics: Whether this solve refines `sensor_from_rig`.
+        optimize_extrinsics: Whether this solve refines `sensor_from_rig`, i.e.
+            whether `refine_sensor_from_rig` will be set on the bundle adjuster.
         camera_model_names: The models in the reconstruction about to be adjusted.
             None skips the camera check — the caller has no model to offer.
         capability: What this build can do; measured when None.
@@ -583,7 +592,11 @@ def resolve_ba_plan(
         requested: `--ba-backend`.
         caspar_option_items: `--caspar-option name=value`, one per repetition.
         ceres_polish: `--caspar-ceres-polish`; inert once the backend is Ceres.
-        optimize_extrinsics: `--optimize-extrinsics`, which CASPAR cannot honour.
+        optimize_extrinsics: Whether a *bundle adjustment* of this run frees
+            `sensor_from_rig`, which CASPAR cannot honour. That is not the same
+            question as `--optimize-extrinsics`: the regularised refinement, which
+            is the default, refines the extrinsics outside the bundle adjuster and
+            leaves this False. See `colsfm.run_config.resolve_run`.
         camera_model_names: The models the run will adjust, when they are known.
             None at the start of a run — the reconstruction does not exist yet —
             so the camera check happens at the first solve instead.

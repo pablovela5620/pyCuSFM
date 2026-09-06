@@ -225,8 +225,14 @@ colsfm-test-typed = { cmd = "python -m pytest tests/colsfm -q", description = "R
 # `test` task) does not carry, so its parser tests live here and skip elsewhere.
 demo-test = { cmd = "python -m pytest tests/test_demo_rerun.py -q", description = "Run the demo_rerun COLMAP text-parser tests" }
 colsfm-lint = { cmd = "ruff check colsfm tests tools", description = "Lint the colsfm package, its tests and the audit tools" }
-colsfm-galileo = { cmd = "python -m colsfm run --input-dir data/r2b_galileo --output-dir data/cusfm_runs/galileo_colsfm/cusfm", description = "Run the whole colsfm pipeline on the 226-frame r2b_galileo sample" }
-colsfm-robocap = { cmd = "python -m colsfm run --input-dir data/cusfm_runs/robocap_blobref/input --output-dir data/cusfm_runs/robocap_colsfm/cusfm", description = "Run the whole colsfm pipeline on the 4528-frame RoboCap stride-4 sequence" }
+# No backend flags: the default is the fast full pipeline (RaCo, LightGlue+, CASPAR
+# with its Ceres polish, the regularised extrinsic refinement, loop closure) since
+# 2026-09-06, NOTES.md decision 17.  In *this* environment the pycolmap has no CASPAR,
+# so the mapper falls back to Ceres, says so, and records the reason in summary.json;
+# `pixi run -e colsfm-caspar-fisheye <same task>` is the one that solves on the GPU.
+colsfm-galileo = { cmd = "python -m colsfm run --input-dir data/r2b_galileo --output-dir data/cusfm_runs/galileo_colsfm/cusfm", description = "Run the default colsfm pipeline on the 226-frame r2b_galileo sample" }
+colsfm-robocap = { cmd = "python -m colsfm run --input-dir data/cusfm_runs/robocap_blobref/input --output-dir data/cusfm_runs/robocap_colsfm/cusfm", description = "Run the default colsfm pipeline on the 4528-frame RoboCap stride-4 sequence" }
+colsfm-galileo-ablation = { cmd = "python -m colsfm run --input-dir data/r2b_galileo --output-dir data/cusfm_runs/galileo_colsfm_ablation/cusfm --features-backend pycolmap --matching-backend pycolmap --ba-backend ceres --no-optimize-extrinsics", description = "The no-GPU-engine ablation on r2b_galileo: COLMAP's own ALIKED and LightGlue, Ceres, no extrinsic refinement" }
 
 
 # ── colsfm-caspar: the colsfm stack on a CASPAR-enabled pycolmap ─────────────
@@ -462,6 +468,14 @@ LD_LIBRARY_PATH = "${CONDA_PREFIX}/lib:${CONDA_PREFIX}/lib/python3.12/site-packa
 [feature.colsfm-caspar-fisheye.tasks]
 caspar-fisheye-probe = { cmd = "python -m tools.caspar_fisheye_probe", description = "Validate the OPENCV_FISHEYE CASPAR adapter against Ceres on a synthetic fisheye rig and the Galileo model" }
 caspar-fisheye-test = { cmd = "python -m pytest tests/colsfm_probes -q", description = "Run the pycolmap capability probe suite against the fisheye-adapter CASPAR build" }
+# The same two run tasks as `[feature.colsfm.tasks]`, verbatim and with no backend
+# flags, because since 2026-09-06 the default *is* the fast full pipeline (NOTES.md
+# decision 17).  They are repeated here rather than shared because this is the
+# environment whose pycolmap has both CASPAR and the OPENCV_FISHEYE adapter, i.e. the
+# one where the default's `--ba-backend caspar` runs on the GPU instead of falling
+# back to Ceres.  RoboCap's fisheye rig needs the adapter specifically.
+colsfm-galileo = { cmd = "python -m colsfm run --input-dir data/r2b_galileo --output-dir data/cusfm_runs/galileo_colsfm/cusfm", description = "Run the default colsfm pipeline on the 226-frame r2b_galileo sample, with CASPAR on the GPU" }
+colsfm-robocap = { cmd = "python -m colsfm run --input-dir data/cusfm_runs/robocap_blobref/input --output-dir data/cusfm_runs/robocap_colsfm/cusfm", description = "Run the default colsfm pipeline on the 4528-frame RoboCap stride-4 sequence, with CASPAR on the GPU" }
 
 
 

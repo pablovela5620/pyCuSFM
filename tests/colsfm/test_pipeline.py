@@ -17,18 +17,26 @@ import dataclasses
 import shutil
 from dataclasses import replace
 from pathlib import Path
+from typing import Final
 
 import numpy as np
 import pycolmap
 import pytest
 from serde.json import from_json, to_json
 
+from colsfm.ba_backend import EXTRINSICS_FALLBACK_REASON
 from colsfm.benchmark import read_run, rig_rigidity_spread_millimeters
 from colsfm.config import CusfmConfig, read_config_directory
 from colsfm.export import KEYFRAME_METADATA_SUBPATH, RUNTIME_CSV_NAME, RuntimeRecord, read_runtime_records
 from colsfm.frames_meta import FRAMES_META_NAME, FramesMeta, read_frames_meta
 from colsfm.geometry import MILLIMETRES_PER_METRE
 from colsfm.matching import MatchingOptions, MatchLimitPolicy
+from colsfm.model_assets import (
+    RACO_LIGHTGLUE_ONNX_PATH,
+    RACO_ONNX_PATH,
+    missing_raco_graphs_message,
+    required_raco_graphs,
+)
 from colsfm.pipeline import StageResult, run_pipeline, run_stage
 from colsfm.run_config import DEFAULT_CONFIG_DIR, PipelineOptions, ResolvedRun, SelectionOptions, resolve_run
 from colsfm.run_lifecycle import (
@@ -65,6 +73,26 @@ Deliberately below the registered count: 0.5 m spacing leaves five rig samples
 across Galileo's 0.66 m sweep, and the cameras facing away from the overlap
 legitimately see nothing. Measured 26 of 34."""
 
+PYCOLMAP_ABLATION: Final[PipelineOptions] = PipelineOptions(
+    input_dir=Path(),
+    output_dir=Path(),
+    min_inter_frame_distance=SMOKE_MIN_INTER_FRAME_DISTANCE_M,
+    features_backend="pycolmap",
+    matching_backend="pycolmap",
+    ba_backend="ceres",
+    optimize_extrinsics=False,
+)
+"""The no-GPU-engine ablation every run in this module takes, minus its two paths.
+
+`python -m colsfm run` defaults to RaCo, LightGlue+ and CASPAR since 2026-09-06
+(NOTES.md decision 17), which needs the uncommitted graphs under
+`data/cusfm_models/` and a `CASPAR_ENABLED` pycolmap. This module is the *pipeline*
+suite, not a backend suite: what it asserts — the artifacts, the publication
+boundary, the summary — is the same on every backend, so it names the ablation that
+runs on a bare checkout and leaves the engines to `test_raco_backend.py` and
+`test_mapping_ba_backend.py`. Every fixture below is `replace(PYCOLMAP_ABLATION,
+input_dir=..., output_dir=...)`, so the ablation is stated once."""
+
 
 @pytest.fixture(scope="module")
 def galileo_run(galileo_input_dir: Path, tmp_path_factory: pytest.TempPathFactory) -> PipelineSummary:
@@ -80,10 +108,8 @@ def galileo_run(galileo_input_dir: Path, tmp_path_factory: pytest.TempPathFactor
     input_dir: Path = galileo_input_dir
     if not (input_dir / FRAMES_META_NAME).is_file():
         pytest.skip(f"missing {input_dir / FRAMES_META_NAME}")
-    options: PipelineOptions = PipelineOptions(
-        input_dir=input_dir,
-        output_dir=tmp_path_factory.mktemp("galileo_colsfm"),
-        min_inter_frame_distance=SMOKE_MIN_INTER_FRAME_DISTANCE_M,
+    options: PipelineOptions = replace(
+        PYCOLMAP_ABLATION, input_dir=input_dir, output_dir=tmp_path_factory.mktemp("galileo_colsfm")
     )
     return run_pipeline(options)
 
@@ -176,10 +202,10 @@ def galileo_caspar_run(
     input_dir: Path = galileo_input_dir
     if not (input_dir / FRAMES_META_NAME).is_file():
         pytest.skip(f"missing {input_dir / FRAMES_META_NAME}")
-    options: PipelineOptions = PipelineOptions(
+    options: PipelineOptions = replace(
+        PYCOLMAP_ABLATION,
         input_dir=input_dir,
         output_dir=tmp_path_factory.mktemp("galileo_colsfm_caspar"),
-        min_inter_frame_distance=SMOKE_MIN_INTER_FRAME_DISTANCE_M,
         ba_backend="caspar",
     )
     return run_pipeline(options)
@@ -249,10 +275,10 @@ def galileo_refined_run(galileo_input_dir: Path, tmp_path_factory: pytest.TempPa
     input_dir: Path = galileo_input_dir
     if not (input_dir / FRAMES_META_NAME).is_file():
         pytest.skip(f"missing {input_dir / FRAMES_META_NAME}")
-    options: PipelineOptions = PipelineOptions(
+    options: PipelineOptions = replace(
+        PYCOLMAP_ABLATION,
         input_dir=input_dir,
         output_dir=tmp_path_factory.mktemp("galileo_colsfm_ext"),
-        min_inter_frame_distance=SMOKE_MIN_INTER_FRAME_DISTANCE_M,
         optimize_extrinsics=True,
     )
     return run_pipeline(options)
@@ -428,6 +454,87 @@ def test_a_stage_that_returns_records_its_timing_and_says_it_finished(tmp_path: 
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def test_the_default_run_is_the_fast_full_pipeline() -> None:
+    """`python -m colsfm run` with no other flag asks for the configuration of record.
+
+    RaCo-ALIKED, LightGlue+, CASPAR with its Ceres polish, the regularised extrinsic
+    refinement and loop closure — NOTES.md decision 17, 2026-09-06. The defaults are
+    pinned here because they are a *product* decision: a machine without the RaCo
+    graphs or without a CASPAR build must be told so, not quietly given another
+    pipeline, and this test is what a change of mind has to walk past.
+    """
+    default: PipelineOptions = PipelineOptions(input_dir=Path("in"), output_dir=Path("out"))
+    assert default.features_backend == "raco"
+    assert default.matching_backend == "raco"
+    assert default.ba_backend == "caspar"
+    assert default.caspar_ceres_polish is True
+    assert default.optimize_extrinsics is True
+    assert default.regularised_extrinsics is True
+    assert default.loop_closure is True
+
+
+def test_the_default_maps_on_caspar_and_refines_the_extrinsics_afterwards(
+    galileo_input_dir: Path, tmp_path: Path
+) -> None:
+    """The default resolves to a CASPAR mapping pass with `sensor_from_rig` held fixed.
+
+    The two defaults look mutually exclusive — CASPAR throws when asked to refine
+    `sensor_from_rig` — and they are not: stage 7 maps with the extrinsics fixed, so
+    the GPU solve is legal, and stage 7b then moves them in pyceres with the priors
+    (`colsfm.extrinsic_refinement`). The plan must therefore say `caspar` with no
+    fallback; it said `ceres` while the pipeline was in fact solving on the GPU.
+    """
+    resolved: ResolvedRun = resolve_run(PipelineOptions(input_dir=galileo_input_dir, output_dir=tmp_path / "cusfm"))
+    assert resolved.features.backend == "raco"
+    assert resolved.matching_backend == "raco"
+    assert resolved.mapping.ba_backend == "caspar"
+    assert resolved.mapping.optimize_extrinsics is False, "stage 7 maps with the rig fixed"
+    assert resolved.ba_plan.backend == "caspar"
+    assert resolved.ba_plan.fallback_reason is None
+    assert resolved.ba_plan.ceres_polish is True
+
+
+def test_the_unregularised_refinement_is_the_one_that_takes_caspar_off_the_gpu(
+    galileo_input_dir: Path, tmp_path: Path
+) -> None:
+    """`--no-regularised-extrinsics` is the path CASPAR cannot honour, and it says so.
+
+    That path is `run_mapping(..., optimize_extrinsics=True)`, i.e. pycolmap's own rig
+    bundle adjustment, which CASPAR throws on. The regularised default never asks the
+    GPU solver for that, so the fallback belongs to the ablation alone.
+    """
+    plan: ResolvedRun = resolve_run(
+        PipelineOptions(
+            input_dir=galileo_input_dir, output_dir=tmp_path / "cusfm", regularised_extrinsics=False
+        )
+    )
+    assert plan.ba_plan.backend == "ceres"
+    assert plan.ba_plan.fallback_reason == EXTRINSICS_FALLBACK_REASON
+    assert plan.ba_plan.ceres_polish is False
+
+
+def test_the_raco_default_needs_two_graphs_and_the_ablation_needs_none() -> None:
+    """Which model files each backend choice requires, before a run creates anything."""
+    assert required_raco_graphs("pycolmap", "pycolmap") == ()
+    assert required_raco_graphs("tensorrt", "tensorrt") == ()
+    assert required_raco_graphs("raco", "pycolmap") == (RACO_ONNX_PATH,)
+    assert required_raco_graphs("pycolmap", "raco") == (RACO_LIGHTGLUE_ONNX_PATH,)
+    assert required_raco_graphs("raco", "raco") == (RACO_ONNX_PATH, RACO_LIGHTGLUE_ONNX_PATH)
+
+
+def test_a_missing_raco_graph_names_the_export_command_and_the_ablation() -> None:
+    """A fresh clone is told how to build the graphs and how to run without them.
+
+    Falling back to `pycolmap` here would be the worst of the options: it changes
+    every number a run reports without saying so. The run stops instead.
+    """
+    message: str = missing_raco_graphs_message((Path("data/cusfm_models/raco-aliked-b1-16.onnx"),))
+    assert "raco-aliked-b1-16.onnx" in message
+    assert "pixi run -e raco raco-export" in message
+    assert "--features-backend pycolmap --matching-backend pycolmap" in message
+
+
+
 def test_a_bad_caspar_override_stops_the_run_before_the_workspace_exists(
     galileo_input_dir: Path, tmp_path: Path
 ) -> None:
@@ -440,7 +547,8 @@ def test_a_bad_caspar_override_stops_the_run_before_the_workspace_exists(
     if not (galileo_input_dir / FRAMES_META_NAME).is_file():
         pytest.skip(f"missing {galileo_input_dir / FRAMES_META_NAME}")
     output_dir: Path = tmp_path / "never_created"
-    options: PipelineOptions = PipelineOptions(
+    options: PipelineOptions = replace(
+        PYCOLMAP_ABLATION,
         input_dir=galileo_input_dir,
         output_dir=output_dir,
         ba_backend="caspar",
@@ -456,8 +564,8 @@ def test_an_unknown_caspar_override_stops_the_run_too(galileo_input_dir: Path, t
     if not (galileo_input_dir / FRAMES_META_NAME).is_file():
         pytest.skip(f"missing {galileo_input_dir / FRAMES_META_NAME}")
     output_dir: Path = tmp_path / "never_created"
-    options: PipelineOptions = PipelineOptions(
-        input_dir=galileo_input_dir, output_dir=output_dir, caspar_option=("solver_iterations=10",)
+    options: PipelineOptions = replace(
+        PYCOLMAP_ABLATION, input_dir=galileo_input_dir, output_dir=output_dir, caspar_option=("solver_iterations=10",)
     )
     with pytest.raises(ValueError, match="not a numeric CASPAR solver option"):
         run_pipeline(options)
@@ -466,8 +574,8 @@ def test_an_unknown_caspar_override_stops_the_run_too(galileo_input_dir: Path, t
 
 def test_the_resolved_run_gives_both_match_stages_one_matcher(galileo_input_dir: Path, tmp_path: Path) -> None:
     """Stage 4 and stage 5's batch match take the same resolved `MatchingOptions`."""
-    options: PipelineOptions = PipelineOptions(
-        input_dir=galileo_input_dir, output_dir=tmp_path / "cusfm", match_cap_mode="image_area"
+    options: PipelineOptions = replace(
+        PYCOLMAP_ABLATION, input_dir=galileo_input_dir, output_dir=tmp_path / "cusfm", match_cap_mode="image_area"
     )
     resolved: ResolvedRun = resolve_run(options)
     config: CusfmConfig = read_config_directory(DEFAULT_CONFIG_DIR)
@@ -480,10 +588,10 @@ def test_the_two_spellings_of_an_uncapped_run_resolve_to_the_same_policy(
 ) -> None:
     """`--match-cap-mode off` and `--max-matches-per-pair None` are one state, not two."""
     by_mode: ResolvedRun = resolve_run(
-        PipelineOptions(input_dir=galileo_input_dir, output_dir=tmp_path / "a", match_cap_mode="off")
+        replace(PYCOLMAP_ABLATION, input_dir=galileo_input_dir, output_dir=tmp_path / "a", match_cap_mode="off")
     )
     by_budget: ResolvedRun = resolve_run(
-        PipelineOptions(input_dir=galileo_input_dir, output_dir=tmp_path / "b", max_matches_per_pair=None)
+        replace(PYCOLMAP_ABLATION, input_dir=galileo_input_dir, output_dir=tmp_path / "b", max_matches_per_pair=None)
     )
     assert by_mode.match_limit == by_budget.match_limit
     assert not by_mode.match_limit.limits
@@ -533,11 +641,8 @@ def test_a_failed_rerun_leaves_the_previous_run_whole(galileo_input_dir: Path, t
     if not (galileo_input_dir / FRAMES_META_NAME).is_file():
         pytest.skip(f"missing {galileo_input_dir / FRAMES_META_NAME}")
     output_dir: Path = tmp_path / "cusfm"
-    good: PipelineOptions = PipelineOptions(
-        input_dir=galileo_input_dir,
-        output_dir=output_dir,
-        min_inter_frame_distance=SMOKE_MIN_INTER_FRAME_DISTANCE_M,
-        loop_closure=False,
+    good: PipelineOptions = replace(
+        PYCOLMAP_ABLATION, input_dir=galileo_input_dir, output_dir=output_dir, loop_closure=False
     )
     run_pipeline(good)
     before: dict[str, int] = {

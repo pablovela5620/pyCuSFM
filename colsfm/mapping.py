@@ -46,8 +46,13 @@ pyceres (the pybind11 registry split, pycolmap-capabilities.md §8). colsfm
 therefore optimises reprojection alone, and on Galileo that trades trajectory
 accuracy for pixels: 0.861 px against 1.334 px, but 5.70 mm ATE against 4.33 mm,
 with extrinsics moving up to 234 mm where the blob moves 11 mm. Only a stereo
-pair's own relative extrinsic is well determined by a 0.66 m sweep. The flag is
-off by default; NOTES.md deviation 9 carries the table.
+pair's own relative extrinsic is well determined by a 0.66 m sweep. NOTES.md
+deviation 9 carries the table.
+
+So this path is the *ablation*, reached by `--no-regularised-extrinsics`. A default
+run refines its extrinsics too — `--optimize-extrinsics` is on — but through
+`colsfm.extrinsic_refinement`, which carries the priors and calls this module only
+with `optimize_extrinsics` False.
 
 ## Overrides forced on pycolmap, and why
 
@@ -242,7 +247,12 @@ class MappingOptions:
     """Knobs the mapper takes from the command line rather than from a config file."""
 
     optimize_extrinsics: bool = False
-    """Refine `sensor_from_rig`; cuSFM's `--optimize_extrinsics`, off by default."""
+    """Set `refine_sensor_from_rig` on this mapper's bundle adjustments; off by default.
+
+    Not `PipelineOptions.optimize_extrinsics`, which is on: a default run refines its
+    extrinsics in `colsfm.extrinsic_refinement`, whose every call here leaves this
+    False. Only `--no-regularised-extrinsics` turns it on, and that is the one thing
+    that takes `ba_backend="caspar"` off the GPU."""
     fixed_camera_params_id: int | None = None
     """Camera whose extrinsic stays fixed while the others are refined; cuSFM's `--fixed_camera_name`."""
     num_threads: int | None = None
@@ -263,8 +273,8 @@ class MappingOptions:
     `colsfm-caspar` environments. It falls back to `ceres`, loudly, on three
     conditions: a camera model this build's CASPAR has no adapter for (whose
     observations it would silently drop; see `caspar_supported_camera_models`),
-    `optimize_extrinsics` (which CASPAR cannot honour), and a pycolmap built without
-    it. See the module docstring for the robust loss CASPAR does not apply."""
+    the `optimize_extrinsics` above (which CASPAR cannot honour, and which the
+    regularised refinement never sets), and a pycolmap built without it. See the module docstring for the robust loss CASPAR does not apply."""
     caspar_supported_models: frozenset[str] | None = None
     """Camera model names to treat as CASPAR-supported, overriding the runtime probe.
 

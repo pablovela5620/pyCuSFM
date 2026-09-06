@@ -134,9 +134,22 @@ sudo apt install libgoogle-glog0v6t64 libopencv-core406t64 libopencv-calib3d406t
 > replaces the NVIDIA cuSFM binaries. It reads the same `frames_meta.json` and writes the
 > same outputs, so a colsfm run and a blob run compare directly.
 
+A run with no flags is the **fast full pipeline**: RaCo-ALIKED features, LightGlue+
+matching, loop closure, CASPAR bundle adjustment with its closing Ceres polish, and the
+regularised rig-extrinsic refinement (NOTES.md decision 17). It needs two things the
+repository does not ship — export the RaCo graphs once with `pixi run -e raco raco-export`
+and `pixi run -e raco raco-export --batched-extractor-path
+data/cusfm_models/raco-aliked-b1-16.onnx`, and use a `colsfm-caspar*` environment for the
+GPU bundle adjuster. Without the graphs the run stops and names the fix; without CASPAR it
+solves on Ceres and records why in `summary.json`.
+
 ```bash
-pixi run -e colsfm colsfm-galileo   # r2b_galileo, 226 frames, 8 pinhole cameras
-pixi run -e colsfm colsfm-robocap   # RoboCap stride 4 (input dir written by `pixi run demo-robocap`), 4528 frames, 4 fisheye cameras
+pixi run -e colsfm-caspar-fisheye colsfm-galileo   # r2b_galileo, 226 frames, 8 pinhole cameras
+pixi run -e colsfm-caspar-fisheye colsfm-robocap   # RoboCap stride 4 (input dir written by `pixi run demo-robocap`), 4528 frames, 4 fisheye cameras
+
+# the no-GPU-engine ablation: COLMAP's own ALIKED and LightGlue, Ceres, no refinement
+pixi run -e colsfm colsfm-galileo-ablation
+
 pixi run -e colsfm python -m colsfm.bench_cli \
     --dataset galileo \
     --run-a data/cusfm_runs/galileo_blobref/cusfm \
@@ -146,8 +159,8 @@ pixi run -e colsfm python -m colsfm.bench_cli \
     --report data/bench/galileo_compare.md
 ```
 
-Galileo, blob against colsfm, measured by the benchmark in
-[data/bench/galileo_compare.md](data/bench/galileo_compare.md):
+Galileo, the blob against colsfm's `pycolmap` + Ceres ablation, measured by the benchmark
+in [data/bench/galileo_compare.md](data/bench/galileo_compare.md):
 
 | Metric | blob | colsfm |
 |---|---|---|
@@ -157,7 +170,12 @@ Galileo, blob against colsfm, measured by the benchmark in
 | ATE vs ground truth (mm RMSE) | 5.00 | 4.33 |
 | total runtime (s) | 40.07 | 19.35 |
 
-Loop closure is on by default, as in the blob; `--no-loop-closure` is the ablation. Decisions,
+That table is the ablation, not the default, and it is kept because the acceptance bounds
+were measured on it;
+[docs/full-pipeline-results.md](docs/full-pipeline-results.md) has the default
+configuration's numbers on all three datasets. Every knob the default turns on has a named
+ablation — `--no-loop-closure`, `--no-optimize-extrinsics`, `--ba-backend ceres`,
+`--features-backend pycolmap` — and `colsfm/README.md` says what each one costs. Decisions,
 deviations from the blob and gotchas are in
 [NOTES.md](NOTES.md); the plan of record is
 [docs/open-pipeline-plan.md](docs/open-pipeline-plan.md); the reverse-engineered contract

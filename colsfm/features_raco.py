@@ -73,7 +73,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Literal, TypeAlias
 
-from colsfm import REPO_ROOT
 from colsfm.database import keypoint_counts
 from colsfm.features import RacoEngineChoice, TensorRTExtraction
 from colsfm.features_native import (
@@ -88,20 +87,8 @@ from colsfm.features_native import (
     run_native_extraction,
 )
 from colsfm.features_trt import NETWORK_HEIGHT, NETWORK_WIDTH
+from colsfm.model_assets import RACO_DYNAMIC_ONNX_PATH, RACO_ONNX_PATH
 from colsfm.tensorrt_runtime import ShapeProfile, resolve_engine
-
-RACO_ONNX_PATH: Final[Path] = REPO_ROOT / "data" / "cusfm_models" / "raco-aliked-b1-16.onnx"
-"""The batch-dynamic RaCo-ALIKED graph; its engine is cached beside it.
-
-Not committed — `data/cusfm_models` is gitignored and the graph is 8.9 MB of
-weights. Produce it with
-`pixi run -e raco raco-export --batched-extractor-path data/cusfm_models/raco-aliked-b1-16.onnx`."""
-
-RACO_DYNAMIC_ONNX_PATH: Final[Path] = REPO_ROOT / "data" / "cusfm_models" / "raco-aliked-dyn.onnx"
-"""The batch- **and** shape-dynamic RaCo-ALIKED graph; its engine is cached beside it.
-
-Also not committed. Produce it with
-`pixi run -e raco raco-export --dynamic-shape --batched-extractor-path data/cusfm_models/raco-aliked-dyn.onnx`."""
 
 MINIMUM_BATCH_SIZE: Final[int] = 1
 """The optimisation profile's `min`, so a one-image run still executes."""

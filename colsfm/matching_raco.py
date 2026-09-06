@@ -45,18 +45,11 @@ import numpy as np
 from jaxtyping import Float32
 from numpy import ndarray
 
-from colsfm import REPO_ROOT
 from colsfm.database import ImagePair, KeypointsXY
 from colsfm.matching import MatchingOptions, MatchReport
 from colsfm.matching_trt import LIGHTGLUE_PROFILE, match_pairs_tensorrt
+from colsfm.model_assets import RACO_LIGHTGLUE_ONNX_PATH
 from colsfm.tensorrt_runtime import ShapeProfile
-
-RACO_LIGHTGLUE_ONNX_PATH: Final[Path] = REPO_ROOT / "data" / "cusfm_models" / "raco" / "aliked_lightglue" / "lightglue_aliked.onnx"
-"""The RaCo-trained LightGlue+ graph; its engine is cached beside it.
-
-Not committed — `data/cusfm_models` is gitignored. Produce it with
-`pixi run -e raco raco-export`, which writes both this and the batch-1
-extractor under `data/cusfm_models/raco/aliked_lightglue/`."""
 
 RACO_LIGHTGLUE_PROFILE: Final[dict[str, ShapeProfile]] = LIGHTGLUE_PROFILE
 """The same keypoint-axis profile as the blob's graph: minimum 1, optimal 3200, maximum 5500.

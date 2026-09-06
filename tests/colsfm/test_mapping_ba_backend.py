@@ -30,6 +30,7 @@ from mapping_helpers import (
 
 from colsfm import ba_backend
 from colsfm.ba_backend import (
+    CASPAR_BUILD_FALLBACK_REASON,
     CASPAR_PROBE_CAMERA_MODELS,
     CASPAR_STOCK_CAMERA_MODELS,
     apply_caspar_options,
@@ -40,6 +41,7 @@ from colsfm.ba_backend import (
 from colsfm.config import BundleAdjustmentConfig, CusfmConfig, VisionMappingConfig
 from colsfm.mapping import MappingOptions, MappingResult, bundle_adjustment_options, ceres_polish_options, run_mapping
 from colsfm.reconstruction import build_reconstruction
+from colsfm.run_report import MappingStats
 
 
 @pytest.fixture(autouse=True, scope="module")
@@ -284,10 +286,15 @@ def test_the_probe_reports_nothing_without_a_caspar_build(caspar_enabled: bool) 
 def test_refining_extrinsics_falls_back_to_ceres(
     synthetic_rig: SyntheticRig, isaac_config: CusfmConfig, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """`optimize_extrinsics` and CASPAR are exclusive, so the request wins the solver.
+    """A mapper asked to free `sensor_from_rig` and CASPAR are exclusive; the request wins.
 
     CASPAR hard-throws on a free `sensor_from_rig` in a multi-sensor frame. Forcing
     the flag off instead would turn an asked-for refinement into a silent no-op.
+
+    This is `MappingOptions.optimize_extrinsics`, not `--optimize-extrinsics`: a
+    default run refines its extrinsics *and* keeps CASPAR, because the regularised
+    refinement moves them outside the bundle adjuster. What lands here is the
+    `--no-regularised-extrinsics` ablation, and the message says so.
     """
     reconstruction: pycolmap.Reconstruction = build_reconstruction(synthetic_rig.frames_meta).reconstruction
     ba_options: pycolmap.BundleAdjustmentOptions = bundle_adjustment_options(
@@ -297,7 +304,7 @@ def test_refining_extrinsics_falls_back_to_ceres(
     )
     assert backend_name(ba_options) == "ceres"
     assert ba_options.refine_sensor_from_rig is True
-    assert "optimize-extrinsics" in capsys.readouterr().out
+    assert "no-regularised-extrinsics" in capsys.readouterr().out
 
 
 def test_the_mapper_runs_on_caspar_or_reports_the_build_that_cannot(
@@ -327,14 +334,24 @@ def test_the_mapper_runs_on_caspar_or_reports_the_build_that_cannot(
     )
     printed: str = capsys.readouterr().out
 
+    # What a finished run *says* about the backend, which is the only record left
+    # once stdout is gone: `--ba-backend caspar` is the default since 2026-09-06, so
+    # in an environment without the build every summary carries this sentence.
+    stats: MappingStats = MappingStats.of(caspar)
+
     if not caspar_enabled:
         assert caspar.ba_backend == "ceres"
         assert "CASPAR_ENABLED" in printed
         assert caspar.num_points3D == ceres.num_points3D
+        assert stats.ba_backend == "ceres"
+        assert stats.ba_fallback_reason == CASPAR_BUILD_FALLBACK_REASON
+        assert MappingStats.of(ceres).ba_fallback_reason is None
         return
 
     assert caspar.ba_backend == "caspar"
     assert "CASPAR_ENABLED" not in printed
+    assert stats.ba_backend == "caspar"
+    assert stats.ba_fallback_reason is None
     recovered, mixed_tracks, relative_errors = match_tracks_to_truth(caspar.reconstruction, synthetic_rig)
     print(
         f"[colsfm] caspar synthetic: {caspar.num_points3D} points against ceres' {ceres.num_points3D}, "

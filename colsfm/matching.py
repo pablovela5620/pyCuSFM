@@ -111,7 +111,12 @@ MatchingBackend: TypeAlias = Literal["pycolmap", "tensorrt", "raco"]
 RaCo-ALIKED. Both have the per-match score COLMAP's bindings hide and therefore
 run the blob's real SSC spatial NMS rather than
 `subsample_matches_by_coverage`'s score-free stand-in; they differ only in the
-graph and in the normalised frame its keypoints arrive in."""
+graph and in the normalised frame its keypoints arrive in.
+
+`raco` is what `python -m colsfm run` asks for by default since 2026-09-06
+(NOTES.md decision 17), because the default extractor is RaCo-ALIKED and LightGlue+
+is the matcher trained against it. `pycolmap` is the ablation, and the default of
+`MatchingOptions` below, which is the *stage's* API rather than the run's."""
 
 MatchCapMode: TypeAlias = Literal["fixed", "image_area", "off"]
 """`--match-cap-mode`, the command line's spelling; `MatchLimitPolicy.of` resolves it."""
@@ -237,6 +242,11 @@ class MatchingOptions:
 
     backend: MatchingBackend = "pycolmap"
     """Which LightGlue implementation runs; see `MatchingBackend`.
+
+    `pycolmap` here even though a *run* defaults to `raco`, for the reason
+    `colsfm.features.FeatureOptions.backend` gives: this is the stage's API, and it
+    must work where no engine does. `colsfm.run_config` always passes the run's
+    choice explicitly.
 
     On `tensorrt` the `variant`, `model_path`, `min_score`, `max_num_matches`,
     `skip_image_pairs_in_same_frame`, `device` and `gpu_index` fields are not

@@ -13,7 +13,7 @@ results.
 | `__init__.py` | Package docstring and `REPO_ROOT`. Turns on the beartype claw when `PIXI_DEV_MODE=1`. |
 | `__main__.py` | The tyro CLI. Two subcommands: `run` (all eight stages) and `stage` (one metadata-only stage, no images and no GPU). |
 | `pipeline.py` | The one runner, and `PipelineObserver` — the seam a viewer or a notebook watches a run through, instead of sequencing the stages itself. The replacement for `pycusfm.cusfm_runner.CusfmRunner.run_all`, down to the `runtime.csv` layout. |
-| `run_config.py` | `PipelineOptions` as the command line spells it, `SelectionOptions` for the two metadata-only stages, and the `ResolvedRun` every stage actually takes. Resolution happens once, before the workspace exists, and validates as it goes. |
+| `run_config.py` | `PipelineOptions` as the command line spells it — including the defaults of the fast full pipeline — `SelectionOptions` for the two metadata-only stages, and the `ResolvedRun` every stage actually takes. Resolution happens once, before the workspace exists, and validates as it goes: a `--caspar-option` typo and a missing RaCo graph both stop the run here. |
 | `run_lifecycle.py` | The stage vocabulary, the `StageLedger` that `runtime.csv` and `summary.json` both come from, and the staging workspace a run publishes across with `RunWorkspace.publish`, so a failed rerun cannot leave a directory holding two runs. |
 | `run_report.py` | `summary.json` and `loop_edges.json`: what a finished run says about itself, as data a benchmark or a viewer can read. |
 | `stages.py` | One `run_*_stage` function per stage and the typed result each returns. They carry no timing and write no `runtime.csv` row, so a caller stepping through a dataset one stage at a time reuses exactly the code a full run executes. |
@@ -25,6 +25,7 @@ results.
 | `keyframe_selection.py` | cuSFM's keyframe selection, as `feature_extractor_main` performs it. |
 | `database.py` | The COLMAP database that carries cuSFM's cameras, rig, frames and images into pycolmap, keeping cuSFM's own identifiers. |
 | `features.py` | ALIKED feature extraction over `pycolmap.extract_features`, and the backend switch. The replacement for `feature_extractor_main`'s per-image half. |
+| `model_assets.py` | Where the uncommitted RaCo graphs live, which of them a backend choice needs, and the message a checkout without them gets: the export command and the `pycolmap` ablation. Pure pathlib, so `run_config` can pre-flight the default backend without importing TensorRT. |
 | `tensorrt_runtime.py` | The TensorRT plumbing both `_trt` backends share: the blob's engine-name cache, the FP16 builder, and one generic execution session with growing device buffers. |
 | `features_trt.py` | The same stage through the blob's own `aliked.onnx` and its FP16 engine, with the blob's preprocessing and pixel mapping. `--features-backend tensorrt`. |
 | `features_raco.py` | The same stage through fabio-sim's RaCo-ALIKED on a batch-dynamic FP16 engine, 8 images per execution; reuses `features_trt`'s preprocessing and pixel mapping unchanged. `--features-backend raco`. |
@@ -41,7 +42,7 @@ results.
 | `ceres_pose.py` | The pyceres plumbing `pose_graph` and `extrinsic_refinement` share: the linear-solver vocabulary, quaternion priming, the manifold, `SolverOptions` and summary unpacking. |
 | `rig_geometry.py` | The rig the two generalized estimators take as fixed arguments — `RigGeometry`, `RigFrameIndex` and the constructors that build them from `frames_meta.json`. |
 | `reconstruction.py` | A `pycolmap.Reconstruction` built from `frames_meta.json`: the rig, the frames and the images. The rig's reference sensor is the vehicle body by default, or a named camera when `reference_camera_params_id` is given — which is what extrinsic refinement needs, because COLMAP freezes every `sensor_from_rig` of a rig whose reference sensor owns no images. `RigReference` inverts that change of basis. |
-| `mapping.py` | Triangulation and global bundle adjustment. The replacement for `keypoints_mapper_main`. Takes the `PosedModel` `reconstruction` builds, so the reconstruction and its `RigReference` can never be mispaired. With `optimize_extrinsics` it also refines the rig extrinsics through pycolmap's rig BA, holding the gauge camera fixed, and reports them as `MappingResult.refined_extrinsics` — the unregularised path, kept for comparison behind `--no-regularised-extrinsics`. `--ba-backend caspar` swaps Ceres for COLMAP's GPU bundle adjustment, which needs the `colsfm-caspar` environment and falls back to Ceres, loudly, when the build, the camera model or `--optimize-extrinsics` rules it out — which camera models are in is measured from the build at run time, so the OPENCV_FISHEYE adapter of `colsfm-caspar-fisheye` is used where it exists (`docs/caspar-fisheye-adapter.md`); a CASPAR run then ends on one Ceres global bundle adjustment over the final model (`--no-caspar-ceres-polish` to ablate), which is what buys Ceres' accuracy at a third of its mapping time. |
+| `mapping.py` | Triangulation and global bundle adjustment. The replacement for `keypoints_mapper_main`. Takes the `PosedModel` `reconstruction` builds, so the reconstruction and its `RigReference` can never be mispaired. With `optimize_extrinsics` it also refines the rig extrinsics through pycolmap's rig BA, holding the gauge camera fixed, and reports them as `MappingResult.refined_extrinsics` — the unregularised path, kept for comparison behind `--no-regularised-extrinsics`. `--ba-backend caspar` — the default — swaps Ceres for COLMAP's GPU bundle adjustment, which needs a `colsfm-caspar*` environment and falls back to Ceres, loudly, when the build, the camera model or `--no-regularised-extrinsics` rules it out — which camera models are in is measured from the build at run time, so the OPENCV_FISHEYE adapter of `colsfm-caspar-fisheye` is used where it exists (`docs/caspar-fisheye-adapter.md`); a CASPAR run then ends on one Ceres global bundle adjustment over the final model (`--no-caspar-ceres-polish` to ablate), which is what buys Ceres' accuracy at a third of its mapping time. |
 | `ba_backend.py` | Which bundle-adjustment backend a run gets, and what this build's CASPAR can do. `CasparCapability` distinguishes an absent build from a failed probe from a measured one; `BaExecutionPlan` records the effective backend and the reason for any fallback, so `summary.json` can say why a run that asked for the GPU solved on the CPU. |
 | `correspondences.py` | Reading the database's verified two-view geometries into the graph the triangulator walks; the mapper's input. |
 | `point_filters.py` | The guards that run after a solve: a point outside the world, a point inside a camera, a projection that is not finite. |
@@ -50,7 +51,7 @@ results.
 | `extrinsic_observations.py` | The observation graph the refinement solves over: which image saw which point and where, indexed once per stage and folded in per round. |
 | `extrinsic_costs.py` | What Ceres gets from one residual block: the rig reprojection cost with its analytic pose Jacobian, and the repeated-Cauchy loss. |
 | `extrinsic_solve.py` | Problem assembly: `ExtrinsicRefinementOptions`, the three block builders and `solve_extrinsics`. |
-| `extrinsic_refinement.py` | Regularised rig-extrinsic refinement: cuSFM's absolute (Eq. 14) and inter-camera relative (Eq. 6) extrinsic priors in pyceres, alternated with pycolmap's own bundle adjustment. What `--optimize-extrinsics` runs by default, because pycolmap's rig BA carries no prior term. |
+| `extrinsic_refinement.py` | Regularised rig-extrinsic refinement: cuSFM's absolute (Eq. 14) and inter-camera relative (Eq. 6) extrinsic priors in pyceres, alternated with pycolmap's own bundle adjustment. What `--optimize-extrinsics` — on by default — runs, because pycolmap's rig BA carries no prior term. Holding the extrinsics fixed inside those bundle adjustments is also what lets the default keep CASPAR. |
 | `export.py` | Writers for the four artifacts a cuSFM run leaves behind: the `sparse/` model, `kpmap/keyframes/frames_meta.json`, the TUM pose files and `runtime.csv`. The replacement for `kpmap_to_colmap`, `extract_pose_from_map_main` and `update_keyframe_pose_main`. |
 | `benchmark.py` | Metrics that compare two runs in the cuSFM output layout, plus the acceptance bounds. It reads both runs the same way and knows nothing about which producer wrote which. Re-exports the names `alignment` and `runtime` own, so one import still covers a whole comparison. |
 | `alignment.py` | Umeyama alignment (rigid, or scale-estimating), rig trajectories, the ground-truth reader and the timestamp join every trajectory metric is built on. |
@@ -85,19 +86,48 @@ Each stage is a `run_<stage>_stage` function returning a small result dataclass,
 `run_pipeline` only composes them and times each one, so a caller that wants to step through
 a dataset stage by stage runs the same code the full pipeline runs.
 
-## The two ONNX stages have two backends each
+## The default: the fast full pipeline
 
-Stages 2 and 4 both run a neural network, and each can run it two ways. The default,
-`--features-backend pycolmap --matching-backend pycolmap`, hands the work to COLMAP 4.2's
-own ALIKED and LightGlue, which COLMAP downloads into `~/.cache/colmap/` and runs through
-ONNX Runtime. The alternative, `tensorrt`, runs **the blob's graphs through the blob's
-engines** (`pycusfm/models/aliked_lightglue/`), reusing the `.engine` files already in the
-repo when the TensorRT version and the GPU architecture match.
+`python -m colsfm run --input-dir X --output-dir Y`, with no other flag, runs the
+configuration of record (NOTES.md decision 17, 2026-09-06):
 
-They are chosen independently, and all four combinations work: both write float32 xy
-keypoints and 128-column float descriptors into the same database rows, and both leave the
+| Knob | Default | The ablation, and what it costs |
+|---|---|---|
+| `--features-backend` | `raco` | `pycolmap` (COLMAP's own ALIKED, no engine needed) or `tensorrt` (the blob's) — 8.3 s or 6.0 s of Galileo against RaCo's 2.6 s |
+| `--matching-backend` | `raco` | `pycolmap` or `tensorrt`; `pycolmap` is the only one without the per-match score, so it runs the grid stand-in for SSC |
+| `--ba-backend` | `caspar` | `ceres`; CASPAR is a third of the Ceres mapping time on KITTI and RoboCap, and falls back to Ceres by itself where the build cannot |
+| `--caspar-ceres-polish` | on | `--no-caspar-ceres-polish`; the polish is what buys Ceres' accuracy back |
+| `--optimize-extrinsics` | on | `--no-optimize-extrinsics` drops stage 7b; `--no-regularised-extrinsics` keeps it without the blob's priors |
+| `--loop-closure` | on | `--no-loop-closure` |
+
+Two of those need something the repository does not ship, and they behave differently
+about it on purpose:
+
+* **The RaCo graphs** live under `data/cusfm_models/`, which is gitignored. A run that
+  cannot find them **stops**, naming `pixi run -e raco raco-export` and the
+  `--features-backend pycolmap --matching-backend pycolmap` ablation
+  (`colsfm.model_assets`). It does not fall back: every number a run reports moves with
+  the extractor, so a silent fallback would be a different experiment under the same name.
+* **CASPAR** needs a `CASPAR_ENABLED` pycolmap, i.e. one of the `colsfm-caspar*`
+  environments. A run without one **falls back to Ceres**, says so on stdout, and records
+  the sentence in `summary.json` as `mapping.ba_fallback_reason`. That fallback is safe
+  in a way the other is not: both solvers minimise the same objective, and the run's own
+  summary says which one did.
+
+## The two ONNX stages have three backends each
+
+Stages 2 and 4 both run a neural network, and each can run it three ways: `raco` (the
+default), `pycolmap` — COLMAP 4.2's own ALIKED and LightGlue, which COLMAP downloads into
+`~/.cache/colmap/` and runs through ONNX Runtime — and `tensorrt`, which runs **the blob's
+graphs through the blob's engines** (`pycusfm/models/aliked_lightglue/`), reusing the
+`.engine` files already in the repo when the TensorRT version and the GPU architecture
+match.
+
+They are chosen independently, and every combination works: all three write float32 xy
+keypoints and 128-column float descriptors into the same database rows, and all leave the
 matches and two-view geometries COLMAP's verifier produced. Measured on Galileo's 226
-frames (RTX 5090); the blob column is the binary this replaces:
+frames (RTX 5090); the blob column is the binary this replaces, and the `raco` column is
+NOTES.md "RaCo backend":
 
 | | blob | `pycolmap` | `tensorrt` |
 |---|---:|---:|---:|
@@ -109,9 +139,11 @@ frames (RTX 5090); the blob column is the binary this replaces:
 | rig poses vs the blob (mm RMSE / deg RMSE) | — | 0.99 / 1.669 | **0.38 / 0.040** |
 
 So `tensorrt` is the faster matcher by 2.8x and the closer reproduction of the blob, and
-`pycolmap` is the more accurate one on this dataset and the one that needs no TensorRT.
-The default stays `pycolmap` because it needs neither the `tensorrt` and `cuda-python`
-packages nor an engine built for the local GPU.
+`pycolmap` is the more accurate one on this dataset and the one that needs no TensorRT at
+all. `raco` is faster than both at the extractor — 2.6 s of stage 2 against 6.0 and 8.3 —
+and lands within 0.1 mm of `tensorrt`'s ATE on the full pipeline
+(`docs/full-pipeline-results.md`), which is why it is the default and `pycolmap` is the
+documented no-engine ablation.
 
 Three ordering notes matter when reading the code. Pair selection cannot see loop pairs:
 stage 3 emits only the consecutive and stereo pairs it can derive from the metadata, and loop
@@ -119,9 +151,17 @@ pairs first exist after stage 5, which matches them into the same database. Stag
 runs the search twice, once with a recording `match_fn` that collects the candidate pairs and
 returns no matches, then one batch match over those pairs, then the real search reading the
 matches back. Loop closure is on by default, as in the blob (`--no-loop-closure` is the
-ablation). And `--optimize-extrinsics` maps **once**:
+ablation). And `--optimize-extrinsics`, also on by default, maps **once**:
 stage 7 builds the camera-referenced reconstruction the refinement needs, and stage 7b
 refines the extrinsics of the model stage 7 left behind rather than mapping the scene again.
+
+That is also why the two defaults `--ba-backend caspar` and `--optimize-extrinsics` are not
+in conflict. CASPAR throws when a bundle adjustment frees `sensor_from_rig`, and the
+regularised refinement never asks one to: it moves the extrinsics in pyceres with the
+priors and holds them fixed inside every pycolmap solve. So stage 7 maps on the GPU and
+stage 7b alternates on the CPU. `--no-regularised-extrinsics` *is*
+`run_mapping(..., optimize_extrinsics=True)`, and that ablation is the one that takes the
+mapper off CASPAR — loudly, with the reason in `summary.json`.
 
 ## Tests
 

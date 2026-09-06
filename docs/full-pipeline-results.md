@@ -19,6 +19,12 @@ Both with `--loop-closure --optimize-extrinsics --ba-backend caspar` in `colsfm-
 2. **RaCo + CASPAR** — `--features-backend raco --matching-backend raco`: RaCo-ALIKED at native
    resolution and LightGlue+, same mapper and refinement. The speed pick.
 
+**Since 2026-09-06, configuration 2 is what `python -m colsfm run` does with no flags at
+all** (NOTES.md decision 17). The flags above are how it had to be spelled when these runs
+were made; they are now the defaults, and `--features-backend pycolmap --matching-backend
+pycolmap --ba-backend ceres --no-optimize-extrinsics` is the ablation that reproduces the
+older "default" every earlier table in this repository means.
+
 The blob was rerun with `--optimize_extrinsics --ba_frame_type vehicle_rig` on Galileo only
 (36 s). KITTI and RoboCap keep the existing blob references, which ran loop closure but **not**
 extrinsic refinement; those two blob rows are therefore one stage short, and the caption says so.

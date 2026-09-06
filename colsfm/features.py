@@ -63,8 +63,14 @@ engine the blob itself built, at the static batch of 1 its graph declares.
 batch-dynamic engine that runs 8 images at once. Both need `tensorrt` and
 `cuda-python`, which the `colsfm` pixi environment carries, and a GPU whose
 architecture the cached engine was built for; `raco` additionally needs the
-graph under `data/cusfm_models/`, which is not committed. `pycolmap` is the
-default because it needs none of that."""
+graph under `data/cusfm_models/`, which is not committed.
+
+`raco` is what `python -m colsfm run` asks for by default since 2026-09-06
+(NOTES.md decision 17): it is the fastest of the three at the same accuracy, and a
+checkout without its graph is told to export one or to pass
+`--features-backend pycolmap` (`colsfm.model_assets`). `pycolmap` is the ablation
+that needs no graph of ours, and the default of `FeatureOptions` below, which is
+the *stage's* API rather than the run's."""
 
 RacoEngineChoice: TypeAlias = Literal["auto", "fixed", "dynamic"]
 """Which RaCo engine runs an image once `native_resolution` is on.
@@ -113,6 +119,11 @@ class FeatureOptions:
 
     backend: FeatureBackend = "pycolmap"
     """Which ALIKED implementation runs; see `FeatureBackend`.
+
+    `pycolmap` here even though a *run* defaults to `raco`: this is the stage's own
+    API, taken by tests and tools that want features and no TensorRT engine, and it
+    should not stop working on a machine that has no graph. `colsfm.run_config`
+    always passes the run's choice explicitly, so the two never disagree in a run.
 
     On `tensorrt` the `variant`, `max_image_size`, `num_threads`, `device` and
     `gpu_index` fields are not read: the engine is the blob's own graph at its
