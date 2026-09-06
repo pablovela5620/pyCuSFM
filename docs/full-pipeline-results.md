@@ -88,3 +88,20 @@ ATE bound against the *refined* blob (2.95 mm) while passing it against the unre
 KITTI: registered and ATE pass, reprojection fails (0.534 / 0.572 px against a 0.500 ceiling)
 as in every KITTI run. RoboCap: `data/bench/full/robocap_*.md`. Galileo: registered and
 reprojection pass, ATE fails as above.
+
+## Parity after the refactor and simplify pass (2026-09-06)
+
+The same KITTI 06 run with NO backend flags, which is now the default (loop closure, RaCo +
+LightGlue+, CASPAR with the Ceres polish, regularised extrinsic refinement), on the refactored
+and simplified tree (`git log 2bc661d..`), against the row above:
+
+| | reference (RaCo + CASPAR, loops + extrinsics) | default, post-refactor |
+|---|---:|---:|
+| total (s) | 153.2 | 155.7 |
+| registered / points | 2156 / 134 869 | 2156 / 134 884 |
+| mean reprojection (px) | 0.572 | 0.572 |
+| Sim(3) ATE (m) | 0.933 | 0.928 |
+| SE(3) ATE (m) | 1.455 | 1.451 |
+
+Within run-to-run noise on every figure; `/tmp/colsfm_runs/parity_kitti_ate.json`. Galileo parity
+was checked twice on the way (after the refactor and after the simplify pass), see NOTES.md.
