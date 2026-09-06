@@ -13,13 +13,17 @@ Goal: `pixi run demo` runs cuSFM on a real sample and shows it in Rerun, with **
 |---|---|---|
 | 1 | **CUDA 13 binaries** (`pycusfm/x86_cuda13`) | Host is an RTX 5090 (Blackwell, sm_120), driver 580.173. TensorRT builds a native `sm_120` engine. No CUDA-12 fallback was needed. |
 | 2 | **No `setup.bash`** | It only creates two symlinks. `command_runner.py:26` derives `lib_dir = dirname(binary_dir)/lib`, so passing `--binary_dir .../x86_cuda13/bin` finds `x86_cuda13/lib` for free. Two `ln -sfn` pixi tasks cover upstream's own CLI, which still defaults to `<package>/bin`. |
-| 3 | **cuVSLAM skipped** (`skip_cuvslam=True`) | Both datasets already carry a trajectory. cuSFM's global BA *refines* it — that is the interesting operation, not re-deriving what we already have. |
+| 3 | **cuVSLAM skipped** (`skip_cuvslam=True`) — except on KITTI | galileo and robocap already carry a trajectory. cuSFM's global BA *refines* it — that is the interesting operation, not re-deriving what we already have. KITTI ships no poses at all, so there cuVSLAM has to run first. |
 | 4 | **Two rigs in one recording** | `rig_00` = input trajectory, `rig_01` = cuSFM-refined, rigidly aligned. Makes the BA correction visible instead of asserted. |
 | 5 | **`ba_frame_type=vehicle_rig`, `optimize_extrinsics=False`** | exoego:v2 has a single `world_T_rig(t)` per rig, which is only meaningful if `rig_T_cam` stays fixed. Optimising extrinsics would silently invalidate the schema. |
 | 6 | **`min_inter_frame_distance=0.0`** | The `isaac` default is 0.5 m. Galileo's whole trajectory is 0.66 m, so the default kept only 32 of 226 keyframes and produced 1275 points. At 0.0 we keep all 226 and get 4938 points. |
 | 7 | **COLMAP model parsed by hand** | This env is a delicately balanced CUDA-13 solve with a TensorRT dependency override; pulling pycolmap's ceres/CUDA stack risks perturbing it for two file formats worth ~40 lines. cuSFM writes text by default. A deliberate exception to "do not hand-roll what exists" — revisit if binary models are ever needed. |
 | 8 | **simplecv from the monorepo, not the standalone repo** | See gotcha 4. |
 | 9 | **CPU video decode, not nvdec** | Measured; see gotcha 6. |
+| 10 | **KITTI 06 imagery from a pinned HF mirror, ground truth from the official archive** | The benchmark's images need a registration form; the third-party mirror `yujie2696/kitti_odometry_06` does not, and is pinned to revision `9ce62e0` so a re-upload cannot move the numbers. That mirror has no poses, so ground truth comes from `data_odometry_poses.zip` (public, no login) with its md5 checked in the task. Neither is committed. |
+| 11 | **KITTI runs with `--use_cuvslam_slam_pose`** | cuVSLAM's raw odometry scores **2.375 m** Sim(3) ATE on this sequence; its loop-closed SLAM trajectory **1.336 m**. The paper's baseline row is the SLAM one, and cuSFM refines whatever it is handed rather than recovering from a bad start. |
+| 12 | **KITTI runs with `--skip_data_association`** | `docs/tutorial.md` states the paper's experiments used pose-graph optimisation *without* the separate association stage. Opposite of the RoboCap default here, and deliberately so. |
+| 13 | **`data/kitti/config`, unmodified** | Upstream ships a KITTI profile tuned for a forward-driving stereo car; it is not `pycusfm/configs/isaac`, and it is not the loop-closure-repaired copy the other two demos default to. Running sequence 06 through either of those is a different experiment. |
 
 ## Datasets
 
@@ -55,6 +59,56 @@ plausible-looking baselines for non-rectifiable geometry.
 `left_eye`/`right_eye` (`cam_02`/`cam_03`) point at the wearer's eyes. They are excluded from
 the reconstruction and drawn as grey frusta, so the recording shows the real hardware without
 implying those cameras contributed.
+
+### `pixi run kitti06` — KITTI odometry sequence 06
+
+The paper's Table 4 experiment. A stereo pair on a car: 1101 frames at 10 Hz, 1226x370
+grayscale, over a **1232.9 m** loop. Downloaded, not committed — imagery from the pinned
+Hugging Face mirror `yujie2696/kitti_odometry_06` (revision `9ce62e0`), poses from the official
+`data_odometry_poses.zip` with md5 `7247b3fe2ef8ccbfa6ddb7801132c2b4` verified in the task.
+
+Unlike the other two datasets, KITTI carries **no trajectory**. `data/kitti/06/frames_meta.json`
+has camera parameters, timestamps and image names but no `camera_to_world`, so cuVSLAM runs
+inside the pipeline and rewrites the metadata with its own poses before feature extraction. The
+demo reads `cuvslam_output/slam_poses.tum` back afterwards and shows it as `rig_00`; there is
+nothing to log until cuSFM has run.
+
+The converter puts the vehicle frame on camera 0 (`sensor_to_vehicle_transform` is a pure
+baseline offset along X, zero for camera 0), which is also the frame KITTI's ground truth is
+written in. So the ground truth, cuVSLAM's TUM output and cuSFM's vehicle-frame poses are all
+directly comparable with no frame change anywhere — worth stating because a silent frame error
+here would look like a plausible ~1 m ATE rather than an obvious failure.
+
+**Commands.** The task is the reference; these are what it runs.
+
+```bash
+pixi run kitti06        # download (guarded) -> convert -> reconstruct -> log -> evo_ape
+pixi run kitti06-eval   # re-score and re-log an existing run, no cuSFM
+```
+
+```bash
+# what `kitti06` expands to, after `_download-kitti06`
+mkdir -p data/kitti/06_result_slam
+python data/kitti/get_framemeta_file_for_KITTI.py data/kitti/06
+cp data/kitti/06/keyframe_meta.json data/kitti/06/frames_meta.json
+python demo_rerun.py --rr-config.headless \
+    --rr-config.save data/kitti/06_result_slam/kitti06.rrd dataset:kitti06
+evo_ape tum data/kitti/06/poses_gt_06.tum \
+    data/kitti/06_result_slam/output_poses/merged_pose_file.tum -as
+```
+
+The equivalent through upstream's own CLI, which produced the same numbers:
+
+```bash
+python -m pycusfm.cusfm_cli --input_dir data/kitti/06 \
+    --cusfm_base_dir data/kitti/06_result_slam --config_dir data/kitti/config \
+    --skip_data_association --use_cuvslam_slam_pose
+```
+
+`demo_rerun.py` drives `create_cusfm_runner` directly rather than shelling out to `cusfm_cli`,
+exactly as the galileo and robocap paths do. `kitti_run_config` applies the settings above to
+any knob still at its `RunConfig` default, so `pixi run kitti06` gets the published
+configuration while an explicit `--run.no-use-cuvslam-slam-pose` still means what it says.
 
 ## Reproduction
 
@@ -386,6 +440,23 @@ where the video has no data, so validation screenshots need the cursor moved ont
     mismatched image/pose pairs. Both now derive from one trimmed index list.
 15. **tyro argument order**: top-level options must precede the subcommand
     (`demo_rerun.py --rr-config.headless dataset:robocap`, not the reverse).
+16. **`get_framemeta_file_for_KITTI.py` ignores its own `--output-name`.** The flag is parsed,
+    documented in the script's usage text, and then never read: `kitti_to_keyframe_metadata`
+    hardcodes `keyframe_meta.json`. The pipeline reads `frames_meta.json`
+    (`constants.kFRAME_META_FILE`), so the two names never meet and the run dies with a missing
+    file. The task copies rather than renaming, and the script stays unedited.
+17. **KITTI needs `--use_cuvslam_slam_pose` explicitly.** Both `cusfm_cli` and
+    `create_cusfm_runner` default it to `False`, i.e. *odometry*. Nothing warns; the run
+    succeeds and simply scores 2.375 m instead of 1.336 m. The flag only takes effect when
+    cuVSLAM actually runs, which on KITTI it must.
+18. **`min_inter_frame_distance` defaults differ between the demo and cuSFM.** cuSFM's own
+    default is 0.5 m; `RunConfig` uses 0.0, because galileo's entire trajectory is 0.66 m long
+    (decision 6). On KITTI 0.0 would hand the solver a different frame set than the published
+    run, so `kitti_run_config` puts it back to 0.5.
+19. **`rr.save()` opens the file in `RerunTyroConfig.__post_init__`**, before any dataset code
+    runs. Saving into a directory that cuSFM has not created yet fails immediately with
+    `Failed to create file: No such file or directory`. Hence the `mkdir -p` at the head of the
+    `kitti06` task — the same reason `prepare-galileo-output` exists.
 
 ## Fisheye frusta — a known visual limitation
 
@@ -514,3 +585,4 @@ identical (SHA-256 over all 27 906 samples matches) and:
 | RoboCap prepare (4 cams: read rrd, remux, extract 932 JPEGs) | 76 s |
 | First TensorRT engine build (`sm_120`, fp16) | ~4 min (cached afterwards) |
 | galileo `demo-upstream` (upstream defaults, incl. engine build) | 267 s |
+| KITTI 06 download (imagery 569 MB + ground truth 1.3 MB) | 254 s |

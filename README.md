@@ -86,9 +86,33 @@ trajectory and the cuSFM-refined one — so the bundle-adjustment correction is 
 ```bash
 pixi run demo                      # bundled r2b_galileo sample (needs no network)
 pixi run demo-robocap              # RoboCap fisheye segment (needs a Rerun catalog once)
+pixi run kitti06                   # the paper's KITTI odometry 06 experiment (~30 min)
 pixi run demo-upstream             # upstream's own cusfm_cli, unmodified
 pixi run check-libs                # ldd gate over the CUDA 13 binaries
 ```
+
+### Reproduce KITTI 06
+
+```bash
+pixi run kitti06
+```
+
+One command downloads KITTI odometry sequence 06 (1101 stereo frames, ~570 MB, from a pinned
+third-party Hugging Face mirror), fetches the benchmark's ground-truth poses from the official
+KITTI archive and checks their md5, converts the sequence with upstream's own
+`data/kitti/get_framemeta_file_for_KITTI.py`, runs cuVSLAM and then cuSFM with upstream's KITTI
+configs, writes `data/kitti/06_result_slam/kitti06.rrd`, and scores the result with
+`evo_ape ... -as` (Sim(3)). The recording shows three trajectories — cuVSLAM's SLAM output that
+cuSFM was initialised from, cuSFM's refinement, and the ground truth — plus the sparse cloud and
+both camera streams. `pixi run kitti06-eval` re-scores an existing run without re-running cuSFM.
+
+The run reproduces the paper's cuVSLAM baseline but **not** its refinement gain; the numbers and
+the reason are in [NOTES.md](NOTES.md#kitti-06--the-papers-table-4-experiment).
+
+The imagery mirror is third-party and unaffiliated with KITTI. The poses are the KITTI odometry
+benchmark's own ground truth (Geiger, Lenz and Urtasun, CVPR 2012), licensed **CC BY-NC-SA 3.0**
+— non-commercial use, attribution required. Neither is redistributed here: both are downloaded
+at run time and are `.gitignore`d.
 
 Headless, writing an `.rrd` instead of opening a viewer:
 

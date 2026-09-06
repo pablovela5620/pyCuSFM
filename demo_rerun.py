@@ -29,14 +29,18 @@ Output follows the ``exoego:v2`` rig schema (see simplecv's
         /cam_NN/pinhole               same calibration, refined motion
           /video                      VideoFrameReference -> rig_00's VideoStream (no copy)
       /world/points                   Points3D (cuSFM sparse cloud)
+      /world/runs/<name>/trajectory   LineStrips3D (input, cusfm, ground_truth)
 
 ``rig_01`` is rigidly aligned to ``rig_00`` with a scale-free Umeyama fit, and the
 residual RMSE is printed. Read that number as a **disagreement between two
 estimates**, not as cuSFM's error: RoboCap's supplied trajectory is pure
 multi-camera VIO (basalt) with no loop closure and no mapping, so it drifts too.
-Only galileo ships an actual ground-truth trajectory, and only there is the word
-"ATE" used. Run with ``--run.no-skip-cuvslam`` to get an independent third
-trajectory from cuSFM's bundled cuVSLAM.
+Only galileo and KITTI 06 ship an actual ground-truth trajectory, and only there is
+the word "ATE" used — on KITTI it is Sim(3)-aligned, matching the benchmark and the
+paper, and it is reported for cuSFM's output *and* for the trajectory cuSFM started
+from, so the refinement can be judged rather than assumed. Run with
+``--run.no-skip-cuvslam`` to get an independent third trajectory from cuSFM's
+bundled cuVSLAM.
 
 Note on fisheye frusta: Rerun draws a frustum from ``K`` alone, so a 150-degree+
 fisheye renders as a much narrower cone than its true field of view. The
