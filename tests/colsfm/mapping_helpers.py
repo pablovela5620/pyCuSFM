@@ -59,6 +59,7 @@ MULTIVIEW_OVERSAMPLING: int = 8
 VEHICLE_R_CAM: Float64[ndarray, "3 3"] = np.array([[0.0, 0.0, 1.0], [-1.0, 0.0, 0.0], [0.0, -1.0, 0.0]])
 """Rotation from the camera's RDF axes to the vehicle's FLU axes (docs/camera.md)."""
 
+
 @dataclass(slots=True)
 class SyntheticRig:
     """A rig sequence with known poses, known points and noisy observations."""
@@ -349,6 +350,7 @@ def synthetic_matches(rig: SyntheticRig, min_matches: int = 20) -> dict[tuple[in
         ).astype(np.uint32)
     return matches
 
+
 def quiet_options(**overrides: object) -> MappingOptions:
     """Mapping options with the per-round printing turned off.
 
@@ -414,6 +416,7 @@ def match_tracks_to_truth(
         range_m: float = float(np.linalg.norm(truth_xyz - first_image.projection_center()))
         relative_errors.append(float(np.linalg.norm(point.xyz - truth_xyz)) / range_m)
     return recovered, mixed_tracks, relative_errors
+
 
 def random_offset(
     rng: np.random.Generator, translation_m: float, rotation_deg: float

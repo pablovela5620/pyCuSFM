@@ -47,6 +47,7 @@ def _quiet_glog() -> None:
     """Silence COLMAP's own logging so the tests' own numbers stay readable."""
     pycolmap.logging.minloglevel = 2
 
+
 @pytest.fixture(scope="module")
 def synthetic_rig() -> SyntheticRig:
     """A 20-frame, two-camera rig with 500 points and 0.3 px observation noise."""
@@ -62,6 +63,7 @@ def synthetic_database(synthetic_rig: SyntheticRig, tmp_path_factory: pytest.Tem
     )
     return database_path
 
+
 @pytest.fixture(scope="module")
 def fisheye_rig() -> SyntheticRig:
     """A 6-frame, two-camera OPENCV_FISHEYE rig: the model stock CASPAR cannot project."""
@@ -74,6 +76,7 @@ def fisheye_database(fisheye_rig: SyntheticRig, tmp_path_factory: pytest.TempPat
     database_path: Path = tmp_path_factory.mktemp("fisheye") / "database.db"
     write_database(database_path, fisheye_rig.frames_meta, fisheye_rig.keypoints_px, synthetic_matches(fisheye_rig))
     return database_path
+
 
 def test_the_caspar_backend_reaches_the_options_the_solver_reads(
     synthetic_rig: SyntheticRig, isaac_config: CusfmConfig
@@ -389,6 +392,7 @@ def test_a_fisheye_rig_maps_on_caspar_only_where_the_adapter_exists(
         assert result.ba_backend == "ceres"
         assert "OPENCV_FISHEYE" in printed
         assert result.polish is None
+
 
 def test_the_polish_option_set_is_the_ceres_one_built_from_the_same_config(
     synthetic_rig: SyntheticRig, isaac_config: CusfmConfig

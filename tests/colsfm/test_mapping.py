@@ -51,6 +51,7 @@ def _quiet_glog() -> None:
     """Silence COLMAP's own logging so the tests' own numbers stay readable."""
     pycolmap.logging.minloglevel = 2
 
+
 @pytest.fixture(scope="module")
 def synthetic_rig() -> SyntheticRig:
     """A 20-frame, two-camera rig with 500 points and 0.3 px observation noise."""
@@ -65,6 +66,7 @@ def synthetic_database(synthetic_rig: SyntheticRig, tmp_path_factory: pytest.Tem
         database_path, synthetic_rig.frames_meta, synthetic_rig.keypoints_px, synthetic_matches(synthetic_rig)
     )
     return database_path
+
 
 def test_pixel_error_schedule_is_the_isaac_ramp(isaac_config: CusfmConfig) -> None:
     """The gate decays linearly across the outer loop: 25, 20, 15, 10, 5 (§5.6).
@@ -190,6 +192,7 @@ def test_the_outer_loop_can_run_to_the_end_or_exit_early(
     assert len(full.rounds) == mapping_config.num_ba_iterations == 5
     assert [round_stats.max_pixel_error for round_stats in full.rounds] == [25.0, 20.0, 15.0, 10.0, 5.0]
 
+
 def _perturbed_metadata(rig: SyntheticRig, seed: int = 11) -> FramesMeta:
     """Knock every rig frame but the gauge one 1 cm and 0.5 deg off its true pose.
 
@@ -304,6 +307,7 @@ def test_run_mapping_is_deterministic_on_one_thread(
     assert [stats.num_points3D for stats in results[0].rounds] == [stats.num_points3D for stats in results[1].rounds]
     assert results[0].mean_reprojection_error_px == pytest.approx(results[1].mean_reprojection_error_px, abs=1e-9)
 
+
 def test_fisheye_rig_triangulates(tmp_path: Path, isaac_config: CusfmConfig) -> None:
     """An OPENCV_FISHEYE rig produces points, with the prior focal length declared.
 
@@ -325,6 +329,7 @@ def test_fisheye_rig_triangulates(tmp_path: Path, isaac_config: CusfmConfig) -> 
     print(f"[colsfm] fisheye: {result.num_points3D} points, reprojection {result.mean_reprojection_error_px:.4f} px")
     assert result.num_points3D > 100
     assert result.mean_reprojection_error_px < 1.0
+
 
 def test_the_round_callback_sees_every_round_as_it_finishes(
     synthetic_rig: SyntheticRig, synthetic_database: Path, isaac_config: CusfmConfig

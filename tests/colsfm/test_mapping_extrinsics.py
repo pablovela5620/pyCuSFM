@@ -42,6 +42,7 @@ def _quiet_glog() -> None:
     """Silence COLMAP's own logging so the tests' own numbers stay readable."""
     pycolmap.logging.minloglevel = 2
 
+
 @pytest.fixture(scope="module")
 def synthetic_rig() -> SyntheticRig:
     """A 20-frame, two-camera rig with 500 points and 0.3 px observation noise."""
@@ -318,6 +319,7 @@ def test_the_unregularised_refinement_drifts_on_weakly_covisible_cameras(
         value for key, value in moved_m.items() if key not in {reference_camera_params_id, partner}
     ]
     assert max(elsewhere) > WEAKLY_CONSTRAINED_MOVE_M, "the other cameras drift; there is no prior holding them"
+
 
 def test_refining_extrinsics_on_a_vehicle_referenced_rig_is_refused(
     synthetic_rig: SyntheticRig, synthetic_database: Path, isaac_config: CusfmConfig

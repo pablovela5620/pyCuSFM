@@ -38,6 +38,7 @@ def _quiet_glog() -> None:
     """Silence COLMAP's own logging so the tests' own numbers stay readable."""
     pycolmap.logging.minloglevel = 2
 
+
 @pytest.fixture(scope="module")
 def synthetic_rig() -> SyntheticRig:
     """A 20-frame, two-camera rig with 500 points and 0.3 px observation noise."""
