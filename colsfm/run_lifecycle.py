@@ -281,8 +281,23 @@ class RunWorkspace:
     """The destination the caller asked for; untouched until `publish`."""
     staging_dir: Path
     """`<output_dir>.colsfm-staging-<pid>`, a sibling so the closing rename is atomic."""
-    stages_planned: tuple[StageName, ...]
-    """The stages the run set out to record, recorded in every state it writes."""
+    ledger: StageLedger
+    """The run's ledger, writing `runtime.csv` into the staging directory.
+
+    Owned here rather than built beside the workspace, because the two used to be
+    given the same stage tuple separately -- `stages_planned` and `StageLedger.stages`
+    -- and `publish` and `fail` then had to be *handed* the ledger whose completed
+    stages they were about to record. The workspace is what a run has; the ledger is
+    part of it."""
+
+    @property
+    def stages_planned(self) -> tuple[StageName, ...]:
+        """The stages the run set out to record, written into every state.
+
+        Returns:
+            `ledger.stages`, which is the same tuple the progress lines count against.
+        """
+        return self.ledger.stages
 
     def record_state(self, status: RunStatus, completed: tuple[str, ...], failure: str | None = None) -> None:
         """Overwrite the staging directory's `run_state.json`.
@@ -304,56 +319,119 @@ class RunWorkspace:
         )
         (self.staging_dir / RUN_STATE_NAME).write_text(to_json(state) + "\n")
 
-    def publish(self, ledger: StageLedger) -> None:
+    def publish(self) -> None:
         """Mark the run succeeded and swap its directory into the destination.
 
         Two renames with the previous run parked in between, so the destination is
         never a directory being filled in: it holds the previous run, then this one.
-
-        Args:
-            ledger: The run's ledger, for the stages it completed.
         """
-        self.record_state("succeeded", tuple(record.stage for record in ledger.records))
+        self.record_state("succeeded", tuple(record.stage for record in self.ledger.records))
         replaced: Path = self.output_dir.with_name(f"{self.output_dir.name}{REPLACED_SUFFIX}-{os.getpid()}")
         if self.output_dir.exists():
             os.replace(self.output_dir, replaced)
         os.replace(self.staging_dir, self.output_dir)
         shutil.rmtree(replaced, ignore_errors=True)
 
-    def fail(self, ledger: StageLedger, reason: str) -> None:
+    def fail(self, reason: str) -> None:
         """Mark the run failed and leave its staging directory for inspection.
 
         Nothing is published, so the destination still holds the last run that
         worked, whole. The next run over the same destination clears this away.
 
         Args:
-            ledger: The run's ledger, for the stages it completed before it stopped.
             reason: What stopped it.
         """
-        self.record_state("failed", tuple(record.stage for record in ledger.records), failure=reason)
+        self.record_state("failed", tuple(record.stage for record in self.ledger.records), failure=reason)
         print(f"[colsfm] run failed; its partial artifacts are in {self.staging_dir}, {self.output_dir} is unchanged")
+
+
+def _owning_pid(directory: Path) -> int | None:
+    """The process id a staging or parked directory names itself after.
+
+    Args:
+        directory: A `<name>.colsfm-staging-<pid>` or `<name>.colsfm-replaced-<pid>` path.
+
+    Returns:
+        The pid, or None when the trailing field is not a number — a directory
+        somebody made by hand, which is not this function's to interpret.
+    """
+    tail: str = directory.name.rpartition("-")[2]
+    return int(tail) if tail.isdigit() else None
+
+
+def _is_running(pid: int) -> bool:
+    """Whether a process with this id exists.
+
+    `os.kill(pid, 0)` delivers no signal and only asks the kernel the question.
+
+    Args:
+        pid: The process id to ask about.
+
+    Returns:
+        True when the process exists, including when it belongs to another user —
+        `PermissionError` is proof that it is there.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _reap_abandoned_directories(output_dir: Path) -> None:
+    """Remove the staging and parked directories of runs that are no longer running.
+
+    A directory names the pid that made it, and this reaps only the ones whose pid
+    is gone. It used to `rmtree` every match, which meant two runs writing the same
+    output directory at once — a sweep, a retry started before the first finished —
+    deleted each other's live staging directory, silently, because the removal ran
+    under `ignore_errors`.
+
+    This process's own leftovers are always reaped: `publish` and `fail` are the only
+    ways a run ends, both leave at most one directory, and the next run in this
+    process takes the same name.
+
+    Args:
+        output_dir: The destination whose siblings to sweep.
+    """
+    patterns: tuple[str, ...] = (
+        f"{output_dir.name}{STAGING_SUFFIX}-*",
+        f"{output_dir.name}{REPLACED_SUFFIX}-*",
+    )
+    for pattern in patterns:
+        for stale in sorted(output_dir.parent.glob(pattern)):
+            pid: int | None = _owning_pid(stale)
+            if pid is not None and pid != os.getpid() and _is_running(pid):
+                print(f"[colsfm] leaving {stale.name} alone; process {pid} is still writing it")
+                continue
+            shutil.rmtree(stale, ignore_errors=True)
 
 
 def open_workspace(output_dir: Path, stages: tuple[StageName, ...]) -> RunWorkspace:
     """Start a run: give it a private directory beside its destination.
 
-    Any staging or parked directory an earlier run of this destination left behind
-    is removed first, so one failure leaves one directory rather than a pile.
+    Any staging or parked directory an *abandoned* run of this destination left
+    behind is removed first, so one failure leaves one directory rather than a pile;
+    a directory another live process is writing is left alone.
 
     Args:
         output_dir: The destination the caller asked for. Not created, not touched.
         stages: The stages the run will record.
 
     Returns:
-        The workspace. Everything the run writes goes into `staging_dir`.
+        The workspace, with its ledger already pointed at the staging directory.
+        Everything the run writes goes into `staging_dir`.
     """
     output_dir.parent.mkdir(parents=True, exist_ok=True)
-    for stale in sorted(output_dir.parent.glob(f"{output_dir.name}{STAGING_SUFFIX}-*")):
-        shutil.rmtree(stale, ignore_errors=True)
-    for stale in sorted(output_dir.parent.glob(f"{output_dir.name}{REPLACED_SUFFIX}-*")):
-        shutil.rmtree(stale, ignore_errors=True)
+    _reap_abandoned_directories(output_dir)
     staging_dir: Path = output_dir.with_name(f"{output_dir.name}{STAGING_SUFFIX}-{os.getpid()}")
     staging_dir.mkdir(parents=True)
-    workspace: RunWorkspace = RunWorkspace(output_dir=output_dir, staging_dir=staging_dir, stages_planned=stages)
+    workspace: RunWorkspace = RunWorkspace(
+        output_dir=output_dir,
+        staging_dir=staging_dir,
+        ledger=StageLedger(output_dir=staging_dir, stages=stages),
+    )
     workspace.record_state("running", ())
     return workspace

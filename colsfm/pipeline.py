@@ -300,15 +300,14 @@ def run_pipeline(options: PipelineOptions, observer: PipelineObserver | None = N
     # the stages take an options object whose `output_dir` is that directory. The
     # summary below reports `options`, i.e. the paths the caller asked for.
     staged: PipelineOptions = replace(options, output_dir=workspace.staging_dir)
-    ledger: StageLedger = StageLedger(output_dir=workspace.staging_dir, stages=stages)
     print(f"[colsfm] config {options.config_dir} | input {options.input_dir} | output {options.output_dir}")
     watcher.run_started(staged, stages)
     try:
-        summary: PipelineSummary = _run_stages(options, staged, resolved, ledger, watcher, started)
+        summary: PipelineSummary = _run_stages(options, staged, resolved, workspace.ledger, watcher, started)
     except BaseException as error:
-        workspace.fail(ledger, f"{type(error).__name__}: {error}")
+        workspace.fail(f"{type(error).__name__}: {error}")
         raise
-    workspace.publish(ledger)
+    workspace.publish()
     watcher.run_finished(summary)
     return summary
 

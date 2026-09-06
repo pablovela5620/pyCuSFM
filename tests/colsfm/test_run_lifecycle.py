@@ -32,6 +32,12 @@ from colsfm.run_lifecycle import (
 SMOKE_STAGES: tuple[str, ...] = ("matching", "export")
 """Two stages, enough to see the ledger order without running anything."""
 
+UNUSED_PID: int = 0x7FFFFFFF
+"""A pid above every Linux `pid_max`, so no process can ever hold it.
+
+The reaper asks whether the owning process is alive; this is how a test says "it
+is not" without racing a real one.""" 
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # The ledger
@@ -100,10 +106,9 @@ def test_publishing_swaps_the_whole_directory_at_once(tmp_path: Path) -> None:
     (output_dir / "summary.json").write_text("the previous run\n")
     (output_dir / "only_in_the_previous_run.txt").write_text("stale\n")
 
-    ledger: StageLedger = StageLedger(output_dir=output_dir, stages=STAGE_NAMES)
     workspace: RunWorkspace = open_workspace(output_dir, STAGE_NAMES)
     (workspace.staging_dir / "summary.json").write_text("this run\n")
-    workspace.publish(ledger)
+    workspace.publish()
 
     assert (output_dir / "summary.json").read_text() == "this run\n"
     assert not (output_dir / "only_in_the_previous_run.txt").exists(), "the previous run must not survive in pieces"
@@ -119,7 +124,7 @@ def test_publishing_into_a_destination_that_does_not_exist_yet(tmp_path: Path) -
     output_dir: Path = tmp_path / "runs" / "cusfm"
     workspace: RunWorkspace = open_workspace(output_dir, STAGE_NAMES)
     (workspace.staging_dir / "summary.json").write_text("this run\n")
-    workspace.publish(StageLedger(output_dir=output_dir, stages=STAGE_NAMES))
+    workspace.publish()
 
     assert (output_dir / "summary.json").read_text() == "this run\n"
 
@@ -130,12 +135,11 @@ def test_a_failed_run_publishes_nothing_and_says_where_its_pieces_are(tmp_path: 
     output_dir.mkdir()
     (output_dir / "summary.json").write_text("the previous run\n")
 
-    ledger: StageLedger = StageLedger(output_dir=output_dir, stages=STAGE_NAMES)
     workspace: RunWorkspace = open_workspace(output_dir, STAGE_NAMES)
-    with timed_stage(ledger, "keyframe_selection"):
+    with timed_stage(workspace.ledger, "keyframe_selection"):
         pass
     (workspace.staging_dir / "summary.json").write_text("half of this run\n")
-    workspace.fail(ledger, "ValueError: no keyframe survived selection")
+    workspace.fail("ValueError: no keyframe survived selection")
 
     assert (output_dir / "summary.json").read_text() == "the previous run\n"
     failed: RunState | None = read_run_state(workspace.staging_dir)
@@ -146,11 +150,58 @@ def test_a_failed_run_publishes_nothing_and_says_where_its_pieces_are(tmp_path: 
     assert failed.failure == "ValueError: no keyframe survived selection"
 
 
+def test_the_workspace_owns_its_ledger(tmp_path: Path) -> None:
+    """One stage tuple, one `runtime.csv`, one object that has both.
+
+    The workspace used to be given the planned stages and the caller then built a
+    `StageLedger` from the same tuple and the same directory, and handed it back to
+    `publish` and `fail` so they could read the stages it had recorded.
+    """
+    workspace: RunWorkspace = open_workspace(tmp_path / "cusfm", STAGE_NAMES)
+
+    assert workspace.ledger.stages == STAGE_NAMES
+    assert workspace.stages_planned == workspace.ledger.stages
+    assert workspace.ledger.output_dir == workspace.staging_dir, "`runtime.csv` lands in the staging directory"
+
+    with timed_stage(workspace.ledger, "keyframe_selection"):
+        pass
+    workspace.publish()
+    published: RunState | None = read_run_state(tmp_path / "cusfm")
+    assert published is not None
+    assert published.stages_completed == ("keyframe_selection",)
+    assert published.stages_planned == tuple(STAGE_NAMES)
+
+
+def test_a_directory_a_live_process_is_writing_is_not_reaped(tmp_path: Path) -> None:
+    """Two runs over one destination must not delete each other's staging directory.
+
+    The reaper used to `rmtree` every `<name>.colsfm-staging-*` sibling under
+    `ignore_errors=True`, so a second run started while the first was still going
+    removed the first's live workspace and said nothing. The directory names the pid
+    that owns it, so the question can simply be asked.
+
+    Pid 1 stands in for the live process: it always exists, it is never this test,
+    and asking about it is answered by the kernel rather than by a fixture.
+    """
+    output_dir: Path = tmp_path / "cusfm"
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    live: Path = output_dir.with_name(f"{output_dir.name}{STAGING_SUFFIX}-1")
+    live.mkdir(parents=True)
+    (live / "database.db").write_text("the other run's work\n")
+    abandoned: Path = output_dir.with_name(f"{output_dir.name}{STAGING_SUFFIX}-{UNUSED_PID}")
+    abandoned.mkdir(parents=True)
+
+    open_workspace(output_dir, STAGE_NAMES)
+
+    assert (live / "database.db").read_text() == "the other run's work\n"
+    assert not abandoned.exists(), "a run that is gone leaves nothing behind"
+
+
 def test_the_next_run_clears_the_last_failure_away(tmp_path: Path) -> None:
     """One failure leaves one directory behind, not a pile of them."""
     output_dir: Path = tmp_path / "cusfm"
     first: RunWorkspace = open_workspace(output_dir, STAGE_NAMES)
-    first.fail(StageLedger(output_dir=output_dir, stages=STAGE_NAMES), "boom")
+    first.fail("boom")
     assert first.staging_dir.exists()
 
     open_workspace(output_dir, STAGE_NAMES)
