@@ -6,6 +6,11 @@ their parsed metadata, the two geometry helpers every synthetic-scene test needs
 protos, and the synthetic cuSFM-layout run builder that `test_benchmark` and
 `test_rerun_log` both score against.
 
+It also owns the `perf` marker: tests whose assertion is a *timing* bound, which
+measure the machine as much as the code and have no business failing an ordinary
+run. They are collected always and skipped unless somebody asks for them, by
+`-m perf` or `COLSFM_PERF_TESTS=1`.
+
 `tests/colsfm` has no `__init__.py` and is therefore on `sys.path`, so the plain
 functions below are imported as `from conftest import ...`; only the fixtures go
 through pytest's own injection.
@@ -15,6 +20,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Final
 
 import numpy as np
 import pycolmap
@@ -31,6 +37,57 @@ from colsfm.schema import KEYFRAME, load_schema
 
 REPO_ROOT: Path = _REPO_ROOT
 """Repo root, so data paths resolve regardless of the working directory."""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The `perf` marker
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+PERF_MARKER: Final[str] = "perf"
+"""Marker for a test whose assertion is a wall-clock or throughput bound."""
+
+PERF_ENVIRONMENT_VARIABLE: Final[str] = "COLSFM_PERF_TESTS"
+"""Set to `1` to run the `perf` tests without naming the marker on the command line."""
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Register the `perf` marker so `--strict-markers` and `--markers` know it.
+
+    Args:
+        config: pytest's configuration.
+    """
+    config.addinivalue_line(
+        "markers",
+        "perf: asserts a timing or throughput bound. Skipped unless selected with "
+        f"`-m {PERF_MARKER}` or `{PERF_ENVIRONMENT_VARIABLE}=1`, because the bound "
+        "measures the machine as much as the code.",
+    )
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    """Skip `perf`-marked tests unless this run asked for them.
+
+    Deliberately a skip rather than a deselect: the default run still reports
+    that the performance tests exist and were not run, which a `-m "not perf"`
+    default in the task definition would hide. It is also what lets the exclusion
+    live here instead of in `pixi.toml`.
+
+    Args:
+        config: pytest's configuration; its `-m` expression is what "asked for
+            them" means.
+        items: The collected tests, marked in place.
+    """
+    if os.environ.get(PERF_ENVIRONMENT_VARIABLE) == "1":
+        return
+    if PERF_MARKER in str(config.getoption("-m") or ""):
+        return
+    skip: pytest.MarkDecorator = pytest.mark.skip(
+        reason=f"timing bound; select it with `-m {PERF_MARKER}` or {PERF_ENVIRONMENT_VARIABLE}=1"
+    )
+    for item in items:
+        if item.get_closest_marker(PERF_MARKER) is not None:
+            item.add_marker(skip)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
