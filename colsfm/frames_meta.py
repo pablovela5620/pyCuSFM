@@ -27,7 +27,7 @@ Conventions (export.md §2, keypoints_mapper_main.md §4.3):
 from __future__ import annotations
 
 import copy
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Literal, TypeAlias
@@ -485,12 +485,12 @@ def _set_string_map(message: Message, field_name: str, values: Mapping[int, str]
         field_name: Name of the map field.
         values: The typed model's mapping.
     """
-    field: object = getattr(message, field_name)
-    if {int(key): value for key, value in field.items()} == dict(values):
+    entries: MutableMapping[int, str] = getattr(message, field_name)
+    if {int(key): value for key, value in entries.items()} == dict(values):
         return
-    field.clear()
+    entries.clear()
     for key, value in values.items():
-        field[key] = value
+        entries[key] = value
 
 
 def _apply_keyframes(message: Message, keyframes: Sequence[KeyframeMeta]) -> None:
@@ -507,7 +507,7 @@ def _apply_keyframes(message: Message, keyframes: Sequence[KeyframeMeta]) -> Non
     if [int(entry.id) for entry in message.keyframes_metadata] != [keyframe.keyframe_id for keyframe in keyframes]:
         del message.keyframes_metadata[:]
         for keyframe in keyframes:
-            entry = message.keyframes_metadata.add()
+            entry: Message = message.keyframes_metadata.add()
             encoded: bytes | None = template_by_id.get(keyframe.keyframe_id)
             if encoded is not None:
                 entry.ParseFromString(encoded)
@@ -551,7 +551,7 @@ def _apply_cameras(message: Message, cameras: Mapping[int, CameraParams]) -> Non
         message: The collection message to update.
         cameras: The typed cameras, keyed by `camera_params_id`.
     """
-    sensors: object = message.camera_params_id_to_camera_params
+    sensors: MutableMapping[int, Message] = message.camera_params_id_to_camera_params
     for camera_params_id in [int(key) for key in sensors if int(key) not in cameras]:
         del sensors[camera_params_id]
     for camera_params_id, camera in cameras.items():
@@ -576,7 +576,7 @@ def _apply_stereo_pairs(message: Message, stereo_pairs: Sequence[StereoPair]) ->
         return
     del message.stereo_pair[:]
     for pair in stereo_pairs:
-        entry = message.stereo_pair.add()
+        entry: Message = message.stereo_pair.add()
         entry.left_camera_param_id = pair.left_camera_params_id
         entry.right_camera_param_id = pair.right_camera_params_id
         entry.baseline_meters = pair.baseline_meters
