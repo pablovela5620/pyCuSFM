@@ -37,11 +37,13 @@ re-exported here, because `tools/audit` reaches for them through this name:
 
 `compare_runs` checks bounds when it is handed bounds and does not otherwise;
 which dataset the runs reconstruct is a plain label. `check_acceptance` then
-drops the checks the data cannot support: the ATE row without ground truth, the
-runtime row without run A's `runtime.csv`. A bound whose value or whose limit is
-not a finite measurement — run A's ATE is NaN when fewer than three samples
-joined — is reported as *not measurable* (`AcceptanceCheck.passed is None`)
-rather than as a failure.
+drops the checks the data cannot support: the ATE row without ground truth. A
+bound whose value or whose limit is not a finite measurement — run A's ATE is
+NaN when fewer than three samples joined, either run's total runtime when its
+`runtime.csv` is missing — is reported as *not measurable*
+(`AcceptanceCheck.passed is None`) rather than as a failure. Missing stays
+missing: a run that timed nothing has `total_runtime_seconds is None`, never a
+0.0 s total that would beat any runtime bound.
 """
 
 from __future__ import annotations
