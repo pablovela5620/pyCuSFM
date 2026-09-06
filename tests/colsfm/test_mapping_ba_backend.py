@@ -28,11 +28,14 @@ from mapping_helpers import (
     write_database,
 )
 
+from colsfm import ba_backend
 from colsfm.ba_backend import (
+    CASPAR_PROBE_CAMERA_MODELS,
     CASPAR_STOCK_CAMERA_MODELS,
     apply_caspar_options,
     backend_name,
     caspar_supported_camera_models,
+    detect_caspar_capability,
 )
 from colsfm.config import BundleAdjustmentConfig, CusfmConfig, VisionMappingConfig
 from colsfm.mapping import MappingOptions, MappingResult, bundle_adjustment_options, ceres_polish_options, run_mapping
@@ -231,19 +234,41 @@ def test_the_probe_reports_the_camera_models_this_caspar_build_projects(
         assert supported == CASPAR_STOCK_CAMERA_MODELS
 
 
-def test_the_probe_answers_once_and_quickly(caspar_enabled: bool) -> None:
-    """The probe is cached, so the mapper pays for it once per process.
+def test_the_probe_solves_once_however_often_it_is_asked(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The probe is cached, so the mapper pays for its CASPAR solves once per process.
 
-    It runs a real CASPAR solve per candidate model, which is only acceptable
-    because it happens once and takes well under a second.
+    The expensive thing is `_caspar_projects`: one real bundle adjustment per
+    candidate camera model. The contract is that the whole sweep runs once and
+    every later caller reads the answer, so the test counts the solves. Timing
+    the second call instead — which is what this used to do, against a 10 ms
+    budget — measures the machine, and asking whether two calls returned the
+    same object measures `functools.cache` rather than the mapper's cost.
+
+    Counting also frees the test from needing a CASPAR build: the stand-in
+    answers for the solve, so the caching contract is checked on every
+    environment rather than only where the GPU backend exists.
     """
-    if not caspar_enabled:
-        pytest.skip("this pycolmap is built without CASPAR_ENABLED; run under `pixi run -e colsfm-caspar`")
-    caspar_supported_camera_models()
-    started: float = time.perf_counter()
-    cached: frozenset[str] = caspar_supported_camera_models()
-    assert time.perf_counter() - started < 0.01
-    assert cached is caspar_supported_camera_models()
+    asked: list[str] = []
+
+    def counting_probe(model_name: str) -> bool:
+        """Stand in for one CASPAR solve, recording which model it was asked about."""
+        asked.append(model_name)
+        return model_name in CASPAR_STOCK_CAMERA_MODELS
+
+    monkeypatch.setattr(ba_backend, "_caspar_projects", counting_probe)
+    # The real answer is memoised for the life of the process, so the cache has
+    # to be empty going in and empty again coming out — otherwise this test
+    # either reads a real probe or leaves the stand-in's answer behind.
+    detect_caspar_capability.cache_clear()
+    try:
+        first: frozenset[str] = caspar_supported_camera_models()
+        repeats: list[frozenset[str]] = [caspar_supported_camera_models() for _ in range(3)]
+    finally:
+        detect_caspar_capability.cache_clear()
+
+    assert asked == list(CASPAR_PROBE_CAMERA_MODELS), "the sweep runs once, in probe order"
+    assert first == CASPAR_STOCK_CAMERA_MODELS
+    assert repeats == [first, first, first]
 
 
 def test_the_probe_reports_nothing_without_a_caspar_build(caspar_enabled: bool) -> None:
