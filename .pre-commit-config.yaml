@@ -2,10 +2,17 @@ repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
     hooks:
+      # The committed COLMAP patches are byte-exact inputs to rattler-build and
+      # are verified against patches/SHA256SUMS at build time: stripping a
+      # trailing space out of a context line, or appending a newline, breaks the
+      # build.  The generated one is also 3 MiB, well over the 500 KB default.
       - id: trailing-whitespace
+        exclude: ^packages/pycolmap-caspar-fisheye/patches/
       - id: end-of-file-fixer
+        exclude: ^packages/pycolmap-caspar-fisheye/patches/
       - id: check-yaml
       - id: check-added-large-files
+        exclude: ^packages/pycolmap-caspar-fisheye/patches/
   - repo: https://github.com/google/yapf
     rev: v0.43.0 # Use the latest version
     hooks:

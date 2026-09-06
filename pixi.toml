@@ -4,10 +4,14 @@ version = "0.1.8"
 description = "Pixi environment for the CUDA 13 pyCuSFM binaries"
 channels = ["conda-forge"]
 platforms = ["linux-64"]
-# `packages/pycolmap-caspar` is a local pixi-build package (a rattler-build
-# recipe compiled on demand), consumed only by the `colsfm-caspar` environment.
+# `packages/pycolmap-caspar*` are local pixi-build packages (rattler-build
+# recipes compiled on demand), each consumed by exactly one environment.
 # Path dependencies on a pixi-build package need this preview flag.
 preview = ["pixi-build"]
+# 0.77.1 stopped mtime-only source changes from rebuilding source packages
+# (pixi #6703); a git checkout touches every mtime, so anything older rebuilds
+# the three caspar packages far too eagerly.  Do not lower this.
+requires-pixi = ">=0.77.1"
 
 [dependencies]
 python = "3.12.*"
@@ -395,12 +399,13 @@ LD_LIBRARY_PATH = "${CONDA_PREFIX}/lib/python3.12/site-packages/tensorrt_libs:${
 
 # ── colsfm-caspar-fisheye: CASPAR with a native OPENCV_FISHEYE adapter ──────
 # A third mirror of `colsfm`, identical to `colsfm-caspar` except that its
-# pycolmap comes from `packages/pycolmap-caspar-fisheye`, which builds a LOCAL
-# fork of COLMAP 4.2.0 (/home/pablo/0Dev/forks/colmap-caspar-fisheye, branch
-# `caspar-opencv-fisheye`) carrying an `OpenCVFisheyeAdapter` for Caspar's GPU
-# bundle adjuster.  Stock CASPAR skips OPENCV_FISHEYE observations with
-# "unsupported camera model"; this build solves them natively.  See
-# docs/caspar-fisheye-adapter.md.
+# pycolmap comes from `packages/pycolmap-caspar-fisheye`, which builds the same
+# pinned upstream COLMAP 4.2.0 (be5e2916) with the two committed patches in
+# `packages/pycolmap-caspar-fisheye/patches/` applied by rattler-build.  They
+# add an `OpenCVFisheyeAdapter` to Caspar's GPU bundle adjuster: stock CASPAR
+# skips OPENCV_FISHEYE observations with "unsupported camera model", this build
+# solves them natively.  Nothing outside the repo is needed to build it.  See
+# docs/caspar-fisheye-adapter.md and the package README.
 #
 # A fourth duplicated dependency list, for the same reason the second and third
 # exist: each `pycolmap` spec has to be alone in its own solve, and none of
@@ -472,6 +477,14 @@ decode-bench = { features = ["decode-bench"], no-default-feature = true, solve-g
 LD_LIBRARY_PATH = "${PIXI_PROJECT_ROOT}/pycusfm/x86_cuda13/lib:${CONDA_PREFIX}/lib/python3.12/site-packages/tensorrt_libs:${CONDA_PREFIX}/lib:/usr/lib/x86_64-linux-gnu"
 
 [tasks]
+# Maintainer-only, and in the DEFAULT feature on purpose: putting them in
+# `colsfm-caspar-fisheye` would build that environment from the stale patch
+# before regenerating it.  Both run equally well as
+# `bash tools/caspar_fisheye_patch.sh {regen,check}`, which needs no environment
+# at all -- prefer that on a fresh clone, where `pixi run` would first install
+# the whole default feature.
+caspar-fisheye-patch = { cmd = "bash tools/caspar_fisheye_patch.sh regen", description = "Re-cut packages/pycolmap-caspar-fisheye/patches/ from the local colmap-caspar-fisheye fork and prove they rebuild it on top of the pinned upstream rev" }
+caspar-fisheye-patch-check = { cmd = "bash tools/caspar_fisheye_patch.sh check", description = "Apply the committed fisheye patches to a fresh blob-less clone of upstream COLMAP at the pinned rev and verify every hash (no fork needed)" }
 select-tensorrt-cu13 = "pixi reinstall tensorrt-cu13-libs tensorrt-cu13-bindings --no-progress"
 setup-cuda13-bin = { cmd = "ln -sfn x86_cuda13/bin pycusfm/bin", depends-on = ["select-tensorrt-cu13"] }
 setup-cuda13-lib = { cmd = "ln -sfn x86_cuda13/lib pycusfm/lib", depends-on = ["select-tensorrt-cu13"] }

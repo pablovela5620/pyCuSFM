@@ -6,4 +6,6 @@ name = "pycolmap"
 version = "4.2.0"
 
 [package.build]
-backend = { name = "pixi-build-rattler-build", version = "*" }
+# Pinned so all three caspar packages are built by one known backend; the
+# lock records no backend version and the local cache holds 0.4.4 and 0.4.6.
+backend = { name = "pixi-build-rattler-build", version = "==0.4.6" }

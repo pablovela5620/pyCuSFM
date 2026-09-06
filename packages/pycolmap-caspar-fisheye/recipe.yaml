@@ -1,25 +1,29 @@
 # rattler-build recipe for a CASPAR pycolmap 4.2.0 with an OPENCV_FISHEYE
-# adapter, built from a LOCAL fork (CUDA 13 / sm_120).
+# Caspar adapter (CUDA 13 / sm_120).
 #
-# This is `packages/pycolmap-caspar/recipe.yaml` with the `source:` pointed at
-# a local clone instead of github.com/colmap/colmap, and a distinct build
-# string.  Everything else -- the two-step libcolmap-then-bindings build, the
-# CUDA 13 / sm_120 pins, the dependency list -- is unchanged.
+# This is `packages/pycolmap-caspar/recipe.yaml` plus two patches on the same
+# pinned upstream source, a Step 0 integrity gate, a distinct build string and
+# one real test.  The two-step build, the CUDA 13 / sm_120 pins and the
+# dependency list are byte-identical to the base recipe (its header explains
+# why).  Diff the two files before editing either.
 #
-# THE FORK: /home/pablo/0Dev/forks/colmap-caspar-fisheye, branch
-# `caspar-opencv-fisheye`, branched from tag 4.2.0
-# (be5e29168d4aff238409d60424812df66aac919f -- the exact revision
-# `packages/pycolmap-caspar` builds).  It adds OPENCV_FISHEYE to Caspar's GPU
-# bundle adjuster: an `opencv_fisheye_core` Symforce residual in
-# `src/thirdparty/Symforce-Caspar/caspar_generate.py`, regenerated f32 AND f64
-# kernel trees, and an `OpenCVFisheyeAdapter` in
-# `src/colmap/estimators/caspar/caspar_model_adapter.h`.  See
-# docs/caspar-fisheye-adapter.md.  Nothing is pushed anywhere; the fork lives
-# only on this machine, which is why `source:` is a `path:` and not a `git:`.
+# THE PATCHES (packages/pycolmap-caspar-fisheye/patches/, applied by
+# rattler-build to the fresh upstream clone, in list order):
+#   add-opencv-fisheye-caspar-adapter.patch  hand-written: OpenCVFisheyeAdapter
+#       in caspar_model_adapter.h, its dispatch in bundle_adjustment_caspar.cc,
+#       the opencv_fisheye residual and the SumStore padding-thread fix in
+#       Symforce-Caspar/caspar_generate.py, doc/faq.rst.
+#   add-opencv-fisheye-generated-f32.patch   224 new Symforce-generated kernel
+#       files plus the 4 regenerated aggregates (solver.{h,cc},
+#       caspar_mappings.{h,cu}) under generated/f32.  The vendored
+#       PINHOLE/SIMPLE_RADIAL kernels are untouched.
+# The generated CUDA travels inside the patch, so symforce is NOT a build
+# dependency (conda-forge has no symforce package at any version).  The fp64
+# tree exists in the fork but is not shipped: no package compiles it.
+# Cut from fork commit c03b1f38 (see README.md) by tools/caspar_fisheye_patch.sh.
 #
-# BUILD COST: the fork adds 224 generated CUDA translation units per precision
-# tree (712 files in generated/f32, up from 488), so the libcolmap step
-# compiles roughly 45% more CUDA than `packages/pycolmap-caspar` does.
+# BUILD COST: 712 CUDA translation units in generated/f32 vs 488 stock.
+# See docs/caspar-fisheye-adapter.md §4 for the measured wall time.
 #
 # ORIGINAL HEADER FOLLOWS.
 #
@@ -54,7 +58,9 @@
 # MKL / fmt / faiss-cuda pins of the earlier pysfm monorepo recipe: those existed
 # only to co-solve with a cuda130 PyTorch, which `colsfm-caspar` does not have.
 context:
-  # Local fork of tag 4.2.0 (be5e2916) with the OPENCV_FISHEYE Caspar adapter.
+  # tag 4.2.0 -> be5e29168d4aff238409d60424812df66aac919f.
+  # tools/caspar_fisheye_patch.sh reads this line as the patch base and refuses
+  # to run if the two sibling recipes pin a different revision.
   colmap_rev: be5e29168d4aff238409d60424812df66aac919f
   cuda_arch: "120"
 
@@ -63,19 +69,37 @@ package:
   version: "4.2.0"
 
 source:
-  # A local path, not a git URL: the fork is unpublished by design.
-  # rattler-build copies the working tree (minus .git) into the build dir, so
-  # the branch that is CHECKED OUT is what gets built -- keep
-  # `caspar-opencv-fisheye` checked out in the fork.
-  path: /home/pablo/0Dev/forks/colmap-caspar-fisheye
+  git: https://github.com/colmap/colmap.git
+  rev: ${{ colmap_rev }}
+  # Paths resolve relative to this recipe directory.  Each file starts with a
+  # `# Patch:` prose header, which every applier skips (nothing before the first
+  # `diff --git` is parsed).  Order: hand-written first, then the generated tree;
+  # the two path sets are disjoint.
+  patches:
+    - patches/add-opencv-fisheye-caspar-adapter.patch
+    - patches/add-opencv-fisheye-generated-f32.patch
 
 build:
   number: 0
-  # An explicit string keeps this artifact distinguishable from the stock fp32
-  # `pycolmap 4.2.0` built by `packages/pycolmap-caspar` -- same package name
-  # and version, different camera-model coverage.
+  # Distinguishes this artifact from the fp32/fp64 stock-source builds, which
+  # share the name and version `pycolmap 4.2.0`.
   string: caspar_fisheye_cuda130_py312
   script:
+    # --- Step 0: prove the patches landed, byte for byte, before compiling ---
+    # The applier inside pixi-build-rattler-build 0.4.6 (flickzeug 0.5.2) patches
+    # with fuzz and can skip an already-applied hunk with a WARNING and exit 0.
+    # A skipped hunk in solver.cc or caspar_mappings.cu would compile and give
+    # wrong answers, so hash every file the two patches touch instead of
+    # trusting the applier.  This costs under a second and runs before the
+    # five-minute CUDA compile.
+    - sha256sum --quiet -c "$RECIPE_DIR/patches/SHA256SUMS"
+    # Cheap, readable corroboration of the same fact, in case the checksum file
+    # itself is ever stale: the adapter class, the generator residual, and the
+    # 224 new fp32 kernel files (104 kernel_OpenCVFisheye* plus 120
+    # kernel_opencv_fisheye_*, hence the case-insensitive count).
+    - grep -q "class OpenCVFisheyeAdapter" src/colmap/estimators/caspar/caspar_model_adapter.h
+    - grep -q "opencv_fisheye" src/thirdparty/Symforce-Caspar/caspar_generate.py
+    - test "$(ls src/thirdparty/Symforce-Caspar/generated/f32 | grep -ci fisheye)" -eq 224
     # conda's onnxruntime-cpp nests its headers at include/onnxruntime/core/session/,
     # but COLMAP includes <onnxruntime_cxx_api.h> flat (the prebuilt-release layout).
     # Put the session dir on the compiler's include search path so it resolves.
@@ -106,6 +130,10 @@ build:
     - export CMAKE_BUILD_PARALLEL_LEVEL=${{ CPU_COUNT }}
     - export CMAKE_ARGS="-DCASPAR_ENABLED=ON -DCMAKE_CUDA_ARCHITECTURES=${{ cuda_arch }} -DGENERATE_STUBS=OFF -DFETCH_ONNX=OFF -DCMAKE_PREFIX_PATH=$PREFIX"
     - python -m pip install . -vv --no-build-isolation --no-deps
+    # --- Provenance inside the package, readable by probes and `pixi run` ---
+    - mkdir -p "$PREFIX/etc/pycolmap-caspar"
+    - printf 'fisheye_f32\n' > "$PREFIX/etc/pycolmap-caspar/variant"
+    - printf '%s\n' "${{ colmap_rev }}" > "$PREFIX/etc/pycolmap-caspar/colmap_rev"
 
 requirements:
   build:
@@ -187,12 +215,17 @@ tests:
   - script:
       - python -c "import pycolmap; assert pycolmap.has_cuda, 'built without CUDA'"
       - python -c "import pycolmap; assert hasattr(pycolmap.BundleAdjustmentOptions(), 'caspar')"
-      # The adapter is C++-side and has no Python symbol of its own, so the
-      # cheapest build-time evidence that the fork is what got built is that
-      # the enum the adapter dispatches on exists.
-      - python -c "import pycolmap; assert pycolmap.CameraModelId.OPENCV_FISHEYE is not None"
+      # The two asserts above also pass on stock pycolmap.  This one does not:
+      # the adapter's class name survives in the extension module's symbols
+      # (0 hits in the stock fp32 and fp64 builds, 2 in this one).  Do not use
+      # `OpenCVFisheye`: stock `_core*.so` carries it 18-27 times as
+      # `OpenCVFisheyeCameraModel`.
+      - python -c "import pathlib, pycolmap; p = pathlib.Path(pycolmap.__file__).parent; assert any(b'OpenCVFisheyeAdapter' in f.read_bytes() for f in p.glob('_core*.so')), 'OpenCVFisheyeAdapter not linked into pycolmap'"
+      # sys.prefix, not $PREFIX: the rattler-build docs do not promise $PREFIX
+      # inside a test script.
+      - python -c "import pathlib, sys; assert (pathlib.Path(sys.prefix) / 'etc/pycolmap-caspar/variant').read_text().strip() == 'fisheye_f32'"
 
 about:
   homepage: https://colmap.github.io/
   license: BSD-3-Clause
-  summary: pycolmap 4.2.0 from a local fork with CASPAR_ENABLED and an OPENCV_FISHEYE Caspar adapter, CUDA 13 / sm_120.
+  summary: pycolmap 4.2.0 (colmap be5e2916 + committed OPENCV_FISHEYE Caspar adapter patches) with CASPAR_ENABLED, CUDA 13 / sm_120.

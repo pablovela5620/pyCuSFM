@@ -36,3 +36,10 @@ pycusfm/x86_cuda12/** filter=lfs diff=lfs merge=lfs -text
 pycusfm/x86_cuda13/** filter=lfs diff=lfs merge=lfs -text
 data/* filter=lfs diff=lfs merge=lfs -text
 *.json filter=lfs diff=lfs merge=lfs -text
+# Patch files and their checksum manifest must reach rattler-build byte for
+# byte; never normalise line endings.
+*.patch -text
+packages/pycolmap-caspar-fisheye/patches/SHA256SUMS -text
+# ~3 MiB of Symforce-generated CUDA; collapse it in review.  Use
+# `git diff --text` to read it.
+packages/pycolmap-caspar-fisheye/patches/add-opencv-fisheye-generated-*.patch linguist-generated=true -diff

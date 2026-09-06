@@ -1,0 +1,43 @@
+# Generator-only pixi environment for regenerating COLMAP's Caspar kernel trees.
+#
+# Committed here so that `add-opencv-fisheye-generated-f32.patch` is
+# regenerable from a fresh clone of this repository.  It is NEVER used at build
+# time: the generated CUDA travels inside the patch, and conda-forge has no
+# `symforce` package at any version (checked 2026-09-05), so a build-time
+# generation step could not be expressed in the recipe's requirements.
+#
+# To use it, copy both files to the root of the colmap fork (they are
+# gitignored there) and run, from that root:
+#
+#   pixi run -e default python src/thirdparty/Symforce-Caspar/caspar_generate.py \
+#       "$PWD/.pixi/gen/f32" f32
+#
+# The output directory must sit inside the fork: symforce formats through
+# clang-format with `-assume-filename=<output path>`, which finds the style file
+# by walking up from that path to the fork's `.clang-format`.  Generating
+# elsewhere changes the formatting and the patch stops reproducing.
+#
+# `tools/caspar_fisheye_patch.sh regen` does all of this and then compares the
+# result with the fork tree, file by file.
+[workspace]
+name = "caspar-codegen"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = "3.11.*"
+pip = "*"
+
+[pypi-dependencies]
+# `symforce.caspar` — the extension that emits these kernels — arrived in 0.12.0.
+symforce = "==0.12.0"
+# symforce's codegen pipes generated C++ through clang-format; without it the
+# emitted sources differ from the shipped tree only in whitespace, but we want a
+# byte-for-byte reproduction check, so pin the formatter too.  The lock resolves
+# it to clang-format 21.1.2.
+clang-format = "*"
+
+[tasks]
+# Trailing arguments are the output directory and the precision, e.g.
+#   pixi run gen "$PWD/.pixi/gen/f32" f32
+gen = { cmd = "python src/thirdparty/Symforce-Caspar/caspar_generate.py", description = "Generate a kernel tree: pixi run gen <out_dir> {f32|f64}" }

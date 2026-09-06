@@ -1,9 +1,20 @@
 [package]
 # Named `pycolmap` so it satisfies colsfm's `import pycolmap` and shadows the
 # conda-forge pycolmap inside the `colsfm-caspar-fisheye` environment only.
-# The version matches the upstream COLMAP tag the fork branched from.
+# The version matches the upstream COLMAP tag the patches apply to.
 name = "pycolmap"
 version = "4.2.0"
 
 [package.build]
-backend = { name = "pixi-build-rattler-build", version = "*" }
+# Pinned: pixi.lock records no backend version and the local cache holds both
+# 0.4.4 (pixi-build-api-version 5) and 0.4.6 (api-version 7).  The pin also
+# freezes the patch applier -- 0.4.6 bundles flickzeug 0.5.2, whose
+# already-applied heuristic can skip a hunk with a warning, which is why the
+# recipe's Step 0 verifies patches/SHA256SUMS.  Bump on purpose, and re-read
+# that comment when you do.
+backend = { name = "pixi-build-rattler-build", version = "==0.4.6" }
+
+[package.build.config]
+# The patches are outside the recipe's default input globs; list them so an edit
+# to a patch (or to SHA256SUMS) invalidates the cached build.
+extra-input-globs = ["patches/**/*"]
