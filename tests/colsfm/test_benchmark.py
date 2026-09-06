@@ -616,6 +616,47 @@ def test_a_bound_that_cannot_be_measured_is_not_a_failure(synthetic_pair: RunPai
     assert "**3/3 bounds met.** 1 not measurable." in report
 
 
+def test_a_candidate_that_timed_nothing_is_not_a_free_pass(
+    synthetic_pair: RunPair, three_samples: FramesMeta, tmp_path: Path, galileo_input_dir: Path
+) -> None:
+    """A run with no `runtime.csv` has no total, and no total is not a fast run.
+
+    Summing an empty log gave 0.0 s, so the candidate looked infinitely fast and
+    met the runtime-ratio bound. A missing measurement stays missing: the total is
+    None, the ratio is None, and the bound reports "not measurable" instead of
+    PASS.
+    """
+    run_b: RunArtifacts = read_run(
+        write_synthetic_run(tmp_path / "b", three_samples, error_px=SYNTHETIC_ERROR_PX, runtimes={}), "colsfm"
+    )
+
+    comparison: Comparison = comparison_for((synthetic_pair[0], run_b), galileo_input_dir, bounds=AcceptanceBounds())
+
+    assert comparison.run_b.total_runtime_seconds is None
+    assert comparison.run_a.total_runtime_seconds == pytest.approx(sum(BLOB_RUNTIMES.values()))
+    assert comparison.total_runtime_ratio is None
+    verdicts: dict[str, bool | None] = {check.name: check.passed for check in comparison.acceptance}
+    assert verdicts["total runtime ratio"] is None
+    report: str = render_markdown_report(comparison)
+    assert "| total runtime ratio |" in report
+    assert "not measurable" in report
+
+
+def test_a_reference_that_timed_nothing_leaves_the_ratio_unmeasurable(
+    synthetic_pair: RunPair, three_samples: FramesMeta, tmp_path: Path, galileo_input_dir: Path
+) -> None:
+    """The other side is symmetric: no reference total, no ratio, no verdict."""
+    run_a: RunArtifacts = read_run(
+        write_synthetic_run(tmp_path / "a", three_samples, error_px=SYNTHETIC_ERROR_PX, runtimes={}), "blob"
+    )
+
+    comparison: Comparison = comparison_for((run_a, synthetic_pair[1]), galileo_input_dir, bounds=AcceptanceBounds())
+
+    assert comparison.run_a.total_runtime_seconds is None
+    assert comparison.total_runtime_ratio is None
+    assert {check.name: check.passed for check in comparison.acceptance}["total runtime ratio"] is None
+
+
 def test_the_comparison_round_trips_through_pyserde(synthetic_pair: RunPair, galileo_input_dir: Path) -> None:
     """The JSON dump is lossless, so the report and the machine-readable form agree."""
     comparison: Comparison = comparison_for(synthetic_pair, galileo_input_dir, bounds=AcceptanceBounds())

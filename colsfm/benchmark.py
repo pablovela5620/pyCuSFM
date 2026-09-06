@@ -37,11 +37,13 @@ re-exported here, because `tools/audit` reaches for them through this name:
 
 `compare_runs` checks bounds when it is handed bounds and does not otherwise;
 which dataset the runs reconstruct is a plain label. `check_acceptance` then
-drops the checks the data cannot support: the ATE row without ground truth, the
-runtime row without run A's `runtime.csv`. A bound whose value or whose limit is
-not a finite measurement — run A's ATE is NaN when fewer than three samples
-joined — is reported as *not measurable* (`AcceptanceCheck.passed is None`)
-rather than as a failure.
+drops the checks the data cannot support: the ATE row without ground truth. A
+bound whose value or whose limit is not a finite measurement — run A's ATE is
+NaN when fewer than three samples joined, either run's total runtime when its
+`runtime.csv` is missing — is reported as *not measurable*
+(`AcceptanceCheck.passed is None`) rather than as a failure. Missing stays
+missing: a run that timed nothing has `total_runtime_seconds is None`, never a
+0.0 s total that would beat any runtime bound.
 """
 
 from __future__ import annotations
@@ -292,8 +294,11 @@ class RunMetrics:
     """Synchronised samples with at least one registered image."""
     stage_runtimes: tuple[StageRuntime, ...]
     """Per-stage wall clock, in pipeline order; missing stages are omitted."""
-    total_runtime_seconds: float
-    """Sum of every stage that reported a runtime."""
+    total_runtime_seconds: float | None
+    """Sum of every stage that reported a runtime, or None when none did.
+
+    Deliberately not 0.0: a run whose `runtime.csv` is missing or empty was not
+    measured, and summing nothing into zero made it the fastest run possible."""
     points_are_black: bool
     """True when every point colour is `(0, 0, 0)` — the run omitted `--output_rgb`."""
     vs_input: TrajectoryMetrics
@@ -367,8 +372,10 @@ class AcceptanceCheck:
     """What was checked."""
     bound: str
     """The bound as written in the plan, e.g. `">= 220"`."""
-    value: float
-    """The measured value."""
+    value: float | None
+    """The measured value, or **None when there was nothing to measure** — a
+    candidate that reported no stage runtime has no total, and a total of zero
+    would read as an infinitely fast run."""
     passed: bool | None
     """Whether the measurement satisfies the bound, or **None when it could not be
     measured** — run A's ATE is NaN when fewer than three samples joined, which
@@ -482,7 +489,9 @@ def compute_run_metrics(artifacts: RunArtifacts, input_track: RigTrack, ground_t
         rig_rigidity_spread_millimeters=rig_rigidity_spread_millimeters(artifacts.frames_meta),
         num_rig_frames=len(artifacts.track),
         stage_runtimes=stage_runtimes,
-        total_runtime_seconds=float(sum(artifacts.runtime_seconds_by_stage.values())),
+        total_runtime_seconds=(
+            float(sum(artifacts.runtime_seconds_by_stage.values())) if artifacts.runtime_seconds_by_stage else None
+        ),
         points_are_black=bool(len(points_rgb) > 0 and not points_rgb.any()),
         vs_input=_trajectory_metrics("input", artifacts.track, input_track, 0),
         vs_ground_truth=(
@@ -587,9 +596,10 @@ def check_acceptance(
 
     Returns:
         One check per bound the data supports; the ATE check is omitted when no
-        ground truth exists, and the runtime check when the reference reported no
-        runtime. A check whose value or bound is not finite comes back with
-        `passed=None`.
+        ground truth exists. The runtime check is always present, because a
+        candidate with no timings has not met the bound — it has left it
+        unmeasured, and saying so is the point. A check whose value or bound is
+        missing or not finite comes back with `passed=None`.
     """
     min_registered: int = metrics_a.reconstruction.registered_images - bounds.registered_images_allowance
     max_reprojection_px: float = bounds.max_reprojection_ratio * metrics_a.reconstruction.mean_reprojection_error_px
@@ -617,15 +627,18 @@ def check_acceptance(
                 passed=_verdict(metrics_b.vs_ground_truth.rmse_millimeters, max_ate_millimeters, at_most=True),
             )
         )
-    if total_runtime_ratio is not None:
-        checks.append(
-            AcceptanceCheck(
-                name="total runtime ratio",
-                bound=f"<= {bounds.max_runtime_ratio} x A",
-                value=total_runtime_ratio,
-                passed=_verdict(total_runtime_ratio, bounds.max_runtime_ratio, at_most=True),
-            )
+    checks.append(
+        AcceptanceCheck(
+            name="total runtime ratio",
+            bound=f"<= {bounds.max_runtime_ratio} x A",
+            value=total_runtime_ratio,
+            passed=(
+                None
+                if total_runtime_ratio is None
+                else _verdict(total_runtime_ratio, bounds.max_runtime_ratio, at_most=True)
+            ),
         )
+    )
     return tuple(checks)
 
 
@@ -655,9 +668,9 @@ def compare_runs(
 
     metrics_a: RunMetrics = compute_run_metrics(run_a, input_track, ground_truth)
     metrics_b: RunMetrics = compute_run_metrics(run_b, input_track, ground_truth)
-    ratio: float | None = (
-        metrics_b.total_runtime_seconds / metrics_a.total_runtime_seconds if metrics_a.total_runtime_seconds > 0.0 else None
-    )
+    seconds_a: float | None = metrics_a.total_runtime_seconds
+    seconds_b: float | None = metrics_b.total_runtime_seconds
+    ratio: float | None = seconds_b / seconds_a if seconds_a and seconds_b is not None else None
     return Comparison(
         dataset=dataset,
         run_a=metrics_a,

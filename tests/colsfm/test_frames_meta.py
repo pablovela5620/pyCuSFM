@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 from collections import Counter
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 import pycolmap
+from google.protobuf import json_format
 
-from colsfm.frames_meta import FramesMeta, KeyframeMeta, RigFrame, read_frames_meta, write_frames_meta
+from colsfm.frames_meta import CameraParams, FramesMeta, KeyframeMeta, RigFrame, parse_message, read_frames_meta, write_frames_meta
 from colsfm.geometry import parse_tum_line, rigid3d_from_axis_angle_degrees
 
 
@@ -207,3 +209,64 @@ def test_filtered_keeps_a_subset_and_renumbers_rig_ids(galileo_input: FramesMeta
     assert [keyframe.keyframe_id for keyframe in subset.keyframes] == kept_ids
     assert {keyframe.synced_sample_id for keyframe in subset.keyframes} == {1}
     assert sorted(subset.cameras) == sorted(galileo_input.cameras)
+
+
+def test_an_edited_camera_survives_serialisation_filtering_and_both_updates(three_samples: FramesMeta) -> None:
+    """`dataclasses.replace` on a camera is what every consumer then sees.
+
+    The typed fields are the authority: a 640x480 crop declared through `replace`
+    (the pattern `test_raco_backend` already uses) must come back out of
+    `to_json`, out of `filtered`, and out of both update methods. Before the fix
+    each of those rebuilt the collection from the untouched source message and
+    silently restored 1920x1200.
+    """
+    camera_params_id: int = three_samples.keyframes[0].camera_params_id
+    camera: CameraParams = three_samples.cameras[camera_params_id]
+    cropped: FramesMeta = replace(
+        three_samples,
+        cameras={**three_samples.cameras, camera_params_id: replace(camera, image_width=640, image_height=480)},
+    )
+
+    reparsed: FramesMeta = parse_message(json_format.Parse(cropped.to_json(), type(cropped.message)()))
+    assert (reparsed.cameras[camera_params_id].image_width, reparsed.cameras[camera_params_id].image_height) == (640, 480)
+
+    kept: list[int] = [keyframe.keyframe_id for keyframe in cropped.keyframes[:4]]
+    assert cropped.filtered(kept).cameras[camera_params_id].image_width == 640
+
+    moved: pycolmap.Rigid3d = rigid3d_from_axis_angle_degrees(
+        axis_xyz=np.array([0.0, 0.0, 1.0]), angle_degrees=3.0, translation_xyz=np.array([1.0, 2.0, 3.0])
+    )
+    assert cropped.with_camera_to_world({kept[0]: moved}).cameras[camera_params_id].image_width == 640
+    assert cropped.with_extrinsics({camera_params_id: moved}).cameras[camera_params_id].image_width == 640
+
+    other_id: int = next(other for other in three_samples.cameras if other != camera_params_id)
+    assert cropped.filtered(kept).cameras[other_id].image_width == three_samples.cameras[other_id].image_width
+
+
+def test_an_edited_keyframe_pose_survives_serialisation_and_filtering(three_samples: FramesMeta) -> None:
+    """The same authority holds for a keyframe field edited through `replace`."""
+    keyframe: KeyframeMeta = three_samples.keyframes[0]
+    moved: pycolmap.Rigid3d = rigid3d_from_axis_angle_degrees(
+        axis_xyz=np.array([0.0, 1.0, 0.0]), angle_degrees=11.0, translation_xyz=np.array([4.0, 5.0, 6.0])
+    )
+    edited: FramesMeta = replace(
+        three_samples, keyframes=(replace(keyframe, world_T_cam=moved), *three_samples.keyframes[1:])
+    )
+
+    reparsed: FramesMeta = parse_message(json_format.Parse(edited.to_json(), type(edited.message)()))
+    assert np.allclose(reparsed.keyframe_by_id()[keyframe.keyframe_id].world_T_cam.translation, [4.0, 5.0, 6.0], atol=1e-9)
+
+    subset: FramesMeta = edited.filtered([keyframe.keyframe_id])
+    assert np.allclose(subset.keyframes[0].world_T_cam.translation, [4.0, 5.0, 6.0], atol=1e-9)
+
+
+def test_an_untouched_collection_still_serialises_byte_for_byte(galileo_input: FramesMeta) -> None:
+    """Overlaying the typed fields writes nothing when nothing changed.
+
+    The guard on the fix: unmodelled protobuf fields and cuSFM's default omission
+    only survive if an unedited collection is serialised from its source message
+    unchanged, byte for byte.
+    """
+    assert galileo_input.to_json() == json_format.MessageToJson(
+        galileo_input.message, indent=2, preserving_proto_field_name=True
+    )
