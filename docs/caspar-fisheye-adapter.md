@@ -177,6 +177,38 @@ more CUDA in the Caspar library.
 environment blocks are **byte-identical**. Only the new
 `colsfm-caspar-fisheye` block was added.
 
+### 4.1 Source provenance: the adapter is carried here as a patch
+
+The recipe builds from a local checkout
+(`/home/pablo/0Dev/forks/colmap-caspar-fisheye`, branch `caspar-opencv-fisheye`),
+and no revision in this repository pins it: the checked-out working tree decides
+what gets built, so the branch alone could not reproduce the package (review
+finding 9). The adapter's source is therefore committed as a patch against
+stock COLMAP.
+
+| | |
+|---|---|
+| Base | `be5e29168d4aff238409d60424812df66aac919f` — tag 4.2.0, the `colmap_rev` both CASPAR recipes already declare |
+| Fork HEAD | `267dd0fd2f30b56b8e23275d6e3ed5a54cb79359`, a single commit on top of that base; working tree clean (`status --porcelain -uall` empty) |
+| Patch | `packages/pycolmap-caspar-fisheye/patches/caspar-opencv-fisheye.patch` — 6.3 MB, 461 files, +124,440/-17,240 lines, nearly all of it generated Symforce CUDA |
+
+To rebuild the fork from stock COLMAP: clone `colmap/colmap`, check out
+`be5e29168d4aff238409d60424812df66aac919f`, then
+
+```bash
+patch -p1 < <pyCuSFM>/packages/pycolmap-caspar-fisheye/patches/caspar-opencv-fisheye.patch
+```
+
+(`am` instead keeps the authorship and the commit message — the file is a
+mailbox-format patch).
+
+Both directions were checked: `patch -p1 --dry-run` applies to a freshly
+extracted 4.2.0 tree, and reverse-applying the patch against the fork's HEAD is
+a no-op, so the patch reproduces that tree exactly.
+
+Moving the recipe's `source` off the local path onto the pinned revision plus
+this patch is designed separately.
+
 ---
 
 ## 5. Validation
