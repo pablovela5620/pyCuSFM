@@ -175,5 +175,6 @@ blob's 334.10 mm.
 4. **RoboCap with loop closure: measured.** With the rig-resection estimator (74 edges),
    colsfm's disagreement with the input trajectory drops from 461 mm to 313 mm (blob: 334 mm)
    and its rig poses land 146 mm RMSE from the blob's, at 1.52x the blob's runtime. Loop
-   closure stays off by default; the estimator's rotation gap (item 1) and the loop stage's
-   cost (721 s, mostly matching) are what remain.
+   closure is on by default since 2026-09-05 (it was off until then; the blob always runs
+   it, and comparisons must pay for the stage on both sides); the estimator's rotation gap
+   (item 1) and the loop stage's cost (721 s, mostly matching) are what remain.

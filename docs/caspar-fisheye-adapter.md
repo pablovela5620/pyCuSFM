@@ -670,3 +670,29 @@ and `02-ceres-vs-caspar.png`, captured from a headless 0.37.1 viewer loading eac
 `.rrd` through `ViewerClient` (`capture.py` and `notes.md` alongside): both coloured point
 clouds, three trajectories (blob or Ceres, CASPAR, input) tracing the same multi-loop walk,
 and the report panel showing the numbers above.
+
+### 9.6 The same run with loop closure on
+
+Loop closure is now on by default (NOTES.md decision 10, revised); this is the §9.5 CASPAR
+run with `--loop-closure`, and the row that is actually comparable to the blob's 705.66 s
+loop work. `data/bench/robocap_full_blob_vs_caspar_loops.md`, recording alongside;
+`docs/loop-stage-cost.md` explains where the seconds go.
+
+| | blob cuSFM | RaCo + CASPAR + polish, loops |
+|---|---:|---:|
+| feature extraction (s) | 183.91 | 85.49 |
+| BoW + loop association + pose graph (s) | 705.66 | 104.00 |
+| matching (s) | 52.53 | 39.08 |
+| triangulation + bundle adjustment (s) | 178.75 | 125.74 |
+| total (s) | 1133.53 | **361.29** |
+| loop edges | 90 | 86 |
+| 3D points / observations | 168 874 / 947 651 | 319 600 / 2 664 920 |
+| mean reprojection error (px) | 1.486 | 1.945 |
+| rig poses vs input, RMSE (mm) | 334.10 | 277.79 |
+| rig poses vs blob, RMSE (mm) / rotation (deg) | — | 159.06 / 1.236 |
+
+0.32x the blob end to end with every stage paid for. The mapping stage grew from 103.8 to
+125.7 s (the polish alone 35.3 s over 14 iterations) because the loop pairs nearly double the
+observations; the reprojection error rose to 1.945 px and fails the 1.10x bound, see
+`docs/loop-stage-cost.md` §5. Pixel evidence:
+`/tmp/rerun-viewer-validation/robocap-full-caspar/03-blob-vs-caspar-loops.png`.

@@ -98,7 +98,8 @@ stage 3 emits only the consecutive and stereo pairs it can derive from the metad
 pairs first exist after stage 5, which matches them into the same database. Stage 5 therefore
 runs the search twice, once with a recording `match_fn` that collects the candidate pairs and
 returns no matches, then one batch match over those pairs, then the real search reading the
-matches back. Loop closure is off by default. And `--optimize-extrinsics` maps **once**:
+matches back. Loop closure is on by default, as in the blob (`--no-loop-closure` is the
+ablation). And `--optimize-extrinsics` maps **once**:
 stage 7 builds the camera-referenced reconstruction the refinement needs, and stage 7b
 refines the extrinsics of the model stage 7 left behind rather than mapping the scene again.
 

@@ -24,7 +24,7 @@ STAGE_LABELS: Final[dict[Stage, str]] = {
     "extraction": "1 feature extraction + keyframe selection",
     "retrieval": "2 BoW vocabulary + index",
     "association": "3 loop-closure association",
-    "pose_graph": "4 pose graph optimisation",
+    "pose_graph": "4 pose graph (blob: loop verification + optimisation)",
     "pair_selection": "5 match pair selection",
     "matching": "6 feature matching",
     "mapping": "7 triangulation + bundle adjustment",

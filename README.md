@@ -157,7 +157,8 @@ Galileo, blob against colsfm, measured by the benchmark in
 | ATE vs ground truth (mm RMSE) | 5.00 | 4.33 |
 | total runtime (s) | 40.07 | 19.35 |
 
-Loop closure is off by default. Decisions, deviations from the blob and gotchas are in
+Loop closure is on by default, as in the blob; `--no-loop-closure` is the ablation. Decisions,
+deviations from the blob and gotchas are in
 [NOTES.md](NOTES.md); the plan of record is
 [docs/open-pipeline-plan.md](docs/open-pipeline-plan.md); the reverse-engineered contract
 for each of the eight stages is in [docs/spec/](docs/spec/).

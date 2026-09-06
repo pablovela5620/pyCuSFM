@@ -250,9 +250,11 @@ class PipelineOptions:
     extrinsic_refinement_rounds: int = 20
     """Ceiling on the extrinsics-then-poses rounds the regularised refinement may take; it
     stops early on its own tolerances, after 19 rounds and 3.2 s on Galileo."""
-    loop_closure: bool = False
-    """Run retrieval-based loop closure. Off by default: the plan decides per dataset,
-    and on the 0.93 s Galileo sweep loops move poses further than the ATE budget allows."""
+    loop_closure: bool = True
+    """Run retrieval-based loop closure. On by default, as in the blob, so every run and
+    every blob comparison pays for the same stage (NOTES.md decision 10, revised). On the
+    0.93 s Galileo sweep the 10 s loop gate rejects every candidate, so the stage costs time
+    and changes nothing; `--no-loop-closure` is the explicit ablation."""
     use_gpu: bool = True
     """Run ALIKED and LightGlue on the GPU when one is usable. A bool rather than a
     `DeviceChoice` because `--use-gpu` is the flag the pixi tasks and the plan use; the

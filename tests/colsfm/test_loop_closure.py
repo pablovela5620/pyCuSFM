@@ -383,14 +383,16 @@ def loop_result(scene: SquareRigScene, match_fn: MatchFunction) -> LoopClosureRe
 # --------------------------------------------------------------------------------------
 
 
-def test_the_stage_is_off_by_default(scene: SquareRigScene, match_fn: MatchFunction) -> None:
-    """`LoopClosureConfig.enabled` is False, and nothing runs until a caller flips it.
+def test_the_stage_is_on_by_default_and_disabling_it_is_inert(scene: SquareRigScene, match_fn: MatchFunction) -> None:
+    """`LoopClosureConfig.enabled` is True, as in the blob, and `enabled=False` runs nothing.
 
-    The pose-graph spec measured that loops move Galileo by 5-13 mm against a 5 mm ATE
-    budget, so the default must be inert (`docs/spec/pose_graph_main.md` §8).
+    The default flipped on 2026-09-05 (NOTES.md decision 10, revised) so every run pays for
+    the same stage the blob runs; the disabled path must stay a clean no-op for ablations.
     """
-    assert LoopClosureConfig().enabled is False
-    result: LoopClosureResult = find_loop_edges(scene.frames_meta, scene.database_path, scene.index, LoopClosureConfig(), match_fn)
+    assert LoopClosureConfig().enabled is True
+    result: LoopClosureResult = find_loop_edges(
+        scene.frames_meta, scene.database_path, scene.index, LoopClosureConfig(enabled=False), match_fn
+    )
     assert result.edges == []
     assert result.diagnostics.enabled is False
     assert result.diagnostics.queries == 0

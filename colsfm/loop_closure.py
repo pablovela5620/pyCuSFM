@@ -246,7 +246,9 @@ measurement in this module can reach.
 Where that leaves the stage
 ---------------------------
 
-`LoopClosureConfig.enabled` stays **False**. The estimator is a real improvement — it beats
+`LoopClosureConfig.enabled` is **True** since 2026-09-05 (it was False until then; the blob
+always runs the stage, and the user wants the comparison to pay for it on both sides). The
+paragraph below is the reasoning that kept it off, kept for the record. The estimator is a real improvement — it beats
 the old one by 200 mm and beats running no loops at all, on the frozen pair set and end to
 end — but 401 mm against a 135 mm target is not a result worth switching on by default, and
 the one number that would justify switching it on (agreement with something that is actually
@@ -299,10 +301,11 @@ DEFAULT_MEASUREMENT_THREADS: Final[int] = min(8, os.cpu_count() or 1)
 class LoopClosureConfig:
     """Gates and thresholds for the loop-closure stage."""
 
-    enabled: bool = False
-    """Master switch. Off because loops measurably move Galileo by 5-13 mm against a 5 mm
-    ATE budget (`docs/spec/pose_graph_main.md` §8); they should matter much more on
-    RoboCap. Validate per dataset before turning this on."""
+    enabled: bool = True
+    """Master switch. On by default since 2026-09-05, as in the blob (NOTES.md decision 10,
+    revised): every run and every blob comparison pays for the same stage. On Galileo the
+    10 s loop gate rejects every candidate, so the stage changes nothing there; pass
+    `enabled=False` (`--no-loop-closure`) for an explicit ablation."""
     top_k: int = 20
     """`query_result_number`: retrieval hits considered per query keyframe."""
     good_score_threshold: float | None = None
