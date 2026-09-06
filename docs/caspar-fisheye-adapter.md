@@ -620,3 +620,45 @@ Against the blob's full-sequence reference the slice is not comparable on regist
 images (600 against 4522) and the harness says so; on what is comparable, the blob's
 poses sit 82.76 mm from the input over the same 150 rig frames against CASPAR's 118.29,
 and its reprojection error is 1.486 px against 1.470.
+
+### 9.5 Measured: the full RoboCap sequence
+
+Same two commands as §9.4 on `data/cusfm_runs/robocap_blobref/input` itself (4528
+keyframes, 1132 rig frames, loop closure off as in `pixi run colsfm-robocap`), run back
+to back on an otherwise idle RTX 5090. Reports: `data/bench/robocap_full_ceres_vs_caspar.md`,
+`data/bench/robocap_full_blob_vs_caspar.md`, `data/bench/robocap_full_blob_vs_ceres.md`;
+recordings alongside as `.rrd`.
+
+| | blob cuSFM | RaCo + Ceres | RaCo + CASPAR + polish |
+|---|---:|---:|---:|
+| feature extraction (s) | 183.91 | 86.37 | 87.28 |
+| BoW + loop association + pose graph (s) | 705.66 | 0.24 | 0.25 |
+| matching (s) | 52.53 | 38.50 | 39.83 |
+| triangulation + bundle adjustment (s) | 178.75 | 161.78 | 103.79 |
+| total (s) | 1133.53 | 293.33 | **237.61** |
+| registered images | 4526 / 4528 | 4528 / 4528 | 4527 / 4528 |
+| 3D points | 168 874 | 295 275 | 299 230 |
+| mean reprojection error (px) | 1.486 | 1.458 | 1.520 |
+| rig poses vs input, RMSE (mm) | 334.10 | 462.35 | 381.88 |
+| rig poses vs blob, RMSE (mm) / rotation (deg) | — | 278.19 / 2.750 | 210.78 / 2.108 |
+
+**Speed.** 237.6 s is 0.21x the blob and 0.81x the same pipeline under Ceres. The
+mapping stage fell from 161.8 s to 103.8 s, of which the Ceres polish is 48.6 s (73
+iterations, reprojection 1.570 to 1.520 px): on this map the fp32 solve stops further
+from the optimum than on the 600-image slice, so the polish does more of the work and
+the net mapping gain is 1.56x against the slice's 1.8x. Extraction and matching are
+unchanged, as they should be.
+
+**Agreement.** Ceres and CASPAR agree to 97.5 mm RMSE and 0.99° over 1132 rig frames
+(the slice gave 20 mm over 150). Against the blob, the CASPAR run is the *closer* of
+the two (210.8 mm against Ceres's 278.2 mm, and 238.3 mm for the pycolmap-backend run
+in `data/bench/robocap_compare.md`), and its would-be scale against the input, 0.94015,
+matches the blob's 0.94008 to four digits where the Ceres run drifts to 0.93210. The
+reprojection error is 4 % worse than Ceres, as everywhere else CASPAR has been measured.
+All three bench_cli bounds pass against both references; RoboCap has no ground truth.
+
+**Pixel evidence.** `/tmp/rerun-viewer-validation/robocap-full-caspar/01-blob-vs-caspar.png`
+and `02-ceres-vs-caspar.png`, captured from a headless 0.37.1 viewer loading each saved
+`.rrd` through `ViewerClient` (`capture.py` and `notes.md` alongside): both coloured point
+clouds, three trajectories (blob or Ceres, CASPAR, input) tracing the same multi-loop walk,
+and the report panel showing the numbers above.
