@@ -33,6 +33,7 @@ results.
 | `matching_trt.py` | The same stage through the blob's own `lightglue_aliked.onnx` and its FP16 engine. The only path with the per-match score, so it runs the real SSC before verification instead of the score-free grid subsample. `--matching-backend tensorrt`. |
 | `matching_raco.py` | The same stage through LightGlue+, the matcher fabio-sim trained against RaCo-ALIKED. `match_pairs_tensorrt` does the work; this module supplies the graph and the normalised keypoint frame it wants. `--matching-backend raco`. |
 | `retrieval.py` | Image retrieval for loop closure, brute force or vocabulary tree. The replacement for `generate_bow_vocabulary_main` and `generate_bow_index_main`. |
+| `loop_shortlist.py` | The retrieval half of the loop funnel — the gates, the `|dt|` banding, the rig-pair deduplication and the counters they fill. It reads no match at all, which is why the loop stage no longer has to run itself twice to learn its pair list. |
 | `loop_closure.py` | Loop-closure candidate selection, gating and rig-edge assembly. The replacement for `generate_association_main`'s `RetrievalLoopAssociations`. `plan_loop_search` decides which rig pairs to measure and which image pairs that needs *without matching anything*; `verify_loop_plan` is the only pass that reads a match. |
 | `loop_pose.py` | The metric rig-to-rig relative pose a loop edge carries: a local triangulated map in the source rig frame, then generalized resection of the target rig. The replacement for `StereoPoseEstimator`. |
 | `pose_graph.py` | Rig-level pose graph optimisation on pyceres with a Python residual. The replacement for `pose_graph_main`. |
@@ -44,6 +45,9 @@ results.
 | `point_filters.py` | The guards that run after a solve: a point outside the world, a point inside a camera, a projection that is not finite. |
 | `mapping_result.py` | What a mapping pass reports: its rounds, its closing Ceres polish and its final model. |
 | `solver_report.py` | The one reader of Ceres' brief report. Unavailable statistics stay `None` rather than becoming a zero-cost solve — which is the normal outcome on the CASPAR backend, since it writes no Ceres line at all. |
+| `extrinsic_observations.py` | The observation graph the refinement solves over: which image saw which point and where, indexed once per stage and folded in per round. |
+| `extrinsic_costs.py` | What Ceres gets from one residual block: the rig reprojection cost with its analytic pose Jacobian, and the repeated-Cauchy loss. |
+| `extrinsic_solve.py` | Problem assembly: `ExtrinsicRefinementOptions`, the three block builders and `solve_extrinsics`. |
 | `extrinsic_refinement.py` | Regularised rig-extrinsic refinement: cuSFM's absolute (Eq. 14) and inter-camera relative (Eq. 6) extrinsic priors in pyceres, alternated with pycolmap's own bundle adjustment. What `--optimize-extrinsics` runs by default, because pycolmap's rig BA carries no prior term. |
 | `export.py` | Writers for the four artifacts a cuSFM run leaves behind: the `sparse/` model, `kpmap/keyframes/frames_meta.json`, the TUM pose files and `runtime.csv`. The replacement for `kpmap_to_colmap`, `extract_pose_from_map_main` and `update_keyframe_pose_main`. |
 | `benchmark.py` | Metrics that compare two runs in the cuSFM output layout, plus the acceptance bounds. It reads both runs the same way and knows nothing about which producer wrote which. Re-exports the names `alignment` and `runtime` own, so one import still covers a whole comparison. |
@@ -69,10 +73,10 @@ row per stage under these names:
 | 2 | `feature_extraction` | `database`, `cameras`, `features`, `features_trt`, `features_raco` | `feature_extractor_main` (per-image half) |
 | 3 | `pair_selection` | `pairs` | `feature_matcher_task_builder_main` |
 | 4 | `matching` | `matching`, `matching_trt`, `matching_raco` | `feature_matcher_main` |
-| 5 | `loop_closure` | `retrieval`, `loop_closure`, `loop_pose` | `generate_bow_*_main` + `generate_association_main` |
+| 5 | `loop_closure` | `retrieval`, `loop_shortlist`, `loop_closure`, `loop_pose` | `generate_bow_*_main` + `generate_association_main` |
 | 6 | `pose_graph` | `pose_graph` | `pose_graph_main` |
 | 7 | `reconstruction` | `reconstruction`, `mapping`, `correspondences`, `point_filters`, `ba_backend` | `keypoints_mapper_main` |
-| 7b | `extrinsic_refinement` | `reconstruction`, `mapping`, `extrinsic_refinement` | `keypoints_mapper_main --optimize_extrinsics=True` (only with `--optimize-extrinsics`) |
+| 7b | `extrinsic_refinement` | `reconstruction`, `mapping`, `extrinsic_refinement`, `extrinsic_observations`, `extrinsic_costs`, `extrinsic_solve` | `keypoints_mapper_main --optimize_extrinsics=True` (only with `--optimize-extrinsics`) |
 | 8 | `export` | `export` | `kpmap_to_colmap`, `extract_pose_from_map_main`, `update_keyframe_pose_main` |
 
 Each stage is a `run_<stage>_stage` function returning a small result dataclass, and
