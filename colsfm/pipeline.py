@@ -37,14 +37,15 @@ Ordering notes worth knowing before reading the code:
   two-view geometry, so a loop pair matched in stage 5 reaches the triangulator
   without being named in stage 3's list.
 * **Loop closure needs matches to verify, and matching is a batch operation.**
-  `colsfm.loop_closure.find_loop_edges` pulls matches through an injected
-  `match_fn` one pair at a time, and running COLMAP's matcher per pair would
-  reload the LightGlue graph per call. The stage therefore runs the search
-  twice: once with a recording `match_fn` that returns nothing (which collects
-  the candidate pairs — the candidate set depends only on retrieval, the score
-  gate and the time gate, never on the matches), then one batch
-  `colsfm.matching.match_pairs` over those pairs, then the real search reading
-  matches back from the database.
+  The estimator pulls matches through an injected `match_fn` one pair at a time,
+  and running COLMAP's matcher per pair would reload the LightGlue graph per
+  call. So the stage plans first: `colsfm.loop_closure.plan_loop_search` does the
+  retrieval half of the funnel — which reads no match at all — and names the
+  image pairs the measurement will ask for; one batch
+  `colsfm.matching.match_pairs` fills in whichever of them the database does not
+  already hold; `verify_loop_plan` then measures and gates the plan, reading the
+  matches back. Presence decides what to match, not count: a pair stage 4
+  matched and found nothing in is finished work.
 * **`--optimize-extrinsics` maps once, not twice.** The camera-referenced
   reconstruction is built up front when the flag is set, stage 7 maps it, and
   stage 7b refines the extrinsics of the model stage 7 left behind. Both
@@ -97,7 +98,7 @@ from colsfm.database import (
     ImagePair,
     Keypoints,
     create_database,
-    raw_match_counts,
+    pairs_with_matches,
     read_descriptors_from_database,
     read_keypoints_batch,
 )
@@ -116,7 +117,14 @@ from colsfm.features import DeviceChoice, ExtractionReport, FeatureBackend, Feat
 from colsfm.frames_meta import FRAMES_META_NAME, CameraParams, FramesMeta, RigFrame, read_frames_meta, write_frames_meta
 from colsfm.geometry import MILLIMETRES_PER_METRE, TumPose, relative_rotation_degrees
 from colsfm.keyframe_selection import KeyframeSelection, apply_selection, select_keyframes
-from colsfm.loop_closure import LoopClosureConfig, LoopClosureDiagnostics, LoopClosureResult, find_loop_edges
+from colsfm.loop_closure import (
+    LoopClosureConfig,
+    LoopClosureDiagnostics,
+    LoopClosureResult,
+    LoopSearchPlan,
+    plan_loop_search,
+    verify_loop_plan,
+)
 from colsfm.mapping import MappingOptions, MappingResult, PolishStats, run_mapping
 from colsfm.matching import (
     BLOB_MATCH_TOP_K,
@@ -201,10 +209,6 @@ log line. See `write_loop_edges`."""
 
 SUMMARY_NAME: Final[str] = "summary.json"
 """Machine-readable run report, written by this pipeline and by nothing in cuSFM."""
-
-LOOP_PROBE_MATCHES: Final[Int[ndarray, "0 2"]] = np.zeros((0, 2), dtype=np.int64)
-"""What the recording `match_fn` returns: no matches, so no candidate is verified."""
-
 
 @serde
 @dataclass(frozen=True, slots=True)
@@ -977,11 +981,16 @@ def run_loop_closure_stage(
 ) -> LoopClosureStageResult:
     """Retrieve, match and verify loop candidates.
 
+    Three steps, none of which matches anything it does not have to: `plan_loop_search`
+    decides which rig pairs to measure and which image pairs that needs, one batch
+    `match_pairs` fills in whatever the database does not already hold, and
+    `verify_loop_plan` measures and gates the plan.
+
     Args:
         frames_meta: The selected collection, in the pose graph's frame conventions.
         database_path: The database holding the keypoints and descriptors.
         pose_graph_config: `pose_graph_config.pb.txt`, whose loop gates this honours.
-        matching_options: Settings for the batch match over the candidate pairs.
+        matching_options: Settings for the batch match over the missing pairs.
         enabled: Whether to run at all.
 
     Returns:
@@ -1000,38 +1009,33 @@ def run_loop_closure_stage(
     print(f"[colsfm] loop closure: retrieval index over {len(index.image_ids)} images in {index.build_seconds:.2f}s")
 
     config: LoopClosureConfig = LoopClosureConfig.from_pose_graph(pose_graph_config)
-    # Read once for both passes: the keypoints are the same file either side of the batch
-    # match, and on RoboCap they are 148 MB.
+    # Read once and handed to the plan: the keypoints are the same file either side of
+    # the batch match, and on RoboCap they are 148 MB.
     keypoints: dict[int, Keypoints] = read_keypoints_batch(database_path, index.image_ids, dtype=np.float64)
-    requested: set[ImagePair] = set()
 
-    def record_pair(image_id_a: int, image_id_b: int) -> Int[ndarray, "num_matches 2"]:
-        """Record a candidate pair and return no matches, so nothing verifies."""
-        requested.add((min(image_id_a, image_id_b), max(image_id_a, image_id_b)))
-        return LOOP_PROBE_MATCHES
-
-    find_loop_edges(frames_meta, database_path, index, config, record_pair, keypoints)
-    requested_pairs: list[ImagePair] = sorted(requested)
-    # Most requested pairs are the consecutive and stereo pairs stage 4 already matched
-    # (8 400 of 14 443 on RoboCap); matching them again would only cost time.
-    already_matched: dict[ImagePair, int] = raw_match_counts(database_path, requested_pairs)
-    candidate_pairs: list[ImagePair] = [pair for pair in requested_pairs if already_matched[pair] == 0]
+    plan: LoopSearchPlan = plan_loop_search(frames_meta, database_path, index, config, keypoints)
+    # Presence, not count: a pair stage 4 matched and found nothing in is finished work,
+    # and matching it again would cost a matcher call to produce the same nothing. Most
+    # of the plan is stage 4's own consecutive and stereo pairs (8 400 of 14 443 on
+    # RoboCap), which is what makes this check worth making at all.
+    present: set[ImagePair] = pairs_with_matches(database_path, plan.image_pairs)
+    missing_pairs: list[ImagePair] = [pair for pair in plan.image_pairs if pair not in present]
     print(
-        f"[colsfm] loop closure: {len(requested_pairs)} candidate pairs, "
-        f"{len(requested_pairs) - len(candidate_pairs)} already matched, {len(candidate_pairs)} to match"
+        f"[colsfm] loop closure: {len(plan.rig_pairs)} shortlisted rig pairs need "
+        f"{len(plan.image_pairs)} image pairs, {len(present)} already matched, {len(missing_pairs)} to match"
     )
-    if candidate_pairs:
-        match_pairs(database_path, candidate_pairs, matching_options)
+    if missing_pairs:
+        match_pairs(database_path, missing_pairs, matching_options)
 
-    # One handle for the whole verification pass: a candidate set of tens of thousands of
-    # pairs would otherwise pay a SQLite open and close per `match_fn` call.
+    # One handle for the whole verification pass: a plan of tens of thousands of pairs
+    # would otherwise pay a SQLite open and close per `match_fn` call.
     with pycolmap.Database.open(database_path) as database:
 
         def read_matches(image_id_a: int, image_id_b: int) -> Int[ndarray, "num_matches 2"]:
             """Read one pair's raw matches back out of the database."""
             return np.asarray(database.read_matches(image_id_a, image_id_b), dtype=np.int64)
 
-        result: LoopClosureResult = find_loop_edges(frames_meta, database_path, index, config, read_matches, keypoints)
+        result: LoopClosureResult = verify_loop_plan(plan, read_matches)
     edges: list[PoseGraphEdge] = list(result.edges)
     # Print the counters, not just the edge count: zero edges is the normal outcome on a
     # short or a low-recall sequence, and only the rejection breakdown says which it was.
@@ -1040,10 +1044,10 @@ def run_loop_closure_stage(
         f"{result.diagnostics.candidates_retrieved} retrieved, {result.diagnostics.rejected_by_score} below score, "
         f"{result.diagnostics.rejected_by_time} inside the {result.diagnostics.min_time_gap_seconds:.2f}s gap, "
         f"{result.diagnostics.rejected_by_geometry} failed geometry, {result.diagnostics.rejected_by_is_good} not good, "
-        f"{result.diagnostics.verified} verified over {len(requested_pairs)} candidate pairs"
+        f"{result.diagnostics.verified} verified over {len(plan.image_pairs)} image pairs"
     )
     return LoopClosureStageResult(
-        edges=edges, num_pairs_matched=len(candidate_pairs), diagnostics=result.diagnostics
+        edges=edges, num_pairs_matched=len(missing_pairs), diagnostics=result.diagnostics
     )
 
 

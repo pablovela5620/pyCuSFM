@@ -273,7 +273,7 @@ from typing import Final
 import numpy as np
 
 from colsfm.config import PoseGraphConfig
-from colsfm.database import read_keypoints_batch
+from colsfm.database import ImagePair, read_keypoints_batch
 from colsfm.frames_meta import FramesMeta, KeyframeMeta
 from colsfm.geometry import MICROSECONDS_PER_SECOND
 from colsfm.loop_pose import (
@@ -288,6 +288,7 @@ from colsfm.loop_pose import (
     RigPoseOutcome,
     RigPoseRejection,
     RigPoseRejectionReason,
+    required_image_pairs,
 )
 from colsfm.pose_graph import Information6, PoseGraphEdge, gate_loop_edges, loop_edge_information
 from colsfm.retrieval import GOOD_SCORE_THRESHOLD, RetrievalIndex, RetrievalQuery
@@ -680,41 +681,100 @@ def select_best_candidates(hits: Sequence[RetrievalHit], band_seconds: float) ->
 # ======================================================================================
 
 
-def find_loop_edges(
+@dataclass(frozen=True, slots=True)
+class LoopSearchPlan:
+    """Everything the loop search will do, decided before a single match exists.
+
+    The stage used to discover its own pair list by *executing* itself: it ran the
+    whole search — retrieval, shortlisting, local-map triangulation, the observation
+    walk — against a matcher that recorded the pairs it was asked for and returned
+    nothing, threw the result away, batch-matched what it had collected, and ran the
+    search a second time for real. Pair scheduling therefore depended on driving the
+    geometric verification path with deliberately false input, and every future
+    change to verification became a change to scheduling.
+
+    Nothing in the first pass needed matches. Retrieval, the score and time gates,
+    the `|dt|` banding and the rig-pair deduplication read the index and the
+    timestamps; the pair list follows from the rig geometry and the shortlist
+    (`colsfm.loop_pose.required_image_pairs`). So the plan is simply that work, done
+    once, and `verify_loop_plan` is the only pass that matches anything.
+    """
+
+    config: LoopClosureConfig
+    """The gates and thresholds the plan was made under, and will be verified under."""
+    enabled: bool
+    """Whether the stage runs at all; a disabled plan asks for nothing and verifies nothing."""
+    rig_pairs: tuple[tuple[int, int], ...]
+    """The shortlisted `(source rig id, target rig id)` pairs, in measurement order.
+
+    Directed as the retrieval hit that survived deduplication was directed, and grouped
+    by source rig frame, because a source triangulates its local map once however many
+    candidates it has. One entry per unordered rig pair."""
+    image_pairs: tuple[ImagePair, ...]
+    """Every image pair the measurement will ask for, normalised, deduplicated and sorted.
+
+    The caller batch-matches whichever of these the database does not already hold,
+    which is what makes one matcher load serve the whole stage."""
+    groups: tuple[tuple[int, tuple[RetrievalHit, ...]], ...]
+    """The measurement's own units: one source rig frame and its shortlisted hits."""
+    geometry: RigGeometry
+    """The rig's cameras, extrinsics and stereo declarations."""
+    rig_index: RigFrameIndex
+    """Rig frames in capture order with their prior poses."""
+    keypoints: Mapping[int, Keypoints]
+    """Keypoint pixels per image id, read once — 148 MB on RoboCap."""
+    counters: _FunnelCounters
+    """The funnel so far: retrieval's own counters, which `verify_loop_plan` finishes."""
+    duration_seconds: float
+    """Session length, for the diagnostics."""
+    gap_seconds: float
+    """The temporal gate actually applied, for the diagnostics."""
+    score_threshold: float
+    """The resolved retrieval score gate, for the diagnostics."""
+
+    @property
+    def queries(self) -> int:
+        """Retrieval queries the plan issued.
+
+        Returns:
+            The count, which is final: retrieval happens once, in planning.
+        """
+        return self.counters.queries
+
+    @property
+    def candidates_retrieved(self) -> int:
+        """Retrieval hits the index returned before any gate.
+
+        Returns:
+            The count, which is final for the same reason.
+        """
+        return self.counters.candidates_retrieved
+
+
+def plan_loop_search(
     frames_meta: FramesMeta,
     database_path: Path,
     index: RetrievalIndex,
     config: LoopClosureConfig,
-    match_fn: MatchFunction,
     keypoints: Mapping[int, Keypoints] | None = None,
-) -> LoopClosureResult:
-    """Retrieve, shortlist, measure and gate loop candidates into rig-level pose-graph edges.
+) -> LoopSearchPlan:
+    """Decide which rig pairs to measure and which image pairs that needs, matching nothing.
 
-    The funnel is: retrieval hits, the score, time and same-rig gates, one hit per `|dt|`
-    band per query, one rig pair overall, then `colsfm.loop_pose.RigPoseEstimator` on each
-    surviving rig pair and `gate_loop_edges` on the result. Everything before the estimator
-    needs only the retrieval index and the timestamps, which is what lets a caller run the
-    whole stage once with a matcher that returns nothing to learn the pair list, then match
-    it, then run it again for real (`colsfm.pipeline._find_loop_edges`).
-
-    Returns a `LoopClosureResult` rather than a bare list so the caller can report why a run
-    produced no edge, which is the normal outcome on a short sequence.
+    The retrieval half of the funnel: hits, the score, time and same-rig gates, one hit
+    per `|dt|` band per query, then one hit per unordered rig pair. None of it reads a
+    match, which is exactly why the discovery run was unnecessary.
 
     Args:
         frames_meta: Parsed `frames_meta.json`; supplies the rig grouping, the prior poses
             the local map is triangulated with, the rig extrinsics and the calibration.
-        database_path: COLMAP database holding the keypoints `match_fn`'s indices refer to.
-            Only read when `keypoints` is None.
+        database_path: COLMAP database holding the keypoints. Only read when `keypoints`
+            is None.
         index: Retrieval index over the same keyframe ids.
-        config: Gates and thresholds. Nothing runs unless `config.enabled`.
-        match_fn: `match_fn(image_id_a, image_id_b) -> Int[ndarray, "m 2"]`.
-        keypoints: Keypoint pixels per image id, already read. A caller that runs the stage
-            twice — once to learn the pair list, once for real — should read them once and
-            pass them to both, because the read is 148 MB on RoboCap and the first pass never
-            looks at them.
+        config: Gates and thresholds. Nothing is planned unless `config.enabled`.
+        keypoints: Keypoint pixels per image id, already read; read here when None.
 
     Returns:
-        The gated loop edges and the diagnostics of the run.
+        The plan, which `verify_loop_plan` turns into edges.
 
     Raises:
         FileNotFoundError: When `database_path` does not exist, the stage is enabled and no
@@ -726,13 +786,24 @@ def find_loop_edges(
     gap_seconds: float = minimum_time_gap_seconds(list(timestamps_us.values()), config)
     score_threshold: float = GOOD_SCORE_THRESHOLD if config.good_score_threshold is None else config.good_score_threshold
     counters: _FunnelCounters = _FunnelCounters()
+    empty_geometry: RigGeometry = rig_geometry(frames_meta)
 
     if not config.enabled:
         print("Loop closure is disabled; set LoopClosureConfig.enabled to run it.")
-        empty: LoopClosureDiagnostics = counters.freeze(
-            enabled=False, duration_seconds=duration_seconds, gap_seconds=gap_seconds, score_threshold=score_threshold, edges=0
+        return LoopSearchPlan(
+            config=config,
+            enabled=False,
+            rig_pairs=(),
+            image_pairs=(),
+            groups=(),
+            geometry=empty_geometry,
+            rig_index=rig_frame_index(frames_meta),
+            keypoints={},
+            counters=counters,
+            duration_seconds=duration_seconds,
+            gap_seconds=gap_seconds,
+            score_threshold=score_threshold,
         )
-        return LoopClosureResult(edges=[], diagnostics=empty)
 
     shortlist: dict[tuple[int, int], RetrievalHit] = _shortlist_rig_pairs(
         frames_meta, index, config, keyframe_by_id, timestamps_us, gap_seconds, score_threshold, counters
@@ -740,7 +811,58 @@ def find_loop_edges(
     pixels: Mapping[int, Keypoints] = (
         read_keypoints_batch(database_path, index.image_ids, dtype=np.float64) if keypoints is None else keypoints
     )
-    candidates: list[LoopCandidate] = _measure_rig_pairs(frames_meta, config, shortlist, pixels, match_fn, counters)
+    groups: list[tuple[int, tuple[RetrievalHit, ...]]] = _group_by_source_rig(shortlist)
+    rig_pairs: tuple[tuple[int, int], ...] = tuple(
+        (source_rig_id, hit.target_rig_id) for source_rig_id, hits in groups for hit in hits
+    )
+    rig_index: RigFrameIndex = rig_frame_index(frames_meta)
+    return LoopSearchPlan(
+        config=config,
+        enabled=True,
+        rig_pairs=rig_pairs,
+        image_pairs=required_image_pairs(rig_index, empty_geometry, pixels, config.rig_pose, rig_pairs),
+        groups=tuple(groups),
+        geometry=empty_geometry,
+        rig_index=rig_index,
+        keypoints=pixels,
+        counters=counters,
+        duration_seconds=duration_seconds,
+        gap_seconds=gap_seconds,
+        score_threshold=score_threshold,
+    )
+
+
+def verify_loop_plan(plan: LoopSearchPlan, match_fn: MatchFunction) -> LoopClosureResult:
+    """Measure and gate a planned search; the only pass that reads a match.
+
+    Args:
+        plan: What `plan_loop_search` decided.
+        match_fn: `match_fn(image_id_a, image_id_b) -> Int[ndarray, "m 2"]`, which the
+            caller has by now given every pair of `plan.image_pairs` to match.
+
+    Returns:
+        The gated loop edges and the diagnostics of the whole funnel, retrieval's half
+        included.
+    """
+    config: LoopClosureConfig = plan.config
+    if not plan.enabled:
+        empty: LoopClosureDiagnostics = plan.counters.freeze(
+            enabled=False,
+            duration_seconds=plan.duration_seconds,
+            gap_seconds=plan.gap_seconds,
+            score_threshold=plan.score_threshold,
+            edges=0,
+        )
+        return LoopClosureResult(edges=[], diagnostics=empty)
+
+    estimator: RigPoseEstimator = RigPoseEstimator(
+        index=plan.rig_index,
+        geometry=plan.geometry,
+        keypoints=plan.keypoints,
+        match_fn=match_fn,
+        config=config.rig_pose,
+    )
+    candidates: list[LoopCandidate] = _measure_groups(list(plan.groups), estimator, config, plan.counters)
 
     edges: list[PoseGraphEdge] = []
     for candidate in candidates:
@@ -759,10 +881,46 @@ def find_loop_edges(
             )
         )
     gated: list[PoseGraphEdge] = gate_loop_edges(edges, max_translation_m=config.max_translation_m, max_rotation_deg=config.max_rotation_deg)
-    diagnostics: LoopClosureDiagnostics = counters.freeze(
-        enabled=True, duration_seconds=duration_seconds, gap_seconds=gap_seconds, score_threshold=score_threshold, edges=len(gated)
+    diagnostics: LoopClosureDiagnostics = plan.counters.freeze(
+        enabled=True,
+        duration_seconds=plan.duration_seconds,
+        gap_seconds=plan.gap_seconds,
+        score_threshold=plan.score_threshold,
+        edges=len(gated),
     )
     return LoopClosureResult(edges=gated, diagnostics=diagnostics, candidates=candidates)
+
+
+def find_loop_edges(
+    frames_meta: FramesMeta,
+    database_path: Path,
+    index: RetrievalIndex,
+    config: LoopClosureConfig,
+    match_fn: MatchFunction,
+    keypoints: Mapping[int, Keypoints] | None = None,
+) -> LoopClosureResult:
+    """Plan a loop search and verify it in one call.
+
+    The convenient form for a caller whose `match_fn` can answer any pair on demand — a
+    synthetic scene, a notebook. `colsfm.pipeline` uses the two halves instead, because
+    COLMAP's matcher is a batch operation and the plan is what says which batch.
+
+    Args:
+        frames_meta: Parsed `frames_meta.json`.
+        database_path: COLMAP database holding the keypoints `match_fn`'s indices refer to.
+        index: Retrieval index over the same keyframe ids.
+        config: Gates and thresholds. Nothing runs unless `config.enabled`.
+        match_fn: `match_fn(image_id_a, image_id_b) -> Int[ndarray, "m 2"]`.
+        keypoints: Keypoint pixels per image id, already read; read here when None.
+
+    Returns:
+        The gated loop edges and the diagnostics of the run.
+
+    Raises:
+        FileNotFoundError: When `database_path` does not exist, the stage is enabled and no
+            `keypoints` were given.
+    """
+    return verify_loop_plan(plan_loop_search(frames_meta, database_path, index, config, keypoints), match_fn)
 
 
 def _query_camera_ids(frames_meta: FramesMeta) -> set[int]:
@@ -905,15 +1063,13 @@ def _group_by_source_rig(shortlist: Mapping[tuple[int, int], RetrievalHit]) -> l
     return [(source_rig_id, tuple(hits)) for source_rig_id, hits in groups.items()]
 
 
-def _measure_rig_pairs(
-    frames_meta: FramesMeta,
+def _measure_groups(
+    groups: list[tuple[int, tuple[RetrievalHit, ...]]],
+    estimator: RigPoseEstimator,
     config: LoopClosureConfig,
-    shortlist: Mapping[tuple[int, int], RetrievalHit],
-    keypoints: Mapping[int, Keypoints],
-    match_fn: MatchFunction,
     counters: _FunnelCounters,
 ) -> list[LoopCandidate]:
-    """Run the metric rig-to-rig estimator over the shortlisted rig pairs.
+    """Run the metric rig-to-rig estimator over the planned measurement groups.
 
     Pairs are grouped by source rig frame so that one source triangulates its local map once
     however many candidates it has, and the groups are measured on `config.num_threads`
@@ -921,22 +1077,15 @@ def _measure_rig_pairs(
     accumulated here, after the join, so the result does not depend on the thread count.
 
     Args:
-        frames_meta: The parsed metadata.
+        groups: One `(source rig id, hits)` group per source rig frame, as the plan ordered
+            them.
+        estimator: The estimator, already carrying the matcher that can answer the plan.
         config: Gates and thresholds.
-        shortlist: The best hit per unordered rig pair.
-        keypoints: Keypoint pixels per image id.
-        match_fn: The injected matcher.
         counters: Diagnostic counters, mutated in place.
 
     Returns:
         One verified candidate per rig pair that passed every gate, in rig-pair order.
     """
-    geometry: RigGeometry = rig_geometry(frames_meta)
-    rig_index: RigFrameIndex = rig_frame_index(frames_meta)
-    estimator: RigPoseEstimator = RigPoseEstimator(
-        index=rig_index, geometry=geometry, keypoints=keypoints, match_fn=match_fn, config=config.rig_pose
-    )
-    groups: list[tuple[int, tuple[RetrievalHit, ...]]] = _group_by_source_rig(shortlist)
 
     def measure(group: tuple[int, tuple[RetrievalHit, ...]]) -> list[RigPoseOutcome]:
         """Measure one source rig frame's candidates against its own local map."""

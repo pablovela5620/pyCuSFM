@@ -294,6 +294,29 @@ def _counts_by_pair(pair_ids: Sequence[int], counts: Sequence[int]) -> dict[Imag
     return {pycolmap.pair_id_to_image_pair(pair_id): int(count) for pair_id, count in zip(pair_ids, counts, strict=True)}
 
 
+def pairs_with_matches(database_path: Path, pairs: Sequence[ImagePair]) -> set[ImagePair]:
+    """Which of these pairs the database has already matched, whatever the count.
+
+    Presence, not count. A pair the matcher ran and found nothing for is *finished
+    work*: matching it again costs a matcher call and produces the same nothing.
+    The loop stage used to ask `raw_match_counts` and treat `== 0` as "not matched",
+    so a completed zero-match pair was indistinguishable from missing work.
+
+    `exists_matches` rather than `read_num_matches`: COLMAP's bulk count query is
+    `WHERE rows > 0`, so it cannot see the very rows this function exists to find.
+    One open handle and one indexed lookup per pair; 14 443 pairs cost milliseconds.
+
+    Args:
+        database_path: An existing database.
+        pairs: Image pairs to look up, in any order.
+
+    Returns:
+        The subset of `pairs` that has a matches row, zero-match rows included.
+    """
+    with pycolmap.Database.open(database_path) as database:
+        return {pair for pair in pairs if database.exists_matches(pair[0], pair[1])}
+
+
 def pair_inlier_counts(database_path: Path, pairs: Sequence[ImagePair]) -> dict[ImagePair, int]:
     """Count the verified inlier matches of many pairs in one pass.
 

@@ -16,6 +16,8 @@ from colsfm.database import (
     image_ids_by_name,
     keypoint_counts,
     pair_inlier_counts,
+    pairs_with_matches,
+    raw_match_counts,
     read_keypoints,
     read_two_view_geometry,
 )
@@ -145,6 +147,36 @@ def test_keypoint_and_geometry_readers(galileo: FramesMeta, tmp_path: Path) -> N
     counts: dict[ImagePair, int] = pair_inlier_counts(database_path, pairs)
     assert counts[(first, second)] == 3
     assert counts[(second, galileo.keyframes[2].keyframe_id)] == 0
+
+
+def test_a_matched_pair_with_no_matches_is_present_but_uncounted(galileo: FramesMeta, tmp_path: Path) -> None:
+    """`pairs_with_matches` reports finished work; `raw_match_counts` reports how much of it.
+
+    The loop-closure stage used to ask for counts and treat 0 as "not matched", so a
+    pair the matcher had already run and found nothing in was re-matched to produce
+    the same nothing. Presence and count are different questions and now have
+    different readers.
+    """
+    database_path: Path = tmp_path / "presence.db"
+    create_database(database_path, galileo)
+    first, second, third = (keyframe.keyframe_id for keyframe in galileo.keyframes[:3])
+
+    database: pycolmap.Database = pycolmap.Database.open(database_path)
+    database.write_matches(first, second, np.array([[0, 1], [1, 2]], dtype=np.uint32))
+    database.write_matches(first, third, np.zeros((0, 2), dtype=np.uint32))
+    database.close()
+
+    matched: ImagePair = (min(first, second), max(first, second))
+    empty: ImagePair = (min(first, third), max(first, third))
+    never: ImagePair = (min(second, third), max(second, third))
+
+    present: set[ImagePair] = pairs_with_matches(database_path, [matched, empty, never])
+    assert present == {matched, empty}, "an empty result is a result; only `never` is missing work"
+
+    counts: dict[ImagePair, int] = raw_match_counts(database_path, [matched, empty, never])
+    assert counts[matched] == 2
+    assert counts[empty] == 0
+    assert counts[never] == 0
 
 
 def test_selected_subset_only_writes_kept_frames(galileo: FramesMeta, tmp_path: Path) -> None:
