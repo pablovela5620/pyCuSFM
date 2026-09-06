@@ -56,7 +56,6 @@ against the blob reference and against a colsfm run directly:
 
 from __future__ import annotations
 
-import math
 import os
 import shutil
 import sys
@@ -76,9 +75,10 @@ from serde import serde
 from colsfm.benchmark import ReconstructionMetrics, write_json_report
 from colsfm.cameras import COLMAP_MODEL_BY_PROJECTION_MODEL, colmap_camera_parameters
 from colsfm.export import KEYFRAME_METADATA_SUBPATH, colour_points_from_images, write_colmap_model, write_optimised_frames_meta, write_pose_files
-from colsfm.frames_meta import FRAMES_META_NAME, CameraParams, FramesMeta, KeyframeMeta, read_frames_meta
+from colsfm.frames_meta import FRAMES_META_NAME, FramesMeta, KeyframeMeta, read_frames_meta
 from colsfm.mapping import caspar_supported_camera_models
 from colsfm.reconstruction import RigReference, rig_reference
+from colsfm.rig_calibration import ExtrinsicDelta, extrinsic_deltas, reference_camera_params_id, rig_config
 from tools.audit.colmap_baseline_galileo import (
     EXTRACTOR_BY_CHOICE,
     MATCHER_BY_CHOICE,
@@ -87,7 +87,6 @@ from tools.audit.colmap_baseline_galileo import (
     StageClock,
     _summarise,
 )
-from tools.audit.colmap_rig_baseline_galileo import ExtrinsicDelta
 
 STAGED_IMAGE_DIR_NAME: str = "images"
 """Symlink tree written inside the run directory; see `stage_images`."""
@@ -97,9 +96,6 @@ CUSFM_DIR_NAME: str = "cusfm"
 
 COLMAP_LOG_NAME: str = "colmap.log"
 """COLMAP's own glog output, captured by redirecting the process's stderr."""
-
-MILLIMETRES_PER_METRE: float = 1000.0
-"""Extrinsic deltas are reported in millimetres, like every other length here."""
 
 CASPAR_UNSUPPORTED_MODEL_MARKER: str = "unsupported camera model"
 """`bundle_adjustment_caspar.cc` logs this when it drops an observation whose camera
@@ -260,18 +256,6 @@ def captured_stderr(path: Path) -> Iterator[None]:
         os.close(saved)
 
 
-def reference_camera_params_id(frames_meta: FramesMeta) -> int:
-    """Pick the rig's reference camera: the one owning the lowest keyframe id.
-
-    Args:
-        frames_meta: The parsed metadata.
-
-    Returns:
-        The reference `camera_params_id`.
-    """
-    return min(frames_meta.keyframes, key=lambda item: item.keyframe_id).camera_params_id
-
-
 def stage_images(frames_meta: FramesMeta, input_dir: Path, staged_root: Path) -> StagedImages:
     """Build the symlink tree whose file names group into rig frames.
 
@@ -359,50 +343,6 @@ def extract(config: ColmapRigBaselineRobocapConfig, frames_meta: FramesMeta, sta
         )
         print(f"[audit-robocap] extracted {len(names)} images of camera {camera_params_id} ({camera.sensor_name})")
     return camera_model
-
-
-def calibrated_cam_from_rig(frames_meta: FramesMeta, reference: RigReference) -> dict[int, pycolmap.Rigid3d]:
-    """The calibration's `cam_from_rig` per camera, the reference at identity.
-
-    Args:
-        frames_meta: The parsed metadata.
-        reference: The rig origin and its `vehicle_T_cam_ref` bridge.
-
-    Returns:
-        `cam_from_rig` per `camera_params_id`.
-    """
-    return {
-        camera_params_id: camera.vehicle_T_cam.inverse() * reference.vehicle_T_reference
-        for camera_params_id, camera in sorted(frames_meta.cameras.items())
-    }
-
-
-def rig_config(frames_meta: FramesMeta, reference: RigReference) -> pycolmap.RigConfig:
-    """Describe the rig the way `apply_rig_config` wants it.
-
-    Args:
-        frames_meta: The parsed metadata.
-        reference: The rig origin and its bridge.
-
-    Returns:
-        A config listing every camera by `image_prefix`, one of them the
-        reference sensor and the rest carrying `cam_from_rig`.
-    """
-    calibrated: dict[int, pycolmap.Rigid3d] = calibrated_cam_from_rig(frames_meta, reference)
-    # Reference first: `Rig::AddSensor` refuses to run before a reference sensor exists.
-    ordered: list[int] = sorted(frames_meta.cameras, key=lambda item: (item != reference.camera_params_id, item))
-    cameras: list[pycolmap.RigConfigCamera] = []
-    for camera_params_id in ordered:
-        camera: CameraParams = frames_meta.cameras[camera_params_id]
-        entry: pycolmap.RigConfigCamera = pycolmap.RigConfigCamera()
-        entry.image_prefix = f"{camera.sensor_name}/"
-        entry.ref_sensor = camera_params_id == reference.camera_params_id
-        if not entry.ref_sensor:
-            entry.cam_from_rig = calibrated[camera_params_id]
-        cameras.append(entry)
-    config: pycolmap.RigConfig = pycolmap.RigConfig()
-    config.cameras = cameras
-    return config
 
 
 def pairing_options(config: ColmapRigBaselineRobocapConfig, loop_detection: bool) -> pycolmap.SequentialPairingOptions:
@@ -520,56 +460,6 @@ def pipeline_options(config: ColmapRigBaselineRobocapConfig, refine_sensor_from_
     options.ba_gpu_index = "0" if config.use_gpu else "-1"
     options.ba_refine_sensor_from_rig = refine_sensor_from_rig
     return options
-
-
-def rotation_degrees(delta: pycolmap.Rigid3d) -> float:
-    """Geodesic angle of a rigid transform's rotation.
-
-    Args:
-        delta: The transform.
-
-    Returns:
-        The angle in degrees.
-    """
-    trace: float = float(np.trace(np.asarray(delta.rotation.matrix(), dtype=np.float64)))
-    return math.degrees(math.acos(max(-1.0, min(1.0, 0.5 * (trace - 1.0)))))
-
-
-def extrinsic_deltas(reconstruction: pycolmap.Reconstruction, frames_meta: FramesMeta, reference: RigReference) -> tuple[ExtrinsicDelta, ...]:
-    """Compare the model's rig extrinsics against the calibration.
-
-    Args:
-        reconstruction: The largest model.
-        frames_meta: The parsed metadata.
-        reference: The rig origin used to build the config.
-
-    Returns:
-        One delta per non-reference camera the model kept. Every entry is zero
-        when `ba_refine_sensor_from_rig` was held off, which is the CASPAR path.
-    """
-    calibrated: dict[int, pycolmap.Rigid3d] = calibrated_cam_from_rig(frames_meta, reference)
-    params_id_by_folder: dict[str, int] = {camera.sensor_name: camera_params_id for camera_params_id, camera in frames_meta.cameras.items()}
-    params_id_by_camera_id: dict[int, int] = {
-        image.camera_id: params_id_by_folder[image.name.split("/")[0]] for image in reconstruction.images.values()
-    }
-    rig: pycolmap.Rig = next(iter(reconstruction.rigs.values()))
-    deltas: list[ExtrinsicDelta] = []
-    for camera_id, camera_params_id in sorted(params_id_by_camera_id.items(), key=lambda item: item[1]):
-        if camera_params_id == reference.camera_params_id:
-            continue
-        sensor_id: pycolmap.sensor_t = pycolmap.sensor_t(pycolmap.SensorType.CAMERA, camera_id)
-        if not rig.has_sensor(sensor_id):
-            continue
-        difference: pycolmap.Rigid3d = rig.sensor_from_rig(sensor_id) * calibrated[camera_params_id].inverse()
-        deltas.append(
-            ExtrinsicDelta(
-                camera_params_id=camera_params_id,
-                sensor_name=frames_meta.cameras[camera_params_id].sensor_name,
-                translation_millimeters=MILLIMETRES_PER_METRE * float(np.linalg.norm(np.asarray(difference.translation, dtype=np.float64))),
-                rotation_degrees=rotation_degrees(difference),
-            )
-        )
-    return tuple(deltas)
 
 
 def rename_to_dataset_names(reconstruction: pycolmap.Reconstruction, staged: StagedImages) -> dict[int, int]:

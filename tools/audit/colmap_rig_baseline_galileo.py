@@ -38,19 +38,18 @@ Run:
 
 from __future__ import annotations
 
-import math
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-import numpy as np
 import pycolmap
 import tyro
 from serde import serde
 
 from colsfm.benchmark import ReconstructionMetrics, RigTrack, write_json_report
-from colsfm.frames_meta import CameraParams, FramesMeta, KeyframeMeta
+from colsfm.frames_meta import FramesMeta, KeyframeMeta
 from colsfm.reconstruction import RigReference, rig_reference
+from colsfm.rig_calibration import ExtrinsicDelta, extrinsic_deltas, reference_camera_params_id, rig_config
 from tools.audit.colmap_baseline_galileo import (
     EXTRACTOR_BY_CHOICE,
     MATCHER_BY_CHOICE,
@@ -73,9 +72,6 @@ from tools.audit.galileo_metrics import (
 STAGED_IMAGE_DIR_NAME: str = "images"
 """Symlink tree written inside the run directory; see the module docstring."""
 
-MILLIMETRES_PER_METRE: float = 1000.0
-"""Extrinsic deltas are reported in millimetres, like every other length here."""
-
 @dataclass(frozen=True)
 class ColmapRigBaselineConfig:
     """One rig-enabled COLMAP run on the Galileo dataset."""
@@ -96,21 +92,6 @@ class ColmapRigBaselineConfig:
     """Run extraction and matching on the GPU."""
     overwrite: bool = True
     """Delete any previous run directory first, so timings are cold-cache-fair."""
-
-
-@serde
-@dataclass(frozen=True)
-class ExtrinsicDelta:
-    """How far the mapper moved one camera's `cam_from_rig` off the calibration."""
-
-    camera_params_id: int
-    """The camera, by its `frames_meta.json` id."""
-    sensor_name: str
-    """The camera folder name, for reading the table."""
-    translation_millimeters: float
-    """Norm of the translation difference between recovered and calibrated `cam_from_rig`."""
-    rotation_degrees: float
-    """Geodesic angle between recovered and calibrated `cam_from_rig` rotations."""
 
 
 @serde
@@ -158,18 +139,6 @@ class ColmapRigBaselineResult:
     """Rig frames the largest model covers."""
     extrinsic_deltas: tuple[ExtrinsicDelta, ...]
     """Recovered rig extrinsics against the calibration, per non-reference camera."""
-
-
-def _reference_camera_params_id(frames_meta: FramesMeta) -> int:
-    """Pick the rig's reference camera: the one owning the lowest keyframe id.
-
-    Args:
-        frames_meta: The parsed metadata.
-
-    Returns:
-        The reference `camera_params_id`.
-    """
-    return min(frames_meta.keyframes, key=lambda item: item.keyframe_id).camera_params_id
 
 
 def _stage_images(frames_meta: FramesMeta, input_dir: Path, staged_root: Path) -> dict[str, str]:
@@ -230,55 +199,6 @@ def _extract(config: ColmapRigBaselineConfig, reference: GalileoReference, stage
         )
 
 
-def _calibrated_cam_from_rig(frames_meta: FramesMeta, reference: RigReference) -> dict[int, pycolmap.Rigid3d]:
-    """The calibration's `cam_from_rig` per camera, the reference at identity.
-
-    `cam_i_T_cam_ref = cam_i_T_vehicle * vehicle_T_cam_ref`, which is what
-    `colsfm.reconstruction.build_rig` writes into a cuSFM reconstruction.
-
-    Args:
-        frames_meta: The parsed metadata.
-        reference: The rig origin and its `vehicle_T_cam_ref` bridge.
-
-    Returns:
-        `cam_from_rig` per `camera_params_id`.
-    """
-    return {
-        camera_params_id: camera.vehicle_T_cam.inverse() * reference.vehicle_T_reference
-        for camera_params_id, camera in sorted(frames_meta.cameras.items())
-    }
-
-
-def _rig_config(frames_meta: FramesMeta, reference: RigReference) -> pycolmap.RigConfig:
-    """Describe the Galileo rig the way `apply_rig_config` wants it.
-
-    Args:
-        frames_meta: The parsed metadata.
-        reference: The rig origin and its bridge.
-
-    Returns:
-        A config listing all eight cameras by `image_prefix`, one of them the
-        reference sensor and the rest carrying `cam_from_rig`.
-    """
-    calibrated: dict[int, pycolmap.Rigid3d] = _calibrated_cam_from_rig(frames_meta, reference)
-    # Reference first: `Rig::AddSensor` refuses to run before a reference sensor exists
-    # (`rig.cc:42`), and `apply_rig_config` walks this list in order.
-    ordered: list[int] = sorted(frames_meta.cameras, key=lambda item: (item != reference.camera_params_id, item))
-    cameras: list[pycolmap.RigConfigCamera] = []
-    for camera_params_id in ordered:
-        camera: CameraParams = frames_meta.cameras[camera_params_id]
-        is_reference: bool = camera_params_id == reference.camera_params_id
-        entry: pycolmap.RigConfigCamera = pycolmap.RigConfigCamera()
-        entry.image_prefix = f"{camera.sensor_name}/"
-        entry.ref_sensor = is_reference
-        if not is_reference:
-            entry.cam_from_rig = calibrated[camera_params_id]
-        cameras.append(entry)
-    config: pycolmap.RigConfig = pycolmap.RigConfig()
-    config.cameras = cameras
-    return config
-
-
 def _match(config: ColmapRigBaselineConfig, database_path: Path) -> None:
     """Match features with COLMAP's stock pairing, left at its defaults.
 
@@ -317,75 +237,6 @@ def _rename_to_dataset_names(reconstruction: pycolmap.Reconstruction, original_b
         image.name = original_by_staged[image.name]
 
 
-def _camera_params_id_by_camera_id(reconstruction: pycolmap.Reconstruction, frames_meta: FramesMeta) -> dict[int, int]:
-    """Map COLMAP's own camera ids back onto `camera_params_id`, through the folders.
-
-    Args:
-        reconstruction: A model whose image names are the dataset's `image_name`s.
-        frames_meta: The parsed metadata, for the folder-to-camera map.
-
-    Returns:
-        `camera_params_id` per COLMAP `camera_id`, for the cameras the model kept.
-    """
-    camera_params_id_by_folder: dict[str, int] = {
-        camera.sensor_name: camera_params_id for camera_params_id, camera in frames_meta.cameras.items()
-    }
-    return {image.camera_id: camera_params_id_by_folder[image.name.split("/")[0]] for image in reconstruction.images.values()}
-
-
-def _rotation_degrees(delta: pycolmap.Rigid3d) -> float:
-    """Geodesic angle of a rigid transform's rotation.
-
-    Args:
-        delta: The transform.
-
-    Returns:
-        The angle in degrees.
-    """
-    trace: float = float(np.trace(np.asarray(delta.rotation.matrix(), dtype=np.float64)))
-    return math.degrees(math.acos(max(-1.0, min(1.0, 0.5 * (trace - 1.0)))))
-
-
-def _extrinsic_deltas(
-    reconstruction: pycolmap.Reconstruction, frames_meta: FramesMeta, reference: RigReference
-) -> tuple[ExtrinsicDelta, ...]:
-    """Compare the mapper's recovered rig extrinsics against the calibration.
-
-    `IncrementalPipelineOptions.ba_refine_sensor_from_rig` defaults to on, so the
-    mapper is free to move these; how far it moved them is a quality number in its
-    own right.
-
-    Args:
-        reconstruction: The largest model, already renamed to dataset image names.
-        frames_meta: The parsed metadata.
-        reference: The rig origin used to build the config.
-
-    Returns:
-        One delta per non-reference camera the model kept, by `camera_params_id`.
-    """
-    calibrated: dict[int, pycolmap.Rigid3d] = _calibrated_cam_from_rig(frames_meta, reference)
-    params_id_by_camera_id: dict[int, int] = _camera_params_id_by_camera_id(reconstruction, frames_meta)
-    rig: pycolmap.Rig = next(iter(reconstruction.rigs.values()))
-    deltas: list[ExtrinsicDelta] = []
-    for camera_id, camera_params_id in sorted(params_id_by_camera_id.items(), key=lambda item: item[1]):
-        if camera_params_id == reference.camera_params_id:
-            continue
-        sensor_id: pycolmap.sensor_t = pycolmap.sensor_t(pycolmap.SensorType.CAMERA, camera_id)
-        if not rig.has_sensor(sensor_id):
-            continue
-        difference: pycolmap.Rigid3d = rig.sensor_from_rig(sensor_id) * calibrated[camera_params_id].inverse()
-        camera: CameraParams = frames_meta.cameras[camera_params_id]
-        deltas.append(
-            ExtrinsicDelta(
-                camera_params_id=camera_params_id,
-                sensor_name=camera.sensor_name,
-                translation_millimeters=MILLIMETRES_PER_METRE * float(np.linalg.norm(np.asarray(difference.translation, dtype=np.float64))),
-                rotation_degrees=_rotation_degrees(difference),
-            )
-        )
-    return tuple(deltas)
-
-
 def main(config: ColmapRigBaselineConfig) -> None:
     """Run one rig-enabled COLMAP baseline on Galileo and write its timings and accuracy.
 
@@ -403,14 +254,14 @@ def main(config: ColmapRigBaselineConfig) -> None:
 
     reference: GalileoReference = read_galileo_reference(config.input_dir)
     frames_meta: FramesMeta = reference.frames_meta
-    reference_camera_params_id: int = _reference_camera_params_id(frames_meta)
-    rig_ref: RigReference = rig_reference(frames_meta, reference_camera_params_id)
+    reference_params_id: int = reference_camera_params_id(frames_meta)
+    rig_ref: RigReference = rig_reference(frames_meta, reference_params_id)
     original_by_staged: dict[str, str] = _stage_images(frames_meta, config.input_dir, staged_root)
     num_rig_frames: int = len({name.split("/")[1] for name in original_by_staged})
     print(
         f"[audit-rig] {config.features} + {config.matcher}: {len(frames_meta.keyframes)} images, "
         f"{len(frames_meta.cameras)} cameras, {num_rig_frames} rig frames, "
-        f"reference camera {reference_camera_params_id} ({frames_meta.cameras[reference_camera_params_id].sensor_name})"
+        f"reference camera {reference_params_id} ({frames_meta.cameras[reference_params_id].sensor_name})"
     )
 
     clock: StageClock = StageClock()
@@ -420,7 +271,7 @@ def main(config: ColmapRigBaselineConfig) -> None:
         # Rig configuration is a sub-second database write with no stage of its own in
         # `runtime.csv`; it is counted here, against the run, rather than left untimed.
         with pycolmap.Database.open(database_path) as database:
-            pycolmap.apply_rig_config([_rig_config(frames_meta, rig_ref)], database)
+            pycolmap.apply_rig_config([rig_config(frames_meta, rig_ref)], database)
         _match(config, database_path)
     with pycolmap.Database.open(database_path) as database:
         num_pairs: int = int(database.num_verified_image_pairs())
@@ -448,13 +299,13 @@ def main(config: ColmapRigBaselineConfig) -> None:
     center_score, alignment = image_center_score(largest, reference)
     rig_track: RigTrack = rig_track_from_reconstruction(largest, frames_meta, alignment)
     rig_score: TrajectoryScore = score_track_against_ground_truth(rig_track, reference.ground_truth)
-    deltas: tuple[ExtrinsicDelta, ...] = _extrinsic_deltas(largest, frames_meta, rig_ref)
+    deltas: tuple[ExtrinsicDelta, ...] = extrinsic_deltas(largest, frames_meta, rig_ref)
 
     result: ColmapRigBaselineResult = ColmapRigBaselineResult(
         features=config.features,
         matcher=config.matcher,
         run_dir=str(run_dir),
-        reference_camera_params_id=reference_camera_params_id,
+        reference_camera_params_id=reference_params_id,
         total_images=len(frames_meta.keyframes),
         total_rig_frames=num_rig_frames,
         num_image_pairs_matched=num_pairs,
