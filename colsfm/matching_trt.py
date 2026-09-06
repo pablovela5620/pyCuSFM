@@ -70,7 +70,6 @@ from colsfm.matching import (
     MatchReport,
     MatchScores,
     PairMatchStats,
-    resolve_match_cap,
     select_by_square_covering,
     verification_options,
 )
@@ -213,8 +212,8 @@ def match_one_pair(
         features: The keypoint and descriptor source.
         sizes: `(width, height)` per `image_id`, for the normalisation.
         pair: The image pair, first image first.
-        options: Matching settings; `tensorrt_min_score`, `max_matches_per_pair`,
-            `match_cap_mode` and `num_points_tolerance_fraction` are read.
+        options: Matching settings; `tensorrt_min_score`, `match_limit` and
+            `num_points_tolerance_fraction` are read.
         normalize: Which normalised keypoint frame the graph's `kpts0`/`kpts1`
             bindings expect; see `KeypointNormalizer`.
 
@@ -246,11 +245,11 @@ def match_one_pair(
         & (candidates[:, 1] < len(keypoints1))
     )
     matches: MatchIndices = candidates[accepted]
-    if options.max_matches_per_pair is None or options.match_cap_mode == "off" or len(matches) == 0:
+    if not options.match_limit.limits or len(matches) == 0:
         return matches
-    # The same cap resolution as the grid subsample, so `--match-cap-mode` means one
-    # thing across both backends; here the number is SSC's target rather than a ceiling.
-    target: int | None = resolve_match_cap(options, width0, height0)
+    # The same policy as the grid subsample, so `--match-cap-mode` means one thing
+    # across both backends; here the number is SSC's target rather than a ceiling.
+    target: int | None = options.match_limit.limit_for(width0, height0)
     if target is None:
         return matches
     kept: Int64[ndarray, " num_kept"] = select_by_square_covering(

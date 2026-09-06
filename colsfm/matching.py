@@ -12,7 +12,7 @@ across; the fourth does not:
 | blob | here |
 |---|---|
 | `mscores0 > match_threshold` (0.3) | `LightGlueONNXMatchingOptions.min_score` |
-| SSC NMS down to `match_top_k: 500` | `max_matches_per_pair` — a score-free grid subsample, see below |
+| SSC NMS down to `match_top_k: 500` | `match_limit` — a score-free grid subsample, see below |
 | `cv::findEssentialMat`, threshold `0.5*(err/f0 + err/f1)` on bearings | `TwoViewGeometryOptions.ransac.max_error = 4.0` px on a real camera model |
 | `n_inliers < 10` empties the pair | `TwoViewGeometryOptions.min_num_inliers = 10` |
 
@@ -35,7 +35,7 @@ and the survivors come out well under 500. Measured over the 331 Galileo pairs:
 | | mean matches per pair | mean reprojection | ATE vs ground truth |
 |---|---|---|---|
 | uncapped | 1300 | 1.80 px | 5.39 mm |
-| `max_matches_per_pair = 500` | 156 | 1.33 px | 4.32 mm |
+| `match_limit` fixed at 500 | 156 | 1.33 px | 4.32 mm |
 | blob (SSC, `match_top_k: 500`) | 430 | 1.55 px | 5.00 mm |
 
 So the cap costs nothing in accuracy — it *buys* it, by refusing to pile a
@@ -114,7 +114,10 @@ run the blob's real SSC spatial NMS rather than
 graph and in the normalised frame its keypoints arrive in."""
 
 MatchCapMode: TypeAlias = Literal["fixed", "image_area", "off"]
-"""How `max_matches_per_pair` is turned into a per-pair cap; see `resolve_match_cap`."""
+"""`--match-cap-mode`, the command line's spelling; `MatchLimitPolicy.of` resolves it."""
+
+MatchLimitKind: TypeAlias = Literal["unlimited", "fixed", "image_area"]
+"""A resolved match limit. `off` and a `None` count both become `unlimited` exactly once."""
 
 MatchScores: TypeAlias = Float32[ndarray, " num_matches"]
 """LightGlue's confidence per match, which only the TensorRT backend can see."""
@@ -150,8 +153,82 @@ CAP_REFERENCE_IMAGE_AREA_PX: Final[int] = 1920 * 1200
 `match_cap_mode = "image_area"` keeps the *match density* of that calibration
 rather than its count: one kept match per `1920*1200 / 500 = 4608` pixels of
 image. Galileo therefore reproduces 500 exactly and KITTI's 1241x376 frames get
-101. See `resolve_match_cap` and the KITTI follow-up in `docs/kitti-06-results.md`
+101. See `MatchLimitPolicy` and the KITTI follow-up in `docs/kitti-06-results.md`
 for what that measured."""
+
+
+@dataclass(frozen=True, slots=True)
+class MatchLimitPolicy:
+    """How many verified matches one pair may keep — one answer, not two knobs.
+
+    `match_cap_mode` and `max_matches_per_pair` used to be separate fields, and two
+    different spellings disabled the limit: `mode="off"`, and a `None` count. A
+    caller reading either one alone could therefore be wrong, and both the grid
+    subsample and the TensorRT matcher had to test both. Here "no limit" has
+    exactly one representation, and `limit_for` is the only place the arithmetic
+    lives.
+
+    Three policies, because 500 was calibrated on one image size and one dataset
+    and is not obviously the right number anywhere else:
+
+    * **`unlimited`** — every verified inlier survives.
+    * **`fixed`** — `matches_per_pair` verbatim. What every run before the KITTI
+      follow-up used.
+    * **`image_area`** — the same *density*, one kept match per
+      `CAP_REFERENCE_IMAGE_AREA_PX / matches_per_pair` pixels, so a 1920x1200 frame
+      keeps 500 and a 1241x376 KITTI frame keeps 101.
+    """
+
+    kind: MatchLimitKind
+    """Which of the three policies applies."""
+    matches_per_pair: int | None
+    """The budget the policy is parameterised by; None exactly when `kind` is `unlimited`."""
+
+    @staticmethod
+    def of(mode: MatchCapMode, max_matches_per_pair: int | None) -> MatchLimitPolicy:
+        """Fold the command line's two knobs into one policy.
+
+        Args:
+            mode: `--match-cap-mode`.
+            max_matches_per_pair: `--max-matches-per-pair`; None means no limit
+                whatever the mode says.
+
+        Returns:
+            The policy those two spell, with "no limit" normalised to one form.
+        """
+        if mode == "off" or max_matches_per_pair is None:
+            return MatchLimitPolicy(kind="unlimited", matches_per_pair=None)
+        return MatchLimitPolicy(kind=mode, matches_per_pair=max_matches_per_pair)
+
+    @property
+    def limits(self) -> bool:
+        """Whether anything is capped at all.
+
+        Returns:
+            False for `unlimited`, True otherwise.
+        """
+        return self.kind != "unlimited"
+
+    def limit_for(self, image_width: int, image_height: int) -> int | None:
+        """The number of matches one pair may keep, given its first image's size.
+
+        Args:
+            image_width: Width of the pair's first image in pixels.
+            image_height: Height of the pair's first image in pixels.
+
+        Returns:
+            The per-pair cap, or None when nothing is capped.
+        """
+        if self.matches_per_pair is None:
+            return None
+        if self.kind == "fixed":
+            return self.matches_per_pair
+        area: int = max(image_width * image_height, 1)
+        return max(round(self.matches_per_pair * area / CAP_REFERENCE_IMAGE_AREA_PX), 1)
+
+
+DEFAULT_MATCH_LIMIT: Final[MatchLimitPolicy] = MatchLimitPolicy(kind="fixed", matches_per_pair=BLOB_MATCH_TOP_K)
+"""The blob's own budget: 500 verified matches per pair, whatever the image size."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,16 +276,15 @@ class MatchingOptions:
     """CUDA device index as COLMAP's comma-separated string."""
     num_threads: int = -1
     """COLMAP matching threads; -1 lets COLMAP choose."""
-    max_matches_per_pair: int | None = BLOB_MATCH_TOP_K
-    """Verified matches to keep per pair, spread over the image; None keeps every inlier.
+    match_limit: MatchLimitPolicy = DEFAULT_MATCH_LIMIT
+    """How many verified matches one pair may keep, as one resolved policy.
 
     The score-free stand-in for the blob's SSC spatial NMS — see
     `subsample_matches_by_coverage` and the module docstring. On the `tensorrt`
-    backend this is the SSC *target* instead, applied before verification with
-    the real LightGlue scores, and the post-verification grid subsample does not
-    run at all."""
-    match_cap_mode: MatchCapMode = "fixed"
-    """How `max_matches_per_pair` becomes a per-pair number; see `resolve_match_cap`."""
+    backend the number is the SSC *target* instead, applied before verification
+    with the real LightGlue scores, and the post-verification grid subsample does
+    not run at all. `MatchLimitPolicy.of` is what turns `--match-cap-mode` and
+    `--max-matches-per-pair` into it."""
     tensorrt_min_score: float = BLOB_MATCH_THRESHOLD
     """LightGlue score gate on the `tensorrt` backend, applied with `>` as the blob does.
 
@@ -222,36 +298,6 @@ class MatchingOptions:
 
 DEFAULT_MATCHING_OPTIONS: Final[MatchingOptions] = MatchingOptions()
 """Shared immutable default, so the signatures below hold no constructor call."""
-
-
-def resolve_match_cap(options: MatchingOptions, image_width: int, image_height: int) -> int | None:
-    """Turn the cap settings into the number of matches one pair may keep.
-
-    Three modes, because 500 was calibrated on one image size and one dataset and
-    is not obviously the right number anywhere else:
-
-    * **`fixed`** — `max_matches_per_pair` verbatim. What every run before the
-      KITTI follow-up used.
-    * **`image_area`** — the same *density*, one kept match per
-      `CAP_REFERENCE_IMAGE_AREA_PX / max_matches_per_pair` pixels of image, so a
-      1920x1200 frame keeps 500 and a 1241x376 KITTI frame keeps 101. The cap
-      then scales with resolution instead of ignoring it.
-    * **`off`** — no cap; every verified inlier survives.
-
-    Args:
-        options: The matching settings.
-        image_width: Width of the pair's first image in pixels.
-        image_height: Height of the pair's first image in pixels.
-
-    Returns:
-        The per-pair cap, or None when nothing is capped.
-    """
-    if options.match_cap_mode == "off" or options.max_matches_per_pair is None:
-        return None
-    if options.match_cap_mode == "fixed":
-        return options.max_matches_per_pair
-    area: int = max(image_width * image_height, 1)
-    return max(round(options.max_matches_per_pair * area / CAP_REFERENCE_IMAGE_AREA_PX), 1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -604,13 +650,13 @@ def cap_verified_matches(
     geometry's `E`/`F`/`H`, its configuration and its triangulation angle are kept
     as verification estimated them.
 
-    The cap is per pair, because `resolve_match_cap`'s `image_area` mode derives
+    The cap is per pair, because `MatchLimitPolicy`'s `image_area` kind derives
     it from the first image's size; in `fixed` mode every pair gets the same one.
 
     Args:
         database_path: An existing COLMAP database holding verified geometries.
         pairs: Pairs to cap, as `(min(image_id), max(image_id))`.
-        options: The matching settings, for `max_matches_per_pair` and `match_cap_mode`.
+        options: The matching settings, for `match_limit`.
 
     Returns:
         Total inlier matches removed across every pair; 0 when nothing is capped.
@@ -624,7 +670,7 @@ def cap_verified_matches(
         sizes: dict[int, tuple[int, int]] = _image_sizes(database, first_image_ids)
         for image_id1, image_id2 in pairs:
             width, height = sizes[image_id1]
-            cap: int | None = resolve_match_cap(options, width, height)
+            cap: int | None = options.match_limit.limit_for(width, height)
             if cap is None:
                 continue
             geometry: pycolmap.TwoViewGeometry = database.read_two_view_geometry(image_id1, image_id2)
@@ -705,7 +751,10 @@ def match_pairs(
         delete_two_view_geometries(database_path, pairs)
         pycolmap.verify_matches(database_path, pair_list_path, geometry_options)
         dropped: int = cap_verified_matches(database_path, pairs, options)
-        print(f"colsfm.matching: spatial cap ({options.match_cap_mode}, {options.max_matches_per_pair}/pair) dropped {dropped} inlier matches")
+        print(
+            f"colsfm.matching: spatial cap ({options.match_limit.kind}, "
+            f"{options.match_limit.matches_per_pair}/pair) dropped {dropped} inlier matches"
+        )
         elapsed_seconds: float = time.perf_counter() - started
 
     inliers: dict[ImagePair, int] = pair_inlier_counts(database_path, pairs)

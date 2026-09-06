@@ -151,15 +151,25 @@ import re
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from functools import cache
 from pathlib import Path
-from typing import Final, Literal, TypeAlias
+from typing import Final, TypeAlias
 
 import numpy as np
 import pycolmap
 from jaxtyping import Bool, Float64
 from numpy import ndarray
 
+from colsfm.ba_backend import (
+    BUNDLE_ADJUSTMENT_BACKEND,
+    CASPAR_BUILD_FALLBACK_REASON,
+    CASPAR_DISABLED_MARKER,
+    BaBackend,
+    CasparCapability,
+    CasparOptions,
+    apply_caspar_options,
+    backend_name,
+    resolve_backend,
+)
 from colsfm.ceres_pose import COLMAP_LINEAR_SOLVER, LinearSolver
 from colsfm.config import BundleAdjustmentConfig, LossFunctionType, VisionMappingConfig
 from colsfm.reconstruction import (
@@ -191,51 +201,6 @@ LOSS_FUNCTION_BY_NAME: Final[dict[LossFunctionType, pycolmap.LossFunctionType]] 
     "HUBER": pycolmap.LossFunctionType.HUBER,
 }
 """cuSFM's `loss_type` enum to pycolmap's; the two sets coincide exactly."""
-
-BaBackend: TypeAlias = Literal["ceres", "caspar"]
-"""Which implementation solves the global bundle adjustment; `MappingOptions.ba_backend`."""
-
-BUNDLE_ADJUSTMENT_BACKEND: Final[dict[BaBackend, pycolmap.BundleAdjustmentBackend]] = {
-    "ceres": pycolmap.BundleAdjustmentBackend.CERES,
-    "caspar": pycolmap.BundleAdjustmentBackend.CASPAR,
-}
-"""The name to pycolmap's enum. The enum is bound unconditionally, so its presence proves
-nothing about the build — only a solve does (`docs/caspar-build.md`)."""
-
-CASPAR_STOCK_CAMERA_MODELS: Final[frozenset[str]] = frozenset({"PINHOLE", "SIMPLE_RADIAL"})
-"""The two models stock CASPAR (COLMAP 4.2.0) projects, and the floor every build meets.
-
-Observations of a model the build has no adapter for are dropped with a `LOG(WARNING)`
-and the solve still reports success, so the pre-flight is a check, not a guard. Which
-models a build actually carries is a property of that build — `colsfm-caspar-fisheye`
-adds OPENCV_FISHEYE (`docs/caspar-fisheye-adapter.md`) — so this constant is the
-reference point, not the answer; `caspar_supported_camera_models` measures the answer."""
-
-CASPAR_PROBE_CAMERA_MODELS: Final[tuple[str, ...]] = (
-    "PINHOLE",
-    "SIMPLE_RADIAL",
-    "OPENCV_FISHEYE",
-    "OPENCV",
-    "FULL_OPENCV",
-)
-"""Camera models `caspar_supported_camera_models` asks the build about, in probe order.
-
-The two stock adapters, the fisheye one this repo added, and the two OPENCV models that
-are the obvious next ports — probing them costs a few milliseconds each and means a
-future adapter is picked up without editing this module."""
-
-CASPAR_DISABLED_MARKER: Final[str] = "CASPAR_ENABLED"
-"""What COLMAP's "built without CASPAR_ENABLED" `ValueError` says; the capability test."""
-
-CasparOptions: TypeAlias = dict[str, float | int]
-"""Numeric overrides for `pycolmap.BundleAdjustmentOptions.caspar`, by attribute name.
-
-The stopping and damping knobs of CASPAR's Levenberg-Marquardt / PCG loop —
-`solver_iter_max`, `pcg_iter_max`, `pcg_rel_error_exit`, `pcg_rel_score_exit`,
-`pcg_rel_decrease_min`, `solver_rel_decrease_min`, `score_exit_value`, `diag_*`.
-Values are cast to the attribute's own type on the way in, so the integer counters
-take integers whichever way they were written. `gpu_index` is a string and is not
-settable here; `MappingOptions.use_gpu` owns it."""
 
 BRIEF_REPORT_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"Iterations:\s*(\d+),\s*Initial cost:\s*([0-9.eE+-]+),\s*Final cost:\s*([0-9.eE+-]+)"
@@ -431,6 +396,13 @@ class MappingResult:
     """Which backend the solves actually ran on — `ceres` whenever one of the three
     fallbacks of `MappingOptions.ba_backend` fired, so this is evidence rather than a
     request."""
+    ba_fallback_reason: str | None = None
+    """Why `ba_backend` is not what was asked for, or None when it is.
+
+    The three sentences of `colsfm.ba_backend`: an unsupported camera model,
+    `optimize_extrinsics`, or a pycolmap built without CASPAR_ENABLED. Recorded
+    rather than only printed, so `summary.json` says why a run that asked for the
+    GPU backend solved on the CPU."""
     polish: PolishStats | None = None
     """The closing Ceres solve of a CASPAR run, or None when none ran.
 
@@ -573,179 +545,32 @@ def triangulator_options(mapping_config: VisionMappingConfig, max_pixel_error: f
     return options
 
 
-CASPAR_PROBE_FOCAL_LENGTH_PX: Final[float] = 300.0
-"""Focal length of the probe camera; wide enough that a 640x480 image sees the whole grid."""
-
-CASPAR_PROBE_IMAGE_SIZE_PX: Final[tuple[int, int]] = (640, 480)
-"""Width and height of the probe camera, in pixels."""
-
-CASPAR_PROBE_POINT_OFFSET_M: Final[float] = 0.02
-"""How far the probe knocks its points off their exact positions, so the solve has work."""
-
-
-def _caspar_probe_reconstruction(model_name: str) -> pycolmap.Reconstruction | None:
-    """A minimal two-frame model of one camera model, knocked off its own solution.
-
-    One single-sensor rig, so `refine_sensor_from_rig` never comes up; two frames, the
-    first of which is the gauge; and a grid of points whose observations are exact
-    projections, displaced afterwards so that a solver with anything to do has
-    something to do. Small enough to build and solve in a few milliseconds.
+def caspar_capability_of(options: MappingOptions) -> CasparCapability | None:
+    """This build's CASPAR capability, or the one `options` states instead.
 
     Args:
-        model_name: A `pycolmap.CameraModelId` member name, e.g. `OPENCV_FISHEYE`.
+        options: Command-line style knobs; `caspar_supported_models` overrides the probe.
 
     Returns:
-        The model, or None when this pycolmap has no such camera model.
+        None to let `colsfm.ba_backend` measure the build, or a capability spelling
+        out exactly what `caspar_supported_models` asked for. An empty set there
+        still means "do not guard on camera models", as it always has.
     """
-    model: pycolmap.CameraModelId | None = getattr(pycolmap.CameraModelId, model_name, None)
-    if model is None:
+    stated: frozenset[str] | None = options.caspar_supported_models
+    if stated is None:
         return None
-    width_px, height_px = CASPAR_PROBE_IMAGE_SIZE_PX
-    reconstruction: pycolmap.Reconstruction = pycolmap.Reconstruction()
-    reconstruction.add_camera(
-        pycolmap.Camera.create_from_model_id(1, model, CASPAR_PROBE_FOCAL_LENGTH_PX, width_px, height_px)
+    return CasparCapability(
+        availability="available" if stated else "unavailable",
+        supported_camera_models=stated,
+        probe_errors=(),
     )
-    rig: pycolmap.Rig = pycolmap.Rig()
-    rig.rig_id = RIG_ID
-    rig.add_ref_sensor(camera_sensor_id(1))
-    reconstruction.add_rig(rig)
-
-    baselines_m: tuple[float, float] = (0.0, -0.3)
-    for frame_index, baseline_m in enumerate(baselines_m):
-        image_id: int = frame_index + 1
-        frame: pycolmap.Frame = pycolmap.Frame()
-        frame.frame_id = image_id
-        frame.rig_id = RIG_ID
-        frame.rig_from_world = pycolmap.Rigid3d(pycolmap.Rotation3d(), np.array([baseline_m, 0.0, 0.0]))
-        frame.add_data_id(pycolmap.data_t(camera_sensor_id(1), image_id))
-        reconstruction.add_frame(frame)
-        reconstruction.register_frame(frame.frame_id)
-        image: pycolmap.Image = pycolmap.Image(name=f"probe{image_id}.png", camera_id=1, image_id=image_id)
-        image.frame_id = frame.frame_id
-        reconstruction.add_image(image)
-
-    grid: Float64[ndarray, "n_points 3"] = np.array(
-        [[x, y, z] for x in np.linspace(-1.0, 1.0, 4) for y in np.linspace(-0.8, 0.8, 4) for z in (3.0, 5.0)],
-        dtype=np.float64,
-    )
-    observations: dict[int, list[tuple[int, int]]] = {index: [] for index in range(len(grid))}
-    for image_id in sorted(reconstruction.images):
-        image = reconstruction.image(image_id)
-        camera: pycolmap.Camera = reconstruction.camera(image.camera_id)
-        cam_from_world: pycolmap.Rigid3d = image.cam_from_world()
-        points_in_cam: Float64[ndarray, "n_points 3"] = (
-            grid @ np.asarray(cam_from_world.rotation.matrix(), dtype=np.float64).T
-            + np.asarray(cam_from_world.translation, dtype=np.float64)
-        )
-        projected: Float64[ndarray, "n_points 2"] = np.asarray(camera.img_from_cam(points_in_cam), dtype=np.float64)
-        visible: Bool[ndarray, " n_points"] = (
-            np.isfinite(projected).all(axis=1)
-            & (points_in_cam[:, 2] > 0.1)
-            & (projected >= 0.0).all(axis=1)
-            & (projected < np.array([width_px, height_px], dtype=np.float64)).all(axis=1)
-        )
-        image.points2D = pycolmap.Point2DList([pycolmap.Point2D(xy) for xy in projected[visible]])
-        for observation_index, point_index in enumerate(np.flatnonzero(visible)):
-            observations[int(point_index)].append((image_id, observation_index))
-
-    rng: np.random.Generator = np.random.default_rng(0)
-    for point_index, point_xyz in enumerate(grid):
-        elements: list[tuple[int, int]] = observations[point_index]
-        # A one-view track is gauge-free and would tell the solver nothing.
-        if len(elements) < 2:
-            continue
-        point3D_id: int = reconstruction.add_point3D(
-            point_xyz + rng.normal(0.0, CASPAR_PROBE_POINT_OFFSET_M, 3),
-            pycolmap.Track([pycolmap.TrackElement(image_id, index) for image_id, index in elements]),
-            np.array([128, 128, 128], dtype=np.uint8),
-        )
-        for image_id, observation_index in elements:
-            reconstruction.image(image_id).set_point3D_for_point2D(observation_index, point3D_id)
-    return reconstruction
-
-
-def _caspar_projects(model_name: str) -> bool:
-    """Whether this build's CASPAR has an adapter for one camera model.
-
-    CASPAR skips the images of a model it cannot project — "Skipping image ... with
-    unsupported camera model" — and then reports `USER_FAILURE` with
-    `num_residuals == 0` on the empty problem it is left with, while a model it does
-    project yields two residuals per observation. That count is the signal: it is
-    bound by pycolmap and it distinguishes the two cases exactly, where the
-    termination type alone would not survive a solver that fails for another reason.
-
-    Args:
-        model_name: A `pycolmap.CameraModelId` member name.
-
-    Returns:
-        True when the solve parameterised the probe's observations.
-
-    Raises:
-        ValueError: When pycolmap is built without CASPAR_ENABLED.
-    """
-    reconstruction: pycolmap.Reconstruction | None = _caspar_probe_reconstruction(model_name)
-    if reconstruction is None:
-        return False
-    config: pycolmap.BundleAdjustmentConfig = pycolmap.BundleAdjustmentConfig()
-    for image_id in sorted(reconstruction.images):
-        config.add_image(image_id)
-    config.set_constant_rig_from_world_pose(min(reconstruction.frames))
-    config.set_constant_cam_intrinsics(1)
-
-    ba_options: pycolmap.BundleAdjustmentOptions = pycolmap.BundleAdjustmentOptions()
-    ba_options.backend = BUNDLE_ADJUSTMENT_BACKEND["caspar"]
-    ba_options.print_summary = False
-    ba_options.refine_sensor_from_rig = False
-    ba_options.refine_focal_length = False
-    ba_options.refine_extra_params = False
-    ba_options.refine_principal_point = False
-    ba_options.refine_rig_from_world = True
-    ba_options.refine_points3D = True
-    # `-1` lets COLMAP pick the device, which is what this module's `use_gpu=False`
-    # means everywhere else; the probe asks about adapters, not about a GPU.
-    ba_options.caspar.gpu_index = "-1"
-    adjuster: pycolmap.BundleAdjuster = pycolmap.create_default_bundle_adjuster(ba_options, config, reconstruction)
-    summary: pycolmap.BundleAdjustmentSummary = adjuster.solve()
-    return summary.num_residuals > 0
-
-
-@cache
-def caspar_supported_camera_models() -> frozenset[str]:
-    """The camera models this build's CASPAR actually projects, measured once.
-
-    There is no pycolmap call that lists CASPAR's adapters, so the only way to know
-    is to hand it a problem and see whether it took it: `_caspar_projects` solves a
-    sixteen-point model per candidate and reads `num_residuals`. The whole sweep is
-    five sub-millisecond GPU solves, it is cached for the life of the process, and
-    `resolve_ba_backend` only reaches it on `ba_backend == "caspar"`.
-
-    Returns:
-        The subset of `CASPAR_PROBE_CAMERA_MODELS` this build projects, by model
-        name; empty when pycolmap is built without CASPAR_ENABLED or when no GPU
-        answers, in which case the whole run falls back to Ceres at solve time.
-    """
-    supported: set[str] = set()
-    for model_name in CASPAR_PROBE_CAMERA_MODELS:
-        try:
-            if _caspar_projects(model_name):
-                supported.add(model_name)
-        except (ValueError, RuntimeError) as error:
-            if CASPAR_DISABLED_MARKER in str(error):
-                return frozenset()
-            # One model that throws says nothing about the next; a build without
-            # CASPAR at all has already returned above.
-            continue
-    return frozenset(supported)
 
 
 def resolve_ba_backend(options: MappingOptions, reconstruction: pycolmap.Reconstruction | None = None) -> BaBackend:
     """The backend that will actually run, after the two pre-flight fallbacks.
 
-    Neither condition is an error: CASPAR would *silently* drop the observations of a
-    camera model this build has no adapter for, and would hold `sensor_from_rig` fixed
-    where the caller asked for it to move. Both are reported and Ceres takes the solve.
-    Which models are supported comes from `caspar_supported_camera_models`, i.e. from
-    the build, unless `options.caspar_supported_models` states it instead.
+    A thin adapter over `colsfm.ba_backend.resolve_backend`, which owns the policy
+    and the reason; this signature is the one the mapper and its tests already use.
 
     Args:
         options: Command-line style knobs; `ba_backend` is what is being resolved.
@@ -755,79 +580,17 @@ def resolve_ba_backend(options: MappingOptions, reconstruction: pycolmap.Reconst
     Returns:
         `ceres` or `caspar`.
     """
-    if options.ba_backend != "caspar":
-        return options.ba_backend
-    if options.optimize_extrinsics:
-        print(
-            "[colsfm] CASPAR holds `sensor_from_rig` fixed and throws when asked to refine it; "
-            "`--optimize-extrinsics` therefore falls back to Ceres for this solve"
-        )
-        return "ceres"
-    supported: frozenset[str] = (
-        caspar_supported_camera_models() if options.caspar_supported_models is None else options.caspar_supported_models
+    backend, reason = resolve_backend(
+        options.ba_backend,
+        optimize_extrinsics=options.optimize_extrinsics,
+        camera_model_names=(
+            None if reconstruction is None else [camera.model.name for camera in reconstruction.cameras.values()]
+        ),
+        capability=caspar_capability_of(options),
     )
-    # An empty set is "this build has no CASPAR at all", not "CASPAR projects
-    # nothing": there is no half-problem to protect against, and the solve-time
-    # fallback reports the missing build in the words that name the fix.
-    if reconstruction is not None and supported:
-        unsupported: set[str] = {
-            camera.model.name for camera in reconstruction.cameras.values() if camera.model.name not in supported
-        }
-        if unsupported:
-            print(
-                f"[colsfm] this CASPAR build projects {sorted(supported)}, and this model has "
-                f"{sorted(unsupported)}, whose observations it would silently drop; using Ceres"
-            )
-            return "ceres"
-    return "caspar"
-
-
-def backend_name(ba_options: pycolmap.BundleAdjustmentOptions) -> BaBackend:
-    """Which backend a set of options selects, as this module's name for it.
-
-    Args:
-        ba_options: The options a solve ran with.
-
-    Returns:
-        `caspar` when the options select CASPAR, `ceres` otherwise.
-    """
-    return "caspar" if ba_options.backend == BUNDLE_ADJUSTMENT_BACKEND["caspar"] else "ceres"
-
-
-def apply_caspar_options(caspar: pycolmap.CasparBundleAdjustmentOptions, overrides: CasparOptions) -> None:
-    """Set CASPAR solver knobs by name, casting each value to the attribute's own type.
-
-    `CasparBundleAdjustmentOptions` binds `solver_iter_max` and `pcg_iter_max` as
-    C++ ints, which pybind11 refuses to take a Python float for, so every value
-    goes through the type the default carries. `gpu_index` is a string knob owned
-    by `MappingOptions.use_gpu` and is rejected here.
-
-    Args:
-        caspar: The `BundleAdjustmentOptions.caspar` block, modified in place.
-        overrides: Attribute name to value.
-
-    Raises:
-        KeyError: When a name is not a numeric CASPAR option.
-    """
-    for name, value in overrides.items():
-        current: object = getattr(caspar, name, None)
-        if not isinstance(current, (int, float)) or isinstance(current, bool):
-            raise KeyError(
-                f"[colsfm] `{name}` is not a numeric CASPAR solver option; "
-                f"the settable ones are {sorted(caspar_option_names())}"
-            )
-        setattr(caspar, name, type(current)(value))
-
-
-def caspar_option_names() -> frozenset[str]:
-    """The numeric option names `apply_caspar_options` accepts.
-
-    Returns:
-        Every key of a default `caspar.todict()` whose value is a number, i.e.
-        everything but the string `gpu_index`.
-    """
-    defaults: dict[str, object] = pycolmap.BundleAdjustmentOptions().caspar.todict()
-    return frozenset(name for name, value in defaults.items() if isinstance(value, (int, float)) and not isinstance(value, bool))
+    if reason is not None:
+        print(f"[colsfm] {reason}; using Ceres")
+    return backend
 
 
 def bundle_adjustment_options(
@@ -1396,6 +1159,15 @@ def run_mapping(
     """
     resolved_options: MappingOptions = MappingOptions() if options is None else options
     reconstruction: pycolmap.Reconstruction = model.reconstruction
+    # Resolved once, up front, so the run can *record* which backend ran and why.
+    # `bundle_adjustment_options` re-resolves and prints; `resolve_backend` is pure
+    # and its probe is cached, so asking twice costs nothing.
+    planned_backend, planned_reason = resolve_backend(
+        resolved_options.ba_backend,
+        optimize_extrinsics=resolved_options.optimize_extrinsics,
+        camera_model_names=[camera.model.name for camera in reconstruction.cameras.values()],
+        capability=caspar_capability_of(resolved_options),
+    )
     ba_config: BundleAdjustmentConfig = mapping_config.bundle_adjustment
     started: float = time.perf_counter()
     image_ids: list[int] = registered_image_ids(reconstruction)
@@ -1523,4 +1295,9 @@ def run_mapping(
         # Read off the options the solves ran with, not off the request: the
         # capability fallback rewrites them in place at the first solve.
         ba_backend=backend_name(ba_options),
+        # A backend that changed *after* the plan can only be the solve-time
+        # discovery that this pycolmap has no CASPAR at all.
+        ba_fallback_reason=(
+            planned_reason if backend_name(ba_options) == planned_backend else CASPAR_BUILD_FALLBACK_REASON
+        ),
     )

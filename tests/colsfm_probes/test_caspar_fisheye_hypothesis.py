@@ -132,7 +132,7 @@ from hypothesis import strategies as st
 from jaxtyping import Bool, Float
 from numpy import ndarray
 
-from colsfm.mapping import caspar_supported_camera_models
+from colsfm.ba_backend import caspar_supported_camera_models
 from tools.caspar_fisheye_probe import (
     FisheyeScenePlan,
     ProbeConfig,

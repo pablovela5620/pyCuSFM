@@ -90,6 +90,7 @@ from serde import serde
 from serde.json import to_json
 
 from colsfm import REPO_ROOT
+from colsfm.ba_backend import BaBackend, BaExecutionPlan, resolve_ba_plan
 from colsfm.config import CusfmConfig, KeyframeSelectionConfig, PoseGraphConfig, read_config_directory
 from colsfm.database import (
     Descriptors,
@@ -116,8 +117,16 @@ from colsfm.frames_meta import FRAMES_META_NAME, CameraParams, FramesMeta, RigFr
 from colsfm.geometry import MILLIMETRES_PER_METRE, TumPose, relative_rotation_degrees
 from colsfm.keyframe_selection import KeyframeSelection, apply_selection, select_keyframes
 from colsfm.loop_closure import LoopClosureConfig, LoopClosureDiagnostics, LoopClosureResult, find_loop_edges
-from colsfm.mapping import BaBackend, CasparOptions, MappingOptions, MappingResult, PolishStats, run_mapping
-from colsfm.matching import BLOB_MATCH_TOP_K, MatchCapMode, MatchingBackend, MatchingOptions, MatchReport, match_pairs
+from colsfm.mapping import MappingOptions, MappingResult, PolishStats, run_mapping
+from colsfm.matching import (
+    BLOB_MATCH_TOP_K,
+    MatchCapMode,
+    MatchingBackend,
+    MatchingOptions,
+    MatchLimitPolicy,
+    MatchReport,
+    match_pairs,
+)
 from colsfm.pairs import select_pairs
 from colsfm.pose_graph import PoseGraphEdge, PoseGraphResult, RigNode, sequential_edges, solve_pose_graph
 from colsfm.reconstruction import PosedModel, build_reconstruction, gauge_camera_params_id
@@ -151,33 +160,6 @@ STAGE_NAMES: Final[tuple[StageName, ...]] = tuple(
     stage for stage in ALL_STAGE_NAMES if stage != EXTRINSIC_REFINEMENT_STAGE
 )
 """The stages a default run records: every stage but the second mapping pass."""
-
-
-def parse_caspar_options(items: tuple[str, ...]) -> CasparOptions | None:
-    """Turn `--caspar-option name=value` strings into the dict `MappingOptions` takes.
-
-    Args:
-        items: One `name=value` per repetition of the flag.
-
-    Returns:
-        The parsed overrides, or None when nothing was passed, which is what keeps
-        COLMAP's own CASPAR defaults.
-
-    Raises:
-        ValueError: When an item has no `=`, or its value is not a number.
-    """
-    if not items:
-        return None
-    options: CasparOptions = {}
-    for item in items:
-        name, separator, raw = item.partition("=")
-        if not separator:
-            raise ValueError(f"[colsfm] --caspar-option takes `name=value`, got `{item}`")
-        try:
-            options[name.strip()] = float(raw)
-        except ValueError as error:
-            raise ValueError(f"[colsfm] --caspar-option `{name.strip()}` needs a number, got `{raw}`") from error
-    return options
 
 
 def stage_names(optimize_extrinsics: bool) -> tuple[StageName, ...]:
@@ -222,6 +204,39 @@ SUMMARY_NAME: Final[str] = "summary.json"
 
 LOOP_PROBE_MATCHES: Final[Int[ndarray, "0 2"]] = np.zeros((0, 2), dtype=np.int64)
 """What the recording `match_fn` returns: no matches, so no candidate is verified."""
+
+
+@serde
+@dataclass(frozen=True, slots=True)
+class SelectionOptions:
+    """What keyframe and pair selection need, and nothing else.
+
+    The metadata-only half of `PipelineOptions`, resolved out of it once at the
+    start of a run. `python -m colsfm stage` takes exactly this: those two stages
+    read `frames_meta.json` and a config profile, touch no image, open no GPU and
+    write nothing, so requiring an output directory of them was asking for a
+    workspace nobody would fill.
+    """
+
+    input_dir: Path
+    """Directory holding `frames_meta.json` and the images its `image_name`s name."""
+    config_dir: Path = DEFAULT_CONFIG_DIR
+    """Directory of `.pb.txt` configs; the loop-closure-fixed isaac profile by default."""
+    min_inter_frame_distance: float = 0.0
+    """Keyframe displacement gate in metres; the demo passes 0.0 to keep every sample."""
+    min_inter_frame_rotation_degrees: float = 5.0
+    """Keyframe rotation gate in degrees, OR-combined with the distance gate."""
+    sample_sync_threshold_microseconds: int = 100
+    """Rig grouping window in microseconds; the isaac demo's value, not the gflag default."""
+
+    @property
+    def frames_meta_path(self) -> Path:
+        """Where the input metadata lives.
+
+        Returns:
+            `<input_dir>/frames_meta.json`.
+        """
+        return self.input_dir / FRAMES_META_NAME
 
 
 @serde
@@ -300,7 +315,7 @@ class PipelineOptions:
     The blob's `match_top_k`; see `colsfm.matching.subsample_matches_by_coverage`."""
     match_cap_mode: MatchCapMode = "fixed"
     """How `max_matches_per_pair` becomes a per-pair number; see
-    `colsfm.matching.resolve_match_cap`. `fixed` is the 500 every run before the KITTI
+    `colsfm.matching.MatchLimitPolicy`. `fixed` is the 500 every run before the KITTI
     follow-up used, `image_area` scales it with the frame's resolution, `off` keeps every
     verified inlier."""
     features_backend: FeatureBackend = "pycolmap"
@@ -310,6 +325,22 @@ class PipelineOptions:
     """Which LightGlue runs: COLMAP's own ONNX one, or the blob's TensorRT engine
     (`colsfm.matching_trt`), which is the only path with the per-match score the blob's
     SSC spatial NMS needs. See `colsfm.matching.MatchingBackend`."""
+
+    @property
+    def selection(self) -> SelectionOptions:
+        """The metadata-only options, resolved out of the command line's spellings.
+
+        Returns:
+            The five gates and paths keyframe and pair selection read, so those
+            stages never see the twenty-one fields they have no use for.
+        """
+        return SelectionOptions(
+            input_dir=self.input_dir,
+            config_dir=self.config_dir,
+            min_inter_frame_distance=self.min_inter_frame_distance,
+            min_inter_frame_rotation_degrees=self.min_inter_frame_rotation_degrees,
+            sample_sync_threshold_microseconds=self.sample_sync_threshold_microseconds,
+        )
 
     @property
     def device(self) -> DeviceChoice:
@@ -389,6 +420,13 @@ class MappingStats:
     solves inside `run_mapping` — so this names them rather than adding a row."""
     polish_iterations: int | None = None
     """Ceres iterations that polish took; the measure of how far CASPAR stopped short."""
+    ba_fallback_reason: str | None = None
+    """Why `ba_backend` is not `options.ba_backend`, or None when it is.
+
+    A `--ba-backend caspar` run that solved on Ceres used to say so on stdout and
+    nowhere else, so a finished run could not be asked which backend produced it.
+    The sentences are `colsfm.ba_backend`'s: an unsupported camera model,
+    `--optimize-extrinsics`, or a pycolmap built without CASPAR_ENABLED."""
 
     @staticmethod
     def of(mapping: MappingResult) -> MappingStats:
@@ -412,6 +450,7 @@ class MappingStats:
             ba_backend=mapping.ba_backend,
             polish_seconds=None if polish is None else polish.seconds,
             polish_iterations=None if polish is None else polish.ba_num_iterations,
+            ba_fallback_reason=mapping.ba_fallback_reason,
         )
 
 
@@ -769,14 +808,14 @@ class KeyframeSelectionStageResult:
     every call, and the stage's own print line and the summary both want it."""
 
 
-def run_keyframe_selection_stage(options: PipelineOptions) -> KeyframeSelectionStageResult:
+def run_keyframe_selection_stage(options: SelectionOptions) -> KeyframeSelectionStageResult:
     """Read the config and the input metadata and apply cuSFM's keyframe selection.
 
     Writes nothing; `run_pipeline` is what saves `keyframes/frames_meta.json`, so
     `run_stage` can inspect a dataset without creating a workspace.
 
     Args:
-        options: The run's options; the config directory and the three gates matter.
+        options: The metadata-only options: the config directory and the three gates.
 
     Returns:
         The configuration, the input collection and the selected one.
@@ -810,13 +849,16 @@ def run_keyframe_selection_stage(options: PipelineOptions) -> KeyframeSelectionS
     )
 
 
-def run_feature_extraction_stage(options: PipelineOptions, selected: FramesMeta) -> ExtractionReport:
+def run_feature_extraction_stage(
+    options: PipelineOptions, selected: FramesMeta, feature_options: FeatureOptions | None = None
+) -> ExtractionReport:
     """Create the COLMAP database and run ALIKED over the selected keyframes.
 
     Args:
-        options: The run's options; the database path, the image root and the
-            thread and device knobs matter.
+        options: The run's options, for the database path and the image root.
         selected: The collection keyframe selection kept.
+        feature_options: The extractor's resolved settings; derived from `options`
+            when None, which is what a caller stepping through one stage wants.
 
     Returns:
         The extraction report: per-image keypoint counts, the device used and the
@@ -825,15 +867,17 @@ def run_feature_extraction_stage(options: PipelineOptions, selected: FramesMeta)
     Raises:
         FileNotFoundError: When the image root is missing.
     """
-    create_database(options.database_path, selected, overwrite=True)
-    feature_options: FeatureOptions = FeatureOptions(
-        backend=options.features_backend, num_threads=options.num_threads, device=options.device
+    resolved: FeatureOptions = (
+        FeatureOptions(backend=options.features_backend, num_threads=options.num_threads, device=options.device)
+        if feature_options is None
+        else feature_options
     )
+    create_database(options.database_path, selected, overwrite=True)
     return extract_features(
         options.database_path,
         options.input_dir,
         [keyframe.image_name for keyframe in selected.keyframes],
-        feature_options,
+        resolved,
     )
 
 
@@ -1216,6 +1260,114 @@ def run_export_stage(options: PipelineOptions, mapped_meta: FramesMeta, mapping:
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════
+# resolved configuration
+# ══════════════════════════════════════════════════════════════════════════════════════
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedRun:
+    """`PipelineOptions` turned into what each stage actually takes, once per run.
+
+    `PipelineOptions` is an *input adapter*: twenty-one fields spanning unrelated
+    stages, kept exactly as the command line spells them and as `summary.json`
+    records them. It used to be carried unresolved through the whole run, so a
+    stage read whichever fields it happened to need, some combinations were inert
+    (`--match-cap-mode off` and a `None` budget both meant "no cap"), and the
+    CASPAR strings were not parsed until feature extraction, matching, loop
+    closure and the pose graph had already been paid for.
+
+    Resolution happens once, before the workspace is created, and it validates:
+    `--caspar-option solver_iter_max=2.9` stops the run here rather than being
+    truncated to 2 at the first solve. What cannot be resolved this early is the
+    matcher's verification block, whose thresholds live in the config profile
+    stage 1 reads — `matching_options` folds those in and is the only place that
+    does.
+    """
+
+    selection: SelectionOptions
+    """Stages 1 and 3: the metadata gates and the config directory."""
+    features: FeatureOptions
+    """Stage 2: which ALIKED runs, on what device, with how many threads."""
+    matching_backend: MatchingBackend
+    """Stage 4: which LightGlue runs."""
+    match_limit: MatchLimitPolicy
+    """Stages 4 and 5: how many verified matches one pair may keep, as one policy."""
+    mapping: MappingOptions
+    """Stages 7 and 7b: the mapper's own knobs, with the validated CASPAR overrides."""
+    ba_plan: BaExecutionPlan
+    """Which backend the bundle adjustments were planned on, and why, before any solve."""
+    device: DeviceChoice
+    """Device request the two ONNX stages share; `--use-gpu` resolved exactly once."""
+    num_threads: int
+    """Threads for extraction and matching; -1 lets COLMAP use every core."""
+
+    def matching_options(self, config: CusfmConfig) -> MatchingOptions:
+        """The matcher's settings, once the config profile's verification block is known.
+
+        Args:
+            config: The profile stage 1 read.
+
+        Returns:
+            The resolved matching settings, identical for stage 4 and stage 5's
+            batch match — one object, so the two cannot drift.
+        """
+        return MatchingOptions(
+            backend=self.matching_backend,
+            max_error_px=config.matching_task_worker.verification.max_pixel_error,
+            confidence=config.matching_task_worker.verification.min_ransac_confidence,
+            num_threads=self.num_threads,
+            device=self.device,
+            match_limit=self.match_limit,
+        )
+
+
+def resolve_run(options: PipelineOptions) -> ResolvedRun:
+    """Turn one command line into the per-stage settings the run will execute.
+
+    Called first, before the output directory exists, so everything cheap is
+    validated before anything is created or replaced.
+
+    Args:
+        options: The command line, verbatim.
+
+    Returns:
+        The resolved settings for every stage.
+
+    Raises:
+        ValueError: When a `--caspar-option` item is malformed, names an option
+            that is not a settable numeric CASPAR knob, or gives an integer knob a
+            fractional value.
+    """
+    ba_plan: BaExecutionPlan = resolve_ba_plan(
+        options.ba_backend,
+        options.caspar_option,
+        ceres_polish=options.caspar_ceres_polish,
+        optimize_extrinsics=options.optimize_extrinsics,
+    )
+    return ResolvedRun(
+        selection=options.selection,
+        features=FeatureOptions(
+            backend=options.features_backend, num_threads=options.num_threads, device=options.device
+        ),
+        matching_backend=options.matching_backend,
+        match_limit=MatchLimitPolicy.of(options.match_cap_mode, options.max_matches_per_pair),
+        # `ba_backend` stays the *request*: the camera-model fallback needs the
+        # reconstruction, which does not exist until stage 7, so `colsfm.mapping`
+        # makes that call and reports it back as `MappingResult.ba_fallback_reason`.
+        mapping=MappingOptions(
+            num_threads=options.ba_num_threads,
+            use_gpu=options.ba_use_gpu,
+            ba_backend=ba_plan.requested_backend,
+            caspar_ceres_polish=options.caspar_ceres_polish,
+            caspar_options=ba_plan.caspar_options or None,
+        ),
+        ba_plan=ba_plan,
+        device=options.device,
+        num_threads=options.num_threads,
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════════════
 # the observer
 # ══════════════════════════════════════════════════════════════════════════════════════
 
@@ -1360,6 +1512,11 @@ def run_pipeline(options: PipelineOptions, observer: PipelineObserver | None = N
     started: float = time.perf_counter()
     if not options.frames_meta_path.is_file():
         raise FileNotFoundError(f"No {FRAMES_META_NAME} at {options.frames_meta_path}")
+    # Resolved and validated before the workspace exists: a `--caspar-option` typo
+    # used to surface at the first bundle adjustment, after feature extraction,
+    # matching and loop closure had already been paid for and the previous run's
+    # database had already been deleted.
+    resolved: ResolvedRun = resolve_run(options)
     options.output_dir.mkdir(parents=True, exist_ok=True)
     (options.output_dir / RUNTIME_CSV_NAME).unlink(missing_ok=True)
     stages: tuple[StageName, ...] = stage_names(options.optimize_extrinsics)
@@ -1369,7 +1526,7 @@ def run_pipeline(options: PipelineOptions, observer: PipelineObserver | None = N
 
     # ── 1. keyframe selection ────────────────────────────────────────────────────────
     with timed_stage(clock, "keyframe_selection"), watcher.stage_scope("keyframe_selection"):
-        selection: KeyframeSelectionStageResult = run_keyframe_selection_stage(options)
+        selection: KeyframeSelectionStageResult = run_keyframe_selection_stage(resolved.selection)
         write_frames_meta(options.output_dir / KEYFRAME_DIR_NAME / FRAMES_META_NAME, selection.selected)
         print(
             f"[colsfm] selected {len(selection.selected.keyframes)}/{len(selection.frames_meta.keyframes)} keyframes "
@@ -1380,7 +1537,7 @@ def run_pipeline(options: PipelineOptions, observer: PipelineObserver | None = N
 
     # ── 2. feature extraction ────────────────────────────────────────────────────────
     with timed_stage(clock, "feature_extraction"), watcher.stage_scope("feature_extraction"):
-        extraction: ExtractionReport = run_feature_extraction_stage(options, selection.selected)
+        extraction: ExtractionReport = run_feature_extraction_stage(options, selection.selected, resolved.features)
     watcher.on_feature_extraction(extraction)
 
     # ── 3. pair selection ────────────────────────────────────────────────────────────
@@ -1389,15 +1546,9 @@ def run_pipeline(options: PipelineOptions, observer: PipelineObserver | None = N
     watcher.on_pair_selection(pairs)
 
     # ── 4. matching and verification ─────────────────────────────────────────────────
-    matching_options: MatchingOptions = MatchingOptions(
-        backend=options.matching_backend,
-        max_error_px=config.matching_task_worker.verification.max_pixel_error,
-        confidence=config.matching_task_worker.verification.min_ransac_confidence,
-        num_threads=options.num_threads,
-        device=options.device,
-        max_matches_per_pair=options.max_matches_per_pair,
-        match_cap_mode=options.match_cap_mode,
-    )
+    # One object for stage 4 and stage 5's batch match: the loop stage matching its
+    # candidates with settings of its own is exactly the drift this prevents.
+    matching_options: MatchingOptions = resolved.matching_options(config)
     with timed_stage(clock, "matching"), watcher.stage_scope("matching"):
         matching: MatchReport = run_matching_stage(options, pairs, matching_options)
     watcher.on_matching(matching)
@@ -1414,13 +1565,7 @@ def run_pipeline(options: PipelineOptions, observer: PipelineObserver | None = N
         pose_graph: PoseGraphStageResult = run_pose_graph_stage(options, selection.selected, config, loops.edges)
     watcher.on_pose_graph(pose_graph)
 
-    mapping_options: MappingOptions = MappingOptions(
-        num_threads=options.ba_num_threads,
-        use_gpu=options.ba_use_gpu,
-        ba_backend=options.ba_backend,
-        caspar_ceres_polish=options.caspar_ceres_polish,
-        caspar_options=parse_caspar_options(options.caspar_option),
-    )
+    mapping_options: MappingOptions = resolved.mapping
 
     # ── 7. triangulation and bundle adjustment ───────────────────────────────────────
     with timed_stage(clock, "reconstruction"), watcher.stage_scope("reconstruction"):
@@ -1493,11 +1638,12 @@ class StageResult:
     """Pairs the pair-selection stage would match; 0 when only selection ran."""
 
 
-def run_stage(options: PipelineOptions, stage: CheapStageName) -> StageResult:
+def run_stage(options: SelectionOptions, stage: CheapStageName) -> StageResult:
     """Run one metadata-only stage, for inspecting a dataset without touching a GPU.
 
     Args:
-        options: The same options a full run takes; only the metadata knobs matter.
+        options: The metadata-only options; neither stage needs anything else, and
+            neither writes, so no output directory is asked for.
         stage: `keyframe_selection` or `pair_selection`.
 
     Returns:

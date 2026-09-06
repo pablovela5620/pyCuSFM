@@ -13,6 +13,7 @@ enough for a smoke test. The 226-frame run is the benchmark, not a unit test.
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import numpy as np
@@ -25,7 +26,7 @@ from colsfm.config import CusfmConfig, read_config_directory
 from colsfm.export import KEYFRAME_METADATA_SUBPATH, RUNTIME_CSV_NAME, RuntimeRecord, read_runtime_records
 from colsfm.frames_meta import FRAMES_META_NAME, FramesMeta, read_frames_meta
 from colsfm.geometry import MILLIMETRES_PER_METRE
-from colsfm.matching import MatchingOptions
+from colsfm.matching import MatchingOptions, MatchLimitPolicy
 from colsfm.pipeline import (
     ALL_STAGE_NAMES,
     DEFAULT_CONFIG_DIR,
@@ -38,10 +39,15 @@ from colsfm.pipeline import (
     PipelineOptions,
     PipelineSummary,
     PoseGraphStageResult,
+    ResolvedRun,
+    SelectionOptions,
     StageClock,
+    StageResult,
+    resolve_run,
     run_loop_closure_stage,
     run_pipeline,
     run_pose_graph_stage,
+    run_stage,
     stage_names,
     timed_stage,
 )
@@ -421,3 +427,87 @@ def test_a_stage_that_returns_records_its_timing_and_says_it_finished(tmp_path: 
     records: list[RuntimeRecord] = read_runtime_records(tmp_path / RUNTIME_CSV_NAME)
     assert [record.command for record in records] == ["matching"]
     assert "matching finished in" in capsys.readouterr().out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration is resolved and validated once, before anything is created
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_a_bad_caspar_override_stops_the_run_before_the_workspace_exists(
+    galileo_input_dir: Path, tmp_path: Path
+) -> None:
+    """`solver_iter_max=2.9` is refused, and nothing is created on the way to refusing it.
+
+    The strings used to be parsed after keyframe selection, feature extraction,
+    matching, loop closure and the pose graph — and the value was then cast with
+    `int(...)`, so 2.9 silently became 2 and a solve nobody asked for ran.
+    """
+    if not (galileo_input_dir / FRAMES_META_NAME).is_file():
+        pytest.skip(f"missing {galileo_input_dir / FRAMES_META_NAME}")
+    output_dir: Path = tmp_path / "never_created"
+    options: PipelineOptions = PipelineOptions(
+        input_dir=galileo_input_dir,
+        output_dir=output_dir,
+        ba_backend="caspar",
+        caspar_option=("solver_iter_max=2.9",),
+    )
+    with pytest.raises(ValueError, match="integer solver knob"):
+        run_pipeline(options)
+    assert not output_dir.exists(), "a refused run must not leave a workspace behind"
+
+
+def test_an_unknown_caspar_override_stops_the_run_too(galileo_input_dir: Path, tmp_path: Path) -> None:
+    """A typo in an option name is cheap to catch and expensive to discover at the solve."""
+    if not (galileo_input_dir / FRAMES_META_NAME).is_file():
+        pytest.skip(f"missing {galileo_input_dir / FRAMES_META_NAME}")
+    output_dir: Path = tmp_path / "never_created"
+    options: PipelineOptions = PipelineOptions(
+        input_dir=galileo_input_dir, output_dir=output_dir, caspar_option=("solver_iterations=10",)
+    )
+    with pytest.raises(ValueError, match="not a numeric CASPAR solver option"):
+        run_pipeline(options)
+    assert not output_dir.exists()
+
+
+def test_the_resolved_run_gives_both_match_stages_one_matcher(galileo_input_dir: Path, tmp_path: Path) -> None:
+    """Stage 4 and stage 5's batch match take the same resolved `MatchingOptions`."""
+    options: PipelineOptions = PipelineOptions(
+        input_dir=galileo_input_dir, output_dir=tmp_path / "cusfm", match_cap_mode="image_area"
+    )
+    resolved: ResolvedRun = resolve_run(options)
+    config: CusfmConfig = read_config_directory(DEFAULT_CONFIG_DIR)
+    assert resolved.matching_options(config) == resolved.matching_options(config)
+    assert resolved.match_limit == MatchLimitPolicy.of("image_area", options.max_matches_per_pair)
+
+
+def test_the_two_spellings_of_an_uncapped_run_resolve_to_the_same_policy(
+    galileo_input_dir: Path, tmp_path: Path
+) -> None:
+    """`--match-cap-mode off` and `--max-matches-per-pair None` are one state, not two."""
+    by_mode: ResolvedRun = resolve_run(
+        PipelineOptions(input_dir=galileo_input_dir, output_dir=tmp_path / "a", match_cap_mode="off")
+    )
+    by_budget: ResolvedRun = resolve_run(
+        PipelineOptions(input_dir=galileo_input_dir, output_dir=tmp_path / "b", max_matches_per_pair=None)
+    )
+    assert by_mode.match_limit == by_budget.match_limit
+    assert not by_mode.match_limit.limits
+
+
+def test_the_metadata_stages_need_no_output_directory(galileo_input_dir: Path) -> None:
+    """`python -m colsfm stage` takes `SelectionOptions`, which has no workspace in it.
+
+    The two cheap stages read metadata, touch no image and write nothing; asking
+    them for an output directory asked for a workspace nobody would fill.
+    """
+    if not (galileo_input_dir / FRAMES_META_NAME).is_file():
+        pytest.skip(f"missing {galileo_input_dir / FRAMES_META_NAME}")
+    fields: set[str] = {field.name for field in dataclasses.fields(SelectionOptions)}
+    assert "output_dir" not in fields
+    result: StageResult = run_stage(
+        SelectionOptions(input_dir=galileo_input_dir, min_inter_frame_distance=SMOKE_MIN_INTER_FRAME_DISTANCE_M),
+        "pair_selection",
+    )
+    assert result.num_selected_keyframes > 0
+    assert result.num_pairs > 0

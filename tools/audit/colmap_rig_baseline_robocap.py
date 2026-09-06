@@ -73,11 +73,11 @@ from jaxtyping import Int64
 from numpy import ndarray
 from serde import serde
 
+from colsfm.ba_backend import caspar_supported_camera_models
 from colsfm.benchmark import ReconstructionMetrics, write_json_report
 from colsfm.cameras import COLMAP_MODEL_BY_PROJECTION_MODEL, colmap_camera_parameters
 from colsfm.export import KEYFRAME_METADATA_SUBPATH, colour_points_from_images, write_colmap_model, write_optimised_frames_meta, write_pose_files
 from colsfm.frames_meta import FRAMES_META_NAME, CameraParams, FramesMeta, KeyframeMeta, read_frames_meta
-from colsfm.mapping import caspar_supported_camera_models
 from colsfm.reconstruction import RigReference, rig_reference
 from tools.audit.colmap_baseline_galileo import (
     EXTRACTOR_BY_CHOICE,

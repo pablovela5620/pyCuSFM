@@ -26,6 +26,7 @@ from colsfm.pipeline import (
     CheapStageName,
     PipelineOptions,
     PipelineSummary,
+    SelectionOptions,
     StageResult,
     run_pipeline,
     run_stage,
@@ -49,8 +50,10 @@ class RunCommand:
 class StageCommand:
     """Run one metadata-only stage, without touching images or a GPU."""
 
-    options: tyro.conf.OmitArgPrefixes[PipelineOptions]
-    """The same options a full run takes; only the metadata knobs matter here."""
+    options: tyro.conf.OmitArgPrefixes[SelectionOptions]
+    """Just what the two metadata-only stages read: the input directory, the config
+    profile and the three selection gates. Not the full run's option set, which
+    would demand an output directory neither stage writes into."""
     stage: CheapStageName = "keyframe_selection"
     """Which stage to run on its own."""
 
