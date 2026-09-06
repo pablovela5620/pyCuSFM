@@ -599,6 +599,13 @@ def test_the_outer_loop_can_run_to_the_end_or_exit_early(
     )
     assert len(early.rounds) == 1
     assert early.rounds[0].observation_change < mapping_config.max_observation_change
+    # A Ceres round reports its own progress, so none of the three is None here.
+    # The CASPAR backend writes no Ceres line at all; those rounds carry None
+    # rather than the 0 iterations at 0.0 cost the old parser fabricated
+    # (`colsfm.solver_report`).
+    assert early.rounds[0].ba_num_iterations is not None
+    assert early.rounds[0].ba_initial_cost is not None
+    assert early.rounds[0].ba_final_cost is not None
 
     full: MappingResult = run_mapping(
         build_reconstruction(synthetic_rig.frames_meta),

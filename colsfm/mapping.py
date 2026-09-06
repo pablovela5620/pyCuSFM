@@ -147,7 +147,6 @@ inside the pycolmap solve by construction); and `refine_focal_length` must equal
 
 from __future__ import annotations
 
-import re
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
@@ -179,6 +178,7 @@ from colsfm.reconstruction import (
     camera_sensor_id,
 )
 from colsfm.reconstruction import num_registered_images as num_observing_images
+from colsfm.solver_report import SolverReport, parse_brief_report
 
 MAPPING_LINEAR_SOLVER: Final[LinearSolver] = "SPARSE_SCHUR"
 """cuSFM's CPU linear solver, and the only one this stage ever wants: a bundle adjustment
@@ -201,12 +201,6 @@ LOSS_FUNCTION_BY_NAME: Final[dict[LossFunctionType, pycolmap.LossFunctionType]] 
     "HUBER": pycolmap.LossFunctionType.HUBER,
 }
 """cuSFM's `loss_type` enum to pycolmap's; the two sets coincide exactly."""
-
-BRIEF_REPORT_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"Iterations:\s*(\d+),\s*Initial cost:\s*([0-9.eE+-]+),\s*Final cost:\s*([0-9.eE+-]+)"
-)
-"""`BundleAdjustmentSummary` exposes iterations and cost only inside `brief_report()`."""
-
 
 @dataclass(frozen=True, slots=True)
 class RoundStats:
@@ -233,14 +227,20 @@ class RoundStats:
     """Points left after this round's bundle adjustment."""
     mean_reprojection_error_px: float
     """Mean reprojection error after this round, in pixels."""
-    ba_num_iterations: int
-    """Ceres iterations the solver reported."""
-    ba_initial_cost: float
-    """Ceres cost before the solve. Not cuSFM's logged `Initial cost`, which is a normalised RMS."""
-    ba_final_cost: float
-    """Ceres cost after the solve."""
+    ba_num_iterations: int | None
+    """Ceres iterations the solver reported, or None when it reported none.
+
+    None is the normal outcome on the CASPAR backend, which writes no Ceres-shaped
+    report at all. It used to be recorded as 0 iterations at 0.0 cost, which reads
+    as a solve that converged instantly (`colsfm.solver_report`)."""
+    ba_initial_cost: float | None
+    """Ceres cost before the solve, or None. Not cuSFM's logged `Initial cost`,
+    which is a normalised RMS."""
+    ba_final_cost: float | None
+    """Ceres cost after the solve, or None."""
     ba_termination: str
-    """`CONVERGENCE`, `NO_CONVERGENCE` or `FAILURE`."""
+    """`CONVERGENCE`, `NO_CONVERGENCE` or `FAILURE`; the solver reports this whatever
+    its report says, so it is not optional."""
     seconds: float
     """Wall-clock seconds the round took, bundle adjustment included."""
 
@@ -256,12 +256,14 @@ class PolishStats:
 
     num_observations: int
     """Observations the solve parameterised; unchanged by it, since nothing filters."""
-    ba_num_iterations: int
-    """Ceres iterations, from `brief_report()`. 22 on KITTI 06 from CASPAR's answer."""
-    ba_initial_cost: float
-    """Ceres cost of the model the rounds left behind."""
-    ba_final_cost: float
-    """Ceres cost after the polish; 3.4 % below the initial one on KITTI 06."""
+    ba_num_iterations: int | None
+    """Ceres iterations, from `brief_report()`. 22 on KITTI 06 from CASPAR's answer;
+    None if the polish somehow published no report."""
+    ba_initial_cost: float | None
+    """Ceres cost of the model the rounds left behind, or None."""
+    ba_final_cost: float | None
+    """Ceres cost after the polish; 3.4 % below the initial one on KITTI 06. None when
+    the solve published no report."""
     ba_termination: str
     """`CONVERGENCE`, `NO_CONVERGENCE` or `FAILURE`."""
     mean_reprojection_error_before_px: float
@@ -999,25 +1001,6 @@ def solve_bundle_adjustment(
     return summary, time.perf_counter() - started
 
 
-def _parse_brief_report(summary: pycolmap.BundleAdjustmentSummary) -> tuple[int, float, float]:
-    """Read iterations and costs out of Ceres' one-line report.
-
-    `BundleAdjustmentSummary` exposes `termination_type`, `num_residuals` and
-    `is_solution_usable`, but the iteration count and the costs only appear in
-    `brief_report()`.
-
-    Args:
-        summary: The solver summary.
-
-    Returns:
-        Iterations, initial cost and final cost; zeros when the report does not parse.
-    """
-    match: re.Match[str] | None = BRIEF_REPORT_PATTERN.search(summary.brief_report())
-    if match is None:
-        return 0, 0.0, 0.0
-    return int(match.group(1)), float(match.group(2)), float(match.group(3))
-
-
 def _check_extrinsics_are_refinable(model: PosedModel) -> None:
     """Refuse an extrinsic refinement COLMAP would silently turn into a no-op.
 
@@ -1080,22 +1063,29 @@ def _polish_with_ceres(
     before_px: float = reconstruction.compute_mean_reprojection_error()
     summary, solve_seconds = solve_bundle_adjustment(reconstruction, polish_options, gauge_frame_id, fixed_camera_params_id)
     reconstruction.update_point_3d_errors()
-    num_iterations, initial_cost, final_cost = _parse_brief_report(summary)
+    report: SolverReport = parse_brief_report(summary.brief_report())
     stats: PolishStats = PolishStats(
         num_observations=reconstruction.compute_num_observations(),
-        ba_num_iterations=num_iterations,
-        ba_initial_cost=initial_cost,
-        ba_final_cost=final_cost,
+        ba_num_iterations=report.num_iterations,
+        ba_initial_cost=report.initial_cost,
+        ba_final_cost=report.final_cost,
         ba_termination=summary.termination_type.name,
         mean_reprojection_error_before_px=before_px,
         mean_reprojection_error_after_px=reconstruction.compute_mean_reprojection_error(),
         seconds=solve_seconds,
     )
     if options.verbose:
-        cost_cut: float = 1.0 - stats.ba_final_cost / stats.ba_initial_cost if stats.ba_initial_cost else 0.0
+        reduction: float | None = report.cost_reduction
+        costs: str = (
+            "cost not reported"
+            if not report.is_available
+            else f"cost {report.initial_cost:.6g} -> {report.final_cost:.6g}"
+            + ("" if reduction is None else f" ({reduction:.2%})")
+        )
+        iterations: str = "?" if report.num_iterations is None else str(report.num_iterations)
         print(
-            f"[colsfm] ceres polish: {stats.ba_num_iterations} iterations, cost {stats.ba_initial_cost:.6g} -> "
-            f"{stats.ba_final_cost:.6g} ({cost_cut:.2%}), reprojection {stats.mean_reprojection_error_before_px:.4f} -> "
+            f"[colsfm] ceres polish: {iterations} iterations, {costs}, "
+            f"reprojection {stats.mean_reprojection_error_before_px:.4f} -> "
             f"{stats.mean_reprojection_error_after_px:.4f} px in {stats.seconds:.1f} s ({stats.ba_termination})"
         )
     return stats
@@ -1238,7 +1228,7 @@ def run_mapping(
             correspondences.observation_manager, reconstruction, mapping_config.depth_threshold
         ) + filter_projection_failures(correspondences.observation_manager, reconstruction)
         reconstruction.update_point_3d_errors()
-        num_iterations, initial_cost, final_cost = _parse_brief_report(summary)
+        report: SolverReport = parse_brief_report(summary.brief_report())
         rounds.append(
             RoundStats(
                 round_index=round_index,
@@ -1251,9 +1241,9 @@ def run_mapping(
                 observation_change=observation_change,
                 num_points3D=reconstruction.num_points3D(),
                 mean_reprojection_error_px=reconstruction.compute_mean_reprojection_error(),
-                ba_num_iterations=num_iterations,
-                ba_initial_cost=initial_cost,
-                ba_final_cost=final_cost,
+                ba_num_iterations=report.num_iterations,
+                ba_initial_cost=report.initial_cost,
+                ba_final_cost=report.final_cost,
                 ba_termination=summary.termination_type.name,
                 seconds=time.perf_counter() - round_started,
             )
