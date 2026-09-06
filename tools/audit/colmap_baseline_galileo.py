@@ -79,12 +79,14 @@ EXTRACTOR_BY_CHOICE: dict[FeatureChoice, pycolmap.FeatureExtractorType] = {
 }
 """COLMAP extractor for each choice; ALIKED-n16rot is the closest variant to cuSFM's engine."""
 
-BaselineStage: TypeAlias = Literal["feature_extraction", "matching", "incremental_mapping"]
-"""The three stages this baseline times; the names it writes into `runtime.csv`.
+BaselineStage: TypeAlias = Literal["feature_extraction", "matching", "incremental_mapping", "export"]
+"""The stages a COLMAP baseline times; the names it writes into `runtime.csv`.
 
-`colsfm.runtime.classify_stage` maps them onto `extraction`, `matching` and
-`mapping`, so a baseline run drops into the benchmark's runtime table beside a
-blob run and a colsfm run."""
+`colsfm.runtime.classify_stage` maps them onto `extraction`, `matching`,
+`mapping` and `export`, so a baseline run drops into the benchmark's runtime
+table beside a blob run and a colsfm run. This module itself times only the
+first three; `export` is timed by `tools.audit.colmap_rig_baseline_robocap`,
+which writes a full cuSFM-layout run and shares `StageClock` with this one."""
 
 MATCHER_BY_CHOICE: dict[FeatureChoice, pycolmap.FeatureMatcherType] = {
     "sift": pycolmap.FeatureMatcherType.SIFT_BRUTEFORCE,
