@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import ctypes
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final, Self, TypeAlias
 
@@ -130,6 +130,66 @@ class PinnedHostBuffer:
     def __exit__(self, *_arguments: object) -> None:
         """Free the page-locked allocation."""
         self.close()
+
+
+@dataclass(slots=True)
+class DeviceBufferPool:
+    """The device buffers one execution context owns, one per binding name.
+
+    Buffers only ever grow, so a run whose shapes change from call to call pays
+    one allocation per new high-water mark rather than one per call.
+
+    Ownership is exception-safe in both directions. `ensure` allocates the
+    replacement **before** it gives up the old one, so a failed `cudaMalloc`
+    leaves the pool owning exactly what it owned before — still valid, still
+    bindable — rather than a freed address recorded at its old capacity. `close`
+    drops each record before freeing it, so no pointer can be freed twice even if
+    one `cudaFree` fails.
+    """
+
+    pointers: dict[str, int] = field(default_factory=dict)
+    """Device address per binding name; only the bindings that have a buffer."""
+    capacities: dict[str, int] = field(default_factory=dict)
+    """Bytes owned per binding name; always the same keys as `pointers`."""
+
+    def ensure(self, name: str, byte_count: int) -> int:
+        """Guarantee a buffer of at least `byte_count` bytes for one binding.
+
+        Args:
+            name: The binding.
+            byte_count: Bytes the current call needs; zero is rounded up to one,
+                because `cudaMalloc(0)` has no useful address to bind.
+
+        Returns:
+            The device pointer, reallocated when the buffer had to grow.
+
+        Raises:
+            RuntimeError: When `cudaMalloc` fails. The pool then still owns the
+                buffer it had, unchanged.
+        """
+        wanted: int = max(byte_count, 1)
+        if self.capacities.get(name, 0) >= wanted:
+            return self.pointers[name]
+        pointer: int = int(check_cuda(cudart.cudaMalloc(wanted), f"cudaMalloc({name})")[0])
+        previous: int | None = self.pointers.get(name)
+        self.pointers[name] = pointer
+        self.capacities[name] = wanted
+        if previous is not None:
+            check_cuda(cudart.cudaFree(previous), f"cudaFree({name})")
+        return pointer
+
+    def close(self) -> None:
+        """Free every buffer this pool owns; safe to call twice.
+
+        Raises:
+            RuntimeError: When a `cudaFree` fails. The buffers freed before it
+                stay freed and forgotten; the ones after it are still owned.
+        """
+        while self.pointers:
+            name: str = next(iter(self.pointers))
+            pointer: int = self.pointers.pop(name)
+            self.capacities.pop(name, None)
+            check_cuda(cudart.cudaFree(pointer), f"cudaFree({name})")
 
 
 def check_cuda(result: tuple[Any, ...] | Any, operation: str) -> tuple[Any, ...]:
@@ -347,32 +407,11 @@ class TensorRTSession:
             self.engine.get_tensor_name(index): np.dtype(trt.nptype(self.engine.get_tensor_dtype(self.engine.get_tensor_name(index))))
             for index in range(self.engine.num_io_tensors)
         }
-        self.device_pointers: dict[str, int] = {}
-        self.capacities: dict[str, int] = {}
+        self.buffers: DeviceBufferPool = DeviceBufferPool()
         self.reuse_output_buffers: bool = reuse_output_buffers
         self.host_outputs: dict[str, ndarray] = {}
         self.stream: int = int(check_cuda(cudart.cudaStreamCreate(), "cudaStreamCreate")[0])
         self.closed: bool = False
-
-    def _ensure_capacity(self, name: str, byte_count: int) -> int:
-        """Guarantee a device buffer of at least `byte_count` bytes for one binding.
-
-        Args:
-            name: The binding.
-            byte_count: Bytes the current call needs.
-
-        Returns:
-            The device pointer, reallocated when the buffer had to grow.
-        """
-        wanted: int = max(byte_count, 1)
-        if self.capacities.get(name, 0) >= wanted:
-            return self.device_pointers[name]
-        if name in self.device_pointers:
-            check_cuda(cudart.cudaFree(self.device_pointers[name]), f"cudaFree({name})")
-        pointer: int = int(check_cuda(cudart.cudaMalloc(wanted), f"cudaMalloc({name})")[0])
-        self.device_pointers[name] = pointer
-        self.capacities[name] = wanted
-        return pointer
 
     def _host_output(self, name: str, shape: tuple[int, ...]) -> ndarray:
         """A host array of `shape` for one output binding, reused when allowed.
@@ -435,7 +474,7 @@ class TensorRTSession:
             if isinstance(supplied, DeviceTensor):
                 self.context.set_tensor_address(name, supplied.pointer)
                 continue
-            pointer: int = self._ensure_capacity(name, supplied.nbytes)
+            pointer: int = self.buffers.ensure(name, supplied.nbytes)
             self.context.set_tensor_address(name, pointer)
             check_cuda(
                 cudart.cudaMemcpyAsync(
@@ -454,7 +493,7 @@ class TensorRTSession:
                 raise RuntimeError(f"TensorRT left output {name} with an unresolved shape {shape}")
             host: ndarray = self._host_output(name, shape)
             outputs[name] = host
-            self.context.set_tensor_address(name, self._ensure_capacity(name, max(host.nbytes, 1)))
+            self.context.set_tensor_address(name, self.buffers.ensure(name, max(host.nbytes, 1)))
         if not self.context.execute_async_v3(self.stream):
             raise RuntimeError("TensorRT execution failed")
         for name, host in outputs.items():
@@ -463,7 +502,7 @@ class TensorRTSession:
             check_cuda(
                 cudart.cudaMemcpyAsync(
                     host.ctypes.data,
-                    self.device_pointers[name],
+                    self.buffers.pointers[name],
                     host.nbytes,
                     cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
                     self.stream,
@@ -479,10 +518,7 @@ class TensorRTSession:
             return
         self.closed = True
         check_cuda(cudart.cudaStreamDestroy(self.stream), "cudaStreamDestroy")
-        for name, pointer in self.device_pointers.items():
-            check_cuda(cudart.cudaFree(pointer), f"cudaFree({name})")
-        self.device_pointers.clear()
-        self.capacities.clear()
+        self.buffers.close()
 
     def __enter__(self) -> Self:
         """Return the session itself, so `with TensorRTSession(...) as session` works."""
@@ -646,16 +682,17 @@ class GpuPreprocessor:
         self.width: int = width
         self.max_batch: int = max_batch
         self.stream: int = stream
+        self.closed: bool = False
+        self.buffers: DeviceBufferPool = DeviceBufferPool()
         self.staging: PinnedHostBuffer = PinnedHostBuffer((max_batch, height, width, 3), np.dtype(np.uint8))
         self.staging_bhwc: UInt8[ndarray, "max_batch height width 3"] = self.staging.array
-        self.input_pointer: int = int(
-            check_cuda(cudart.cudaMalloc(self.staging.nbytes), "cudaMalloc(image_u8)")[0]
-        )
         self.output_nbytes: int = max_batch * 3 * height * width * np.dtype(np.float32).itemsize
-        self.output_pointer: int = int(
-            check_cuda(cudart.cudaMalloc(self.output_nbytes), "cudaMalloc(image)")[0]
-        )
-        self.closed: bool = False
+        try:
+            self.input_pointer: int = self.buffers.ensure(PREPROCESS_IMAGE_U8_BINDING, self.staging.nbytes)
+            self.output_pointer: int = self.buffers.ensure(PREPROCESS_IMAGE_BINDING, self.output_nbytes)
+        except BaseException:
+            self.close()
+            raise
 
     def run(self, count: int) -> DeviceTensor:
         """Convert the first `count` staged frames and leave the result on the device.
@@ -696,14 +733,17 @@ class GpuPreprocessor:
         return DeviceTensor(pointer=self.output_pointer, shape=(count, 3, self.height, self.width))
 
     def close(self) -> None:
-        """Free the device buffers and the page-locked staging; safe to call twice."""
+        """Free the device buffers and the page-locked staging; safe to call twice.
+
+        Also the constructor's unwind path, so it releases whatever was acquired
+        rather than assuming every allocation happened.
+        """
         if self.closed:
             return
         self.closed = True
         del self.staging_bhwc
         self.staging.close()
-        check_cuda(cudart.cudaFree(self.input_pointer), "cudaFree(image_u8)")
-        check_cuda(cudart.cudaFree(self.output_pointer), "cudaFree(image)")
+        self.buffers.close()
 
     def __enter__(self) -> Self:
         """Return the preprocessor itself, so `with GpuPreprocessor(...)` works."""
