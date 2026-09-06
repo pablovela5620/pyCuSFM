@@ -20,7 +20,7 @@ poses at all, so there cuVSLAM runs first and its trajectory becomes the input.
 Output follows the ``exoego:v2`` rig schema (see simplecv's
 ``packages/simplecv/docs/exoego_schema.md``), with **two rigs** under one world::
 
-    /                                 ViewCoordinates.RFU (gravity-aligned Z-up)
+    /                                 ViewCoordinates (RFU Z-up; RDF on KITTI)
       /world/rig_00                   AnyValues + world_T_rig(t)  <- input trajectory
         /cam_NN                       Transform3D (rig_T_cam, from_parent)
           /pinhole                    PinholeWithDistortion
@@ -604,6 +604,20 @@ class PreparedSequence:
     input_source: str = "ego-motion"
     """Provenance of ``world_T_rig``, shown on the rig in the viewer and printed.
     Never "ground truth": on every dataset here the input trajectory is an estimate."""
+    view_coordinates: rr.ViewCoordinates = field(default_factory=lambda: rr.ViewCoordinates.RFU)
+    """Axis semantics of the world frame, logged at the recording root.
+
+    RFU (X right, Y forward, **Z up**) is right for galileo and robocap, whose world
+    frames are gravity-aligned. It is wrong for KITTI, whose world frame *is* camera 0
+    — X right, Y **down**, Z forward — and which therefore needs ``RDF``.
+
+    Not cosmetic. Claiming RFU on KITTI tells the viewer that the direction of travel
+    is the sky: the ground grid renders as a vertical wall and the whole 1233 m drive
+    stands on end. Measured on sequence 06, the trajectory spans 457 m in Z, 23 m in X
+    and 9.6 m in Y, so Y is unambiguously the vertical axis.
+
+    A ``default_factory`` because ``ViewCoordinates`` is a component instance and
+    dataclasses reject it as a mutable default."""
     base_dir: Path | None = None
     """Explicit cuSFM workspace. ``None`` uses ``run.work_dir/<name><variant>/cusfm``.
     KITTI pins its own so the run lands beside the sequence, the ground truth and the
@@ -1291,6 +1305,7 @@ def prepare_kitti(config: KittiConfig, run: RunConfig) -> PreparedSequence:
         projection_model="PINHOLE",
         reference_name="vehicle_00",
         input_source="cuVSLAM (pending)",
+        view_coordinates=rr.ViewCoordinates.RDF,
         base_dir=config.result_dir,
     )
     print(f"  {len(sample_ids)} stereo samples, {len(cameras)} cameras (upstream frames_meta.json used as-is)")
@@ -2242,7 +2257,7 @@ def main(config: Config) -> None:
     print(f"  sparse points     : {len(model.points_xyz)}")
 
     # ── log ──────────────────────────────────────────────────────────────────
-    rr.log("/", rr.ViewCoordinates.RFU, static=True)
+    rr.log("/", sequence.view_coordinates, static=True)
     rr.send_blueprint(build_blueprint(sequence))
 
     # The input rig plays at the source frame rate when the dataset provides it,

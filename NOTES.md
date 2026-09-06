@@ -110,6 +110,11 @@ exactly as the galileo and robocap paths do. `kitti_run_config` applies the sett
 any knob still at its `RunConfig` default, so `pixi run kitti06` gets the published
 configuration while an explicit `--run.no-use-cuvslam-slam-pose` still means what it says.
 
+One deliberate difference from the raw CLI line above: the demo path always passes
+`output_rgb=True`, so the sparse cloud carries per-point colour. The CLI run leaves it off and
+every point comes out `0 0 0` (gotcha 11). It adds a colour-lookup pass to feature extraction
+and changes no geometry — both runs produce the same trajectory.
+
 ## Reproduction
 
 | Run | Registered | Points | vs input estimate | ATE vs GT | Rig rigidity |
@@ -126,6 +131,56 @@ at 1.0) was **0.99345** — cuSFM preserved metric scale to within 0.7 %.
 `ATE vs GT` compares cuSFM against the shipped `ground_truth.txt`, matched to within 0.02 ms.
 It is a **baseline on one short sample**, not a reproduction of a published number — upstream
 ships no per-dataset accuracy figure for this sample.
+
+### KITTI 06 — the paper's Table 4 experiment
+
+Sim(3)-aligned ATE against the KITTI odometry benchmark's own ground truth, 1232.9 m driven.
+Every number below is from one `pixi run kitti06` on this host.
+
+| Trajectory | Poses | Sim(3) ATE RMSE | Fitted scale |
+|---|---:|---:|---:|
+| paper, Table 4 — CuVSLAM | — | **1.202 m** | — |
+| paper, Table 4 — CuSfM-View Graph | — | **0.783 m** | — |
+| ours — cuVSLAM SLAM (what cuSFM was given) | 1100 / 1101 | **1.350 m** | 0.99336 |
+| ours — cuSFM refined (`merged_pose_file.tum`) | 1076 / 1101 | **1.343 m** | 0.99367 |
+
+`evo_ape tum data/kitti/06/poses_gt_06.tum .../merged_pose_file.tum -as` reports
+`rmse 1.342864` — the demo's own Umeyama agrees with evo to four decimals, on the same file.
+cuSFM's disagreement with its own input was 122.6 mm over 1241.7 m; 1076 of 1100 images
+registered per camera; 120 188 sparse points; rig rigidity spread 0.00 mm.
+
+**The blob reproduces the cuVSLAM baseline but not the refinement gain.** 1.350 m against the
+paper's 1.202 m is close enough to say the initialisation matches; 1.343 m against 0.783 m is
+not a refinement at all. cuSFM moved the trajectory by 7 mm of RMSE, 0.5 %.
+
+The reason is in the run: `data/kitti/06_result_slam/pose_graph/pose_graph_main.txt` says
+
+> `Perform pose graph optimization with 0 loop constraints. and seq link use input pose: 0`
+
+and `vehicle_pose_graph.pb.txt` contains 1075 `type: CONSECUTIVE` edges and **zero `LOOP`
+edges**. With no loop constraint the pose graph is a chain, so optimising it cannot remove
+accumulated drift — it can only redistribute it. KITTI 06 revisits its own street, so loops
+exist to be found; the pose graph simply rejects every candidate.
+
+The cause is the same pair of config defects already diagnosed for the `isaac` profile (see
+`LOOP_CLOSURE_CONFIG_DIR` in `demo_rerun.py`), and `data/kitti/config` has both:
+`localizer_config.pb.txt` sets `max_mean_point_to_epipolarline_error: 10e-6`, and
+`loop_edge_translation_threshold_meters` / `loop_edge_rotation_threshold_degrees` are absent
+from every file, so proto3 defaults them to 0 and a plain `>` comparison rejects every nonzero
+relative pose. The KITTI profile is in fact *more* permissive than isaac on retrieval
+(`loop_closure_min_words: 1`, `loop_closure_query_count: 100` against 50 and 20) — the
+candidates reach geometric verification and die there.
+
+Those thresholds were repaired for RoboCap in `data/cusfm_configs/loop-closure-fixed`, and the
+same repair would very likely close loops here. It is deliberately **not** applied: the point
+of `pixi run kitti06` is to reproduce the published experiment with upstream's own KITTI
+configs unmodified, and a run with patched thresholds would be a different experiment. What is
+reported above is what the shipped configuration does.
+
+Two smaller honesty notes. The cuVSLAM stage is not deterministic run to run: an earlier
+identical run on this host scored 1.336 m / 1.328 m instead of 1.350 m / 1.343 m, so treat the
+third decimal as noise and the 0.5 % refinement as the finding. And the paper does not state
+its alignment; Sim(3) is what reproduces its cuVSLAM row to 12 %, while SE(3) does not.
 
 ## RoboCap reconstruction quality — diagnosis
 
@@ -586,3 +641,26 @@ identical (SHA-256 over all 27 906 samples matches) and:
 | First TensorRT engine build (`sm_120`, fp16) | ~4 min (cached afterwards) |
 | galileo `demo-upstream` (upstream defaults, incl. engine build) | 267 s |
 | KITTI 06 download (imagery 569 MB + ground truth 1.3 MB) | 254 s |
+| `pixi install` in a fresh clone (warm package cache, empty `.pixi`) | **17.0 s** |
+| `pixi run kitti06`, data already downloaded | **20 min 12 s** |
+
+`pixi run kitti06` breaks down as (from `data/kitti/06_result_slam/runtime.csv`, plus cuVSLAM
+and the Rerun logging, which that file does not record):
+
+| Stage | Time |
+|---|---:|
+| cuVSLAM + metadata rewrite | ~50 s |
+| `feature_extractor_main` (2152 keyframes, ALIKED) | 130.5 s |
+| `generate_bow_vocabulary_main` | 54.6 s |
+| `generate_bow_index_main` | 25.0 s |
+| **`pose_graph_main`** | **859.9 s** |
+| `feature_matcher_task_builder_main` | 3.6 s |
+| `feature_matcher_main` | 16.1 s |
+| `keypoints_mapper_main` (global BA) | 84.9 s |
+| `kpmap_to_colmap` | 4.6 s |
+| `extract_pose_from_map_main` | 0.03 s |
+| Rerun logging + 60 MB `.rrd` write + `evo_ape` | ~35 s |
+
+`pose_graph_main` is 71 % of the run and 822.7 s of its 859.9 s is `Find loop` — the loop
+search that then reports zero constraints. The measurable cost of the run is spent looking for
+loops the configuration cannot accept.
