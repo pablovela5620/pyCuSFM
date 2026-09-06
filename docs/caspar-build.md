@@ -34,6 +34,17 @@ rattler-build compiles on demand. It is consumed by exactly one environment,
 | Flags | `-DCUDA_ENABLED=ON -DCASPAR_ENABLED=ON -DGUI_ENABLED=OFF -DTESTS_ENABLED=OFF -DFETCH_ONNX=OFF` |
 | Precision | float32 — `CASPAR_USE_DOUBLE` left at its default `OFF` |
 
+All three caspar packages pin that backend to `==0.4.6`. `pixi.lock` records no
+backend version, and the local cache holds both 0.4.4 (pixi-build-api-version 5)
+and 0.4.6 (api-version 7), so without the pin nothing says which one built an
+artifact. The pin also freezes the patch applier that
+`packages/pycolmap-caspar-fisheye` depends on: 0.4.6 bundles flickzeug 0.5.2,
+whose "already applied" heuristic can skip a hunk with a warning
+(`docs/caspar-fisheye-adapter.md` §4.1). The workspace declares
+`requires-pixi = ">=0.77.1"` for the same reason it pins the backend — 0.77.1 is
+the release that stopped mtime-only source changes from rebuilding a source
+package (pixi #6703), and a git checkout touches every mtime.
+
 Two things about the recipe are load-bearing:
 
 1. **The build is two steps.** `pycolmap`'s `pyproject.toml` sets

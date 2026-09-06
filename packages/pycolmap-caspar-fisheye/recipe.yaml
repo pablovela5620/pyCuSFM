@@ -130,6 +130,12 @@ build:
     - export CMAKE_BUILD_PARALLEL_LEVEL=${{ CPU_COUNT }}
     - export CMAKE_ARGS="-DCASPAR_ENABLED=ON -DCMAKE_CUDA_ARCHITECTURES=${{ cuda_arch }} -DGENERATE_STUBS=OFF -DFETCH_ONNX=OFF -DCMAKE_PREFIX_PATH=$PREFIX"
     - python -m pip install . -vv --no-build-isolation --no-deps
+    # --- Step 3: prove the adapter reached the extension module -------------
+    # The same check as the last `tests:` entry below, repeated here because
+    # pixi-build packages the test block but does not run it during
+    # `pixi install` (verified 2026-09-05); in the build script it always runs.
+    # `OpenCVFisheyeAdapter` has 0 hits in the stock fp32/fp64 builds and 2 here.
+    - grep -aq OpenCVFisheyeAdapter "$PREFIX"/lib/python3.12/site-packages/pycolmap/_core*.so
     # --- Provenance inside the package, readable by probes and `pixi run` ---
     - mkdir -p "$PREFIX/etc/pycolmap-caspar"
     - printf 'fisheye_f32\n' > "$PREFIX/etc/pycolmap-caspar/variant"

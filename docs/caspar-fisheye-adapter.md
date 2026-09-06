@@ -4,8 +4,10 @@ Follow-on to `docs/caspar-fisheye-feasibility.md`, which estimated 1–2 days fo
 a working fork. **It took under three hours.** This document records what was
 built, what it measures, and what an upstream submission would still need.
 
-Everything here is local. There is no GitHub fork, no branch pushed anywhere,
-and no published artifact.
+The fork is local and unpushed, but the repository no longer depends on it: the
+package builds upstream COLMAP 4.2.0 plus two committed patches under
+`packages/pycolmap-caspar-fisheye/patches/`, so any clone can build it. There is
+still no GitHub fork and no published artifact.
 
 ---
 
@@ -13,10 +15,12 @@ and no published artifact.
 
 | Thing | Where |
 |---|---|
-| COLMAP fork | `/home/pablo/0Dev/forks/colmap-caspar-fisheye`, branch `caspar-opencv-fisheye`, commit `267dd0fd`, branched from tag `4.2.0` (`be5e29168d4aff238409d60424812df66aac919f`) |
-| Symforce generator environment | `/home/pablo/0Dev/forks/colmap-caspar-fisheye/pixi.toml` (gitignored in the fork) — `symforce == 0.12.0` from PyPI, plus `clang-format` |
-| conda package | `packages/pycolmap-caspar-fisheye/{recipe.yaml,pixi.toml}` — build string `caspar_fisheye_cuda130_py312` |
+| COLMAP fork | `/home/pablo/0Dev/forks/colmap-caspar-fisheye`, branch `caspar-opencv-fisheye`, commit `c03b1f38`, three commits on top of tag `4.2.0` (`be5e29168d4aff238409d60424812df66aac919f`) |
+| The fork's whole diff, committed here | `packages/pycolmap-caspar-fisheye/patches/` — `add-opencv-fisheye-caspar-adapter.patch` (44 KB, hand-written, 4 files), `add-opencv-fisheye-generated-f32.patch` (3.1 MB, 228 generated files), `SHA256SUMS` (232 hashes, checked at build time). The fp64 tree is not shipped |
+| Symforce generator environment | `packages/pycolmap-caspar-fisheye/generator/pixi.{toml,lock}` — `symforce == 0.12.0` from PyPI plus `clang-format` 21.1.2, Python 3.11. Copy to the fork root (gitignored there) to regenerate |
+| conda package | `packages/pycolmap-caspar-fisheye/{recipe.yaml,pixi.toml,README.md}` — source `colmap/colmap` @ `be5e2916` plus the two patches, build string `caspar_fisheye_cuda130_py312` |
 | pixi environment | `colsfm-caspar-fisheye` (own solve group, `no-default-feature`) |
+| patch tooling | `tools/caspar_fisheye_patch.sh regen` / `check` |
 | validation probe | `tools/caspar_fisheye_probe.py` |
 
 ### The fork diff
@@ -87,9 +91,53 @@ diffing a with-fisheye run against a without-fisheye run). So the fork keeps
 COLMAP's shipped kernels untouched and installs only the 224 new files plus the
 4 aggregates, formatted with COLMAP's `.clang-format`.
 
-**PINHOLE and SIMPLE_RADIAL therefore cannot regress: their kernels did not
-change.** No mapping function was removed or renamed
-(checked by name-set diff on `caspar_mappings.*`).
+**PINHOLE and SIMPLE_RADIAL kernels do not change.** No mapping function was
+removed or renamed (checked by name-set diff on `caspar_mappings.*`). They are
+not fully insulated, though: the four shared aggregates are regenerated, and one
+of the changes in them is deliberate — see below.
+
+### 2.1 Two fixes made in the generator, not in the generated code
+
+A Codex adversarial review
+(`docs/reviews/2026-09-05-codex-fisheye-patch-review.md`) found one defect and
+one unremarked side effect. Both are now handled where the code is produced, so
+that regeneration keeps them instead of undoing them.
+
+**The padding-thread read (fork commit `39a03443`).** symforce 0.12.0's
+`AddSum.write_template` closes the `if (global_thread_idx < problem_size)` guard
+and only then emits
+
+```cuda
+SumStore<float>(out_rTr_local, (float*)inout_shared, 0, global_thread_idx < problem_size, r4);
+```
+
+`r4` is a register assigned inside the guard, so the padding threads of the last
+block pass an uninitialised value **by value**. `SumStore` masks the data
+(`valid ? data : 0`) only after the argument has been evaluated. This is the
+hazard reported on upstream COLMAP PR #4611, and it affects every CASPAR score
+kernel, not only the fisheye ones.
+
+The template lives in the symforce wheel, not in COLMAP, so `caspar_generate.py`
+replaces the method: the argument becomes
+`(global_thread_idx < problem_size ? r4 : static_cast<float>(0))`, which is the
+value `SumStore` already substitutes, so the sum is unchanged. All **58**
+`SumStore` calls in the fp32 fisheye kernels (58 in fp64 too) are now guarded.
+Regeneration stays self-contained: an unmodified `symforce==0.12.0` from PyPI
+plus this script reproduce the tree byte for byte, which
+`tools/caspar_fisheye_patch.sh regen` checks on every run.
+
+Only the fisheye kernels are regenerated with the fix — 50 files per precision.
+Applying it to the 105 vendored PINHOLE/SIMPLE_RADIAL kernels that would also
+change is upstream's call: it alters register allocation and instruction order
+in code this branch does not own, and §2's "their kernels did not change"
+guarantee would go with it.
+
+**`result.initial_score` (fork commit `c03b1f38`).** The one-line difference
+described above was arriving as a side effect of regenerating `solver.cc`. It is
+wanted — stock COLMAP reports an indeterminate initial score — so it is now named
+at both ends, in a comment next to the `generate()` call in `caspar_generate.py`
+and at the consumer in `bundle_adjustment_caspar.cc`. Practical consequence:
+initial scores from this build are not comparable with a stock CASPAR build's.
 
 ---
 
@@ -164,10 +212,21 @@ Pose-pool and calib sizing hookup; supported-model sentence.
 
 | | |
 |---|---|
-| Wall time | **5 m 25 s** (75 min CPU across 32 threads) |
-| Result | `pycolmap-4.2.0-caspar_fisheye_cuda130_py312.conda` |
+| Wall time | **5 m 33 s** and **4 m 52 s** on two runs from the patched git source (32 threads); 5 m 25 s when it still built from the local path |
+| Result | `pycolmap-4.2.0-caspar_fisheye_cuda130_py312.conda`, 102 MiB, 800 files |
 | `libcaspar_lib_core.a` | 27.20 MiB |
 | Extra CUDA TUs vs `pycolmap-caspar` | +112 |
+| Step 0 (232 checksums) | under 1 s, before cmake |
+
+Cloning upstream and applying the two patches adds no measurable time over the
+old path source. Two cache facts, measured: `touch patches/*.patch` then
+`pixi install` does **not** rebuild (0.09 s), and changing one byte inside a
+patch **does** — so `extra-input-globs` is honoured by this backend.
+
+`pixi install` runs the build script but **not** the recipe's `tests:` block
+(it packages it into `info/tests/`). So the discriminator also runs as Step 3 of
+the build script, where it always executes. `rattler-build test --package-file
+<the .conda>` runs the test block on demand; all four commands pass.
 
 Effectively the same 5-minute build as the stock CASPAR package, despite 45 %
 more CUDA in the Caspar library.
@@ -177,41 +236,89 @@ more CUDA in the Caspar library.
 environment blocks are **byte-identical**. Only the new
 `colsfm-caspar-fisheye` block was added.
 
-### 4.1 Source provenance: the adapter is carried here as a patch
+### 4.1 Source provenance: two committed patches, hash-checked at build time
 
-The recipe builds from a local checkout
-(`/home/pablo/0Dev/forks/colmap-caspar-fisheye`, branch `caspar-opencv-fisheye`),
-and no revision in this repository pins it: the checked-out working tree decides
-what gets built, so the branch alone could not reproduce the package (review
-finding 9). The adapter's source is therefore committed as a patch against
-stock COLMAP.
+The recipe used to build from `source: path:
+/home/pablo/0Dev/forks/colmap-caspar-fisheye`. The checked-out working tree
+decided what got built, the `colmap_rev` in the recipe controlled nothing, and
+nobody without that directory could build the package at all. It now uses the
+same pinned upstream source as its two siblings, plus `source.patches:`.
 
 | | |
 |---|---|
-| Base | `be5e29168d4aff238409d60424812df66aac919f` — tag 4.2.0, the `colmap_rev` both CASPAR recipes already declare |
-| Fork HEAD | `267dd0fd2f30b56b8e23275d6e3ed5a54cb79359`, a single commit on top of that base; working tree clean (`status --porcelain -uall` empty) |
-| Patch | `packages/pycolmap-caspar-fisheye/patches/caspar-opencv-fisheye.patch` — 6.3 MB, 461 files, +124,440/-17,240 lines, nearly all of it generated Symforce CUDA |
+| Base | `be5e29168d4aff238409d60424812df66aac919f` — tag 4.2.0, the `colmap_rev` all three CASPAR recipes declare (the script refuses to run if they disagree) |
+| Fork HEAD | `c03b1f388e8872196e84ba08297a1c67b7d8b526`, three commits on that base, working tree clean |
+| `add-opencv-fisheye-caspar-adapter.patch` | 44,249 B, 4 files — the adapter, its dispatch, the generator (residual **and** the SumStore fix of §2.1), one FAQ line. Meant to be read |
+| `add-opencv-fisheye-generated-f32.patch` | 3,165,846 B, 228 files — 224 new fp32 fisheye kernels plus the 4 regenerated aggregates. Symforce output; not hand-editable |
+| `SHA256SUMS` | 39,330 B, 232 lines — one hash per patched file |
+| Not shipped | the fp64 kernel tree (3.3 MB; no package compiles it) and the fork's `.gitignore` hunk |
 
-To rebuild the fork from stock COLMAP: clone `colmap/colmap`, check out
-`be5e29168d4aff238409d60424812df66aac919f`, then
+**Why the hashes.** `pixi-build-rattler-build 0.4.6` applies patches with
+flickzeug 0.5.2, not with `git apply` or GNU `patch`. flickzeug patches with
+fuzz (`max_fuzz: 2`, `ignore_whitespace: true`) and its "already applied" check
+can drop a hunk with a **warning** and exit 0 — the bug fixed upstream in
+flickzeug 0.5.3/0.5.4, which no conda-forge backend build carries yet. 17,240 of
+this diff's lines are deletions inside `solver.cc` and `caspar_mappings.cu`,
+where a silently skipped hunk compiles and answers wrongly. So the recipe's Step
+0 runs `sha256sum --quiet -c "$RECIPE_DIR/patches/SHA256SUMS"` before cmake: it
+takes under a second and turns any partial application into a build failure.
+The backend version is pinned in all three packages to keep the applier fixed.
+
+**Reproducing the patches** (`tools/caspar_fisheye_patch.sh regen`, or
+`pixi run caspar-fisheye-patch`). It reads the base revision from the recipe, so
+the two cannot drift. It then:
+
+1. refuses a dirty fork, or a fork whose merge base is not that revision;
+2. requires every path the fork changes to belong to a patch or to the two
+   deliberate exclusions;
+3. regenerates the fp32 tree in the fork's symforce environment and requires the
+   224 committed fisheye files and the 4 aggregates to match **byte for byte**
+   — the generated half is generated, not edited;
+4. rejects diff shapes flickzeug mishandles (binary hunks, a new `100755` file,
+   a header line that would eat the preamble skipper);
+5. cuts both patches and `SHA256SUMS`, applies them to a pristine `be5e2916`
+   worktree, and asserts that the result equals the fork commit outside the
+   exclusions and that every hash matches.
+
+**Verifying them without the fork** (`tools/caspar_fisheye_patch.sh check`, or
+`pixi run caspar-fisheye-patch-check`): clones `colmap/colmap` blob-less at the
+pinned revision, applies both patches and checks all 232 hashes. This is the
+fresh-clone gate; it needs the network and nothing else.
+
+**Reproducing the build from a clean clone:**
 
 ```bash
-patch -p1 < <pyCuSFM>/packages/pycolmap-caspar-fisheye/patches/caspar-opencv-fisheye.patch
+pixi --version                                    # >= 0.77.1, enforced by requires-pixi
+bash tools/caspar_fisheye_patch.sh check          # VERIFIED: ... every hash in SHA256SUMS
+pixi install -e colsfm-caspar-fisheye             # builds the package, see the table above
+ls .pixi/envs/colsfm-caspar-fisheye/conda-meta/ | grep pycolmap
+cat .pixi/envs/colsfm-caspar-fisheye/etc/pycolmap-caspar/variant     # fisheye_f32
+pixi run -e colsfm-caspar-fisheye caspar-fisheye-test
+pixi run -e colsfm-caspar-fisheye caspar-fisheye-probe               # needs the Galileo LFS data
 ```
 
-(`am` instead keeps the authorship and the commit message — the file is a
-mailbox-format patch).
-
-Both directions were checked: `patch -p1 --dry-run` applies to a freshly
-extracted 4.2.0 tree, and reverse-applying the patch against the fork's HEAD is
-a no-op, so the patch reproduces that tree exactly.
-
-Moving the recipe's `source` off the local path onto the pinned revision plus
-this patch is designed separately.
+**Why the generated CUDA is committed rather than generated at build time.**
+The review's recommendation was build-time generation, and the generator does
+not need a GPU. It needs `symforce`, and conda-forge has no `symforce` package
+at any version (checked 2026-09-05), so it cannot appear in the recipe's
+`requirements.build`. A rattler-build script that pip-installs symforce would
+make the build depend on PyPI at build time and would not be pinned by
+`pixi.lock`. The compromise: the generated tree is committed, the environment
+that produces it is committed next to it
+(`packages/pycolmap-caspar-fisheye/generator/`), and `regen` proves on every run
+that the two agree.
 
 ---
 
 ## 5. Validation
+
+The figures below are single runs. CASPAR reduces with atomics, so its scores
+and reprojection errors move at the 1e-3 relative level between identical runs:
+the 2026-09-05 re-measurement after the generator fixes of §2.1 gives synthetic
+CASPAR reprojection 0.000141-0.000151 px across three runs (documented: 0.000143)
+and `galileo-pinhole` 0.013-0.017 px (documented: 0.016826). Read the tables as
+orders of magnitude and verdicts, not as expected output. Every verdict below
+still holds, and no "unsupported camera model" line appears in any run.
 
 All from `pixi run -e colsfm-caspar-fisheye python -m tools.caspar_fisheye_probe`
 on an RTX 5090 (sm_120), pycolmap 4.2.0, `has_cuda=True`.
