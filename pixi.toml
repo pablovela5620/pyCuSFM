@@ -132,15 +132,25 @@ demo-upstream = { cmd = """bash -o pipefail -ec '
 '""", depends-on = ["setup-cuda13", "prepare-galileo-output"] }
 
 # ── KITTI 06 reproduction ────────────────────────────────────────────────────
-# Guarded: both downloads are skipped once their marker file is on disk, so
-# `pixi run kitti06` is cheap to re-run.
+# Guarded so `pixi run kitti06` is cheap to re-run, but the guards test for a
+# *complete* download, never for a file that lands early:
+#
+#   imagery -- `.download-complete`, written only after `hf download` returns 0.
+#     Existing complete trees predate the marker, so it is back-filled when the
+#     last frame of both cameras (`image_{0,1}/001100.png`, 1101 frames each) is
+#     on disk. An interrupted download leaves neither, and is retried.
+#   poses   -- the md5 of `poses_gt_06.txt` itself, so a truncated or swapped
+#     pose file is re-fetched instead of silently moving every reported number.
 #
 # Imagery comes from a third-party Hugging Face mirror of KITTI odometry
 # sequence 06, pinned to one revision. That mirror carries no poses, so the
-# ground truth is fetched separately from the official KITTI archive (no login)
-# and its md5 is checked -- a silently different pose file would move every
-# reported number.
-_download-kitti06 = { cmd = "mkdir -p data/kitti/dataset/sequences/06 && ([ -f data/kitti/dataset/sequences/06/calib.txt ] || hf download yujie2696/kitti_odometry_06 --repo-type dataset --revision 9ce62e03c1ae82b7f8e013808cb68a22dc82fe88 --local-dir data/kitti/dataset/sequences/06) && ln -sfn dataset/sequences/06 data/kitti/06 && ([ -f data/kitti/06/poses_gt_06.txt ] || (curl -fsSL -o data/kitti/dataset/data_odometry_poses.zip https://s3.eu-central-1.amazonaws.com/avg-kitti/data_odometry_poses.zip && unzip -o -j data/kitti/dataset/data_odometry_poses.zip dataset/poses/06.txt -d data/kitti/dataset && echo '7247b3fe2ef8ccbfa6ddb7801132c2b4  data/kitti/dataset/06.txt' | md5sum -c - && mv data/kitti/dataset/06.txt data/kitti/06/poses_gt_06.txt))", description = "Fetch KITTI odometry 06 imagery (HF mirror) and the official ground-truth poses" }
+# ground truth is fetched separately from the official KITTI archive (no login).
+#
+# One line, `&&`-chained with `( )` subshells: pixi's task shell has no `{ ...; }`
+# grouping.
+_download-kitti06 = { cmd = "mkdir -p data/kitti/dataset/sequences/06 && (test -f data/kitti/dataset/sequences/06/.download-complete || (test -f data/kitti/dataset/sequences/06/image_0/001100.png && test -f data/kitti/dataset/sequences/06/image_1/001100.png && touch data/kitti/dataset/sequences/06/.download-complete) || (hf download yujie2696/kitti_odometry_06 --repo-type dataset --revision 9ce62e03c1ae82b7f8e013808cb68a22dc82fe88 --local-dir data/kitti/dataset/sequences/06 && touch data/kitti/dataset/sequences/06/.download-complete)) && ln -sfn dataset/sequences/06 data/kitti/06 && (echo '7247b3fe2ef8ccbfa6ddb7801132c2b4  data/kitti/06/poses_gt_06.txt' | md5sum -c --status - || (curl -fsSL -o data/kitti/dataset/data_odometry_poses.zip https://s3.eu-central-1.amazonaws.com/avg-kitti/data_odometry_poses.zip && unzip -o -j data/kitti/dataset/data_odometry_poses.zip dataset/poses/06.txt -d data/kitti/dataset && echo '7247b3fe2ef8ccbfa6ddb7801132c2b4  data/kitti/dataset/06.txt' | md5sum -c - && mv data/kitti/dataset/06.txt data/kitti/06/poses_gt_06.txt))", description = "Fetch KITTI odometry 06 imagery (HF mirror) and the official ground-truth poses" }
+
+kitti06-check-data = { cmd = "(test -f data/kitti/dataset/sequences/06/image_0/001100.png && test -f data/kitti/dataset/sequences/06/image_1/001100.png && echo 'imagery: complete (1101 frames per camera)' || (echo 'imagery: INCOMPLETE -- run `pixi run _download-kitti06`' && false)) && (echo '7247b3fe2ef8ccbfa6ddb7801132c2b4  data/kitti/06/poses_gt_06.txt' | md5sum -c --status - && echo 'poses:   present, md5 matches' || (echo 'poses:   MISSING or wrong md5 -- run `pixi run _download-kitti06`' && false))", description = "Report whether the KITTI 06 imagery and ground-truth poses are complete on disk" }
 
 # `mkdir -p` first, not as an afterthought: RerunTyroConfig opens the .rrd in its
 # __post_init__, well before cuSFM creates its own workspace directory.

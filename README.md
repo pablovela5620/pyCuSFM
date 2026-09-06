@@ -104,7 +104,8 @@ KITTI archive and checks their md5, converts the sequence with upstream's own
 configs, writes `data/kitti/06_result_slam/kitti06.rrd`, and scores the result with
 `evo_ape ... -as` (Sim(3)). The recording shows three trajectories — cuVSLAM's SLAM output that
 cuSFM was initialised from, cuSFM's refinement, and the ground truth — plus the sparse cloud and
-both camera streams. `pixi run kitti06-eval` re-scores an existing run without re-running cuSFM.
+both camera streams. `pixi run kitti06-eval` re-scores an existing run without re-running cuSFM, and
+`pixi run kitti06-check-data` reports whether the download finished.
 
 The run reproduces the paper's cuVSLAM baseline but **not** its refinement gain; the numbers and
 the reason are in [NOTES.md](NOTES.md#kitti-06--the-papers-table-4-experiment).

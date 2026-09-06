@@ -20,7 +20,7 @@ Goal: `pixi run demo` runs cuSFM on a real sample and shows it in Rerun, with **
 | 7 | **COLMAP model parsed by hand** | This env is a delicately balanced CUDA-13 solve with a TensorRT dependency override; pulling pycolmap's ceres/CUDA stack risks perturbing it for two file formats worth ~40 lines. cuSFM writes text by default. A deliberate exception to "do not hand-roll what exists" — revisit if binary models are ever needed. |
 | 8 | **simplecv from the monorepo, not the standalone repo** | See gotcha 4. |
 | 9 | **CPU video decode, not nvdec** | Measured; see gotcha 6. |
-| 10 | **KITTI 06 imagery from a pinned HF mirror, ground truth from the official archive** | The benchmark's images need a registration form; the third-party mirror `yujie2696/kitti_odometry_06` does not, and is pinned to revision `9ce62e0` so a re-upload cannot move the numbers. That mirror has no poses, so ground truth comes from `data_odometry_poses.zip` (public, no login) with its md5 checked in the task. Neither is committed. |
+| 10 | **KITTI 06 imagery from a pinned HF mirror, ground truth from the official archive** | The benchmark's images need a registration form; the third-party mirror `yujie2696/kitti_odometry_06` does not, and is pinned to revision `9ce62e0` so a re-upload cannot move the numbers. That mirror has no poses, so ground truth comes from `data_odometry_poses.zip` (public, no login) with its md5 checked in the task. Neither is committed. Both downloads are guarded on evidence of a *finished* transfer, never on a file that lands early — see the download guards below. |
 | 11 | **KITTI runs with `--use_cuvslam_slam_pose`** | cuVSLAM's raw odometry scores **2.375 m** Sim(3) ATE on this sequence; its loop-closed SLAM trajectory **1.336 m**. The paper's baseline row is the SLAM one, and cuSFM refines whatever it is handed rather than recovering from a bad start. |
 | 12 | **KITTI runs with `--skip_data_association`** | `docs/tutorial.md` states the paper's experiments used pose-graph optimisation *without* the separate association stage. Opposite of the RoboCap default here, and deliberately so. |
 | 13 | **`data/kitti/config`, unmodified** | Upstream ships a KITTI profile tuned for a forward-driving stereo car; it is not `pycusfm/configs/isaac`, and it is not the loop-closure-repaired copy the other two demos default to. Running sequence 06 through either of those is a different experiment. |
@@ -79,11 +79,25 @@ written in. So the ground truth, cuVSLAM's TUM output and cuSFM's vehicle-frame 
 directly comparable with no frame change anywhere — worth stating because a silent frame error
 here would look like a plausible ~1 m ATE rather than an obvious failure.
 
+**Download guards.** `_download-kitti06` is skipped when the data is already on disk, so
+the guard has to mean *complete*, not *started*. Guarding on `calib.txt` was wrong: it is a few
+hundred bytes and arrives in the first seconds, so a download interrupted anywhere in the 2202
+PNGs looked finished forever after. The imagery guard is now `.download-complete`, written only
+after `hf download` returns 0, and back-filled when the last frame of both cameras
+(`image_0/001100.png` and `image_1/001100.png`, 1101 each) is present — so trees fetched before
+the marker existed are not re-downloaded. The poses guard hashes `poses_gt_06.txt` rather than
+merely testing that it exists, so a truncated or swapped pose file is re-fetched instead of
+quietly moving every reported number.
+
+`kitti06-check-data` runs those same two checks and reports, without downloading anything; it
+exits non-zero when either is incomplete.
+
 **Commands.** The task is the reference; these are what it runs.
 
 ```bash
-pixi run kitti06        # download (guarded) -> convert -> reconstruct -> log -> evo_ape
-pixi run kitti06-eval   # re-score and re-log an existing run, no cuSFM
+pixi run kitti06            # download (guarded) -> convert -> reconstruct -> log -> evo_ape
+pixi run kitti06-eval       # re-score and re-log an existing run, no cuSFM
+pixi run kitti06-check-data # is the imagery complete and the pose md5 right?
 ```
 
 ```bash
