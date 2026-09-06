@@ -88,7 +88,7 @@ tyro = ">=0.9.1"
 # points, reachable as `pixi run -e raco <task>`.
 [feature.raco.tasks]
 test = { cmd = "python -m pytest tests/ -q", description = "Run the test suite" }
-lint = { cmd = "ruff check demo_rerun.py tools tests", description = "Lint the demo, RaCo tools, and tests" }
+lint = { cmd = "ruff check demo_rerun.py demo tools tests", description = "Lint the demo entry point and package, RaCo tools, and tests" }
 raco-export = { cmd = "python -m tools.export_cusfm_raco", description = "Export RaCo-ALIKED + LightGlue to ONNX for cuSFM" }
 raco-extract = { cmd = "python -m tools.raco_extract", description = "Write cuSFM keyframes with the batched RaCo extractor" }
 raco-benchmark = { cmd = "python -m tools.benchmark_cusfm_extractors", description = "Benchmark stock ALIKED against RaCo-ALIKED" }
@@ -220,6 +220,7 @@ LD_LIBRARY_PATH = "${CONDA_PREFIX}/lib:${CONDA_PREFIX}/lib/python3.12/site-packa
 [feature.colsfm.tasks]
 colsfm-probe = { cmd = "python -m pytest tests/colsfm_probes -q", description = "Run the pycolmap capability probe suite" }
 colsfm-test = { cmd = "python -m pytest tests/colsfm -q", description = "Run the colsfm pipeline test suite" }
+colsfm-test-typed = { cmd = "python -m pytest tests/colsfm -q", description = "Run the colsfm suite with beartype runtime type checking on", env = { PIXI_DEV_MODE = "1" } }
 # `demo_rerun` needs rerun + simplecv, which the `raco` environment (owner of the
 # `test` task) does not carry, so its parser tests live here and skip elsewhere.
 demo-test = { cmd = "python -m pytest tests/test_demo_rerun.py -q", description = "Run the demo_rerun COLMAP text-parser tests" }
