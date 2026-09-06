@@ -215,6 +215,9 @@ LD_LIBRARY_PATH = "${CONDA_PREFIX}/lib:${CONDA_PREFIX}/lib/python3.12/site-packa
 [feature.colsfm.tasks]
 colsfm-probe = { cmd = "python -m pytest tests/colsfm_probes -q", description = "Run the pycolmap capability probe suite" }
 colsfm-test = { cmd = "python -m pytest tests/colsfm -q", description = "Run the colsfm pipeline test suite" }
+# `demo_rerun` needs rerun + simplecv, which the `raco` environment (owner of the
+# `test` task) does not carry, so its parser tests live here and skip elsewhere.
+demo-test = { cmd = "python -m pytest tests/test_demo_rerun.py -q", description = "Run the demo_rerun COLMAP text-parser tests" }
 colsfm-lint = { cmd = "ruff check colsfm tests tools", description = "Lint the colsfm package, its tests and the audit tools" }
 colsfm-galileo = { cmd = "python -m colsfm run --input-dir data/r2b_galileo --output-dir data/cusfm_runs/galileo_colsfm/cusfm", description = "Run the whole colsfm pipeline on the 226-frame r2b_galileo sample" }
 colsfm-robocap = { cmd = "python -m colsfm run --input-dir data/cusfm_runs/robocap_blobref/input --output-dir data/cusfm_runs/robocap_colsfm/cusfm", description = "Run the whole colsfm pipeline on the 4528-frame RoboCap stride-4 sequence" }

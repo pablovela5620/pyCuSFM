@@ -132,20 +132,15 @@ def test_demo_rerun_reads_a_pycolmap_model(scene: SyntheticScene, tmp_path: Path
     assert np.allclose(np.sort(model.points_xyz, axis=0), np.sort(scene.points_xyz, axis=0), atol=1e-9)
 
 
-def test_demo_rerun_parser_breaks_on_images_without_observations(tmp_path: Path) -> None:
-    """A registered image with no 2D points silently corrupts `read_colmap_model`.
+def test_demo_rerun_parser_handles_images_without_observations(tmp_path: Path) -> None:
+    """A registered image with no 2D points must not shift the pose/POINTS2D pairing.
 
     COLMAP writes two lines per image: a pose line and a POINTS2D line.  When an
     image has no observations, the POINTS2D line is *empty*.  demo_rerun's parser
-    drops empty lines before taking every second line, so the pose/points
-    alternation shifts: from that point on, POINTS2D lines are read as poses.
-    The parser does not raise — it returns the same *number* of entries with a
-    real pose replaced by nonsense parsed out of a coordinate list.
-
-    This is a limitation of the existing hand-rolled parser, not of pycolmap.
-    The colsfm exporter must therefore either guarantee every written image has
-    at least one observation, or the parser has to be replaced by
-    `pycolmap.Reconstruction.read`.
+    used to drop empty lines before taking every second line, so from that point
+    on POINTS2D lines were read as poses: it returned the same *number* of
+    entries with a real pose replaced by nonsense parsed out of a coordinate
+    list.  It now consumes strict pairs, so this file survives intact.
     """
     read_colmap_model = _load_read_colmap_model()
     reconstruction: pycolmap.Reconstruction = pycolmap.Reconstruction()
@@ -187,20 +182,16 @@ def test_demo_rerun_parser_breaks_on_images_without_observations(tmp_path: Path)
     assert body[3] == ""
 
     model = read_colmap_model(tmp_path)
-    print(f"[probe] read_colmap_model keys: {sorted(model.world_T_cam)}")
-    expected_names: set[str] = {"img_1.png", "img_2.png", "img_3.png"}
-    assert set(model.world_T_cam) != expected_names
-    # img_3's POINTS2D line was consumed as if it were img_3's pose line, so the
-    # real pose is lost and a nonsense entry takes its place.
-    assert "img_3.png" not in model.world_T_cam
-    bogus: list[str] = sorted(set(model.world_T_cam) - expected_names)
-    assert len(bogus) == 1
-    assert float(np.max(np.abs(model.world_T_cam[bogus[0]][:3, 3]))) > 100.0
+    assert set(model.world_T_cam) == {"img_1.png", "img_2.png", "img_3.png"}
 
-    # pycolmap's own reader handles the same file correctly.
+    # Every pose matches pycolmap's own reader on the same file.
     reloaded: pycolmap.Reconstruction = pycolmap.Reconstruction()
     reloaded.read_text(tmp_path)
     assert reloaded.num_reg_images() == 3
+    for image_id in (1, 2, 3):
+        expected: Float[ndarray, "4 4"] = np.eye(4)
+        expected[:3, :] = reloaded.image(image_id).cam_from_world().matrix()
+        assert np.allclose(model.world_T_cam[f"img_{image_id}.png"], np.linalg.inv(expected), atol=1e-6)
 
 
 def test_points3d_txt_carries_colour_and_track(scene: SyntheticScene, tmp_path: Path) -> None:

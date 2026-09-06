@@ -631,28 +631,31 @@ order (pycolmap's `Rotation3d.quat` is xyzw, hence the `np.roll`).
 A fully observed pycolmap model parses **correctly**: all 10 images and 72 points
 recovered, poses matching to 1e-6.
 
-**But there is a real failure mode.** COLMAP writes two lines per image; when an
-image has no 2D points the `POINTS2D` line is *empty*. `read_colmap_model`
-filters empty lines before taking every second line, so from that point on the
-pose/points alternation shifts and `POINTS2D` lines are parsed as poses. It does
-not raise. On a three-image model where image 2 has no observations, the parser
-returned:
+**There was a real failure mode, now fixed.** COLMAP writes two lines per image;
+when an image has no 2D points the `POINTS2D` line is *empty*. `read_colmap_model`
+used to filter empty lines before taking every second line, so from that point on
+the pose/points alternation shifted and `POINTS2D` lines were parsed as poses. It
+did not raise. On a three-image model where image 2 has no observations, the
+parser returned:
 
 ```
 ['234.28571428571428 211.42857142857142 4 189.23076923076923 247.69230769230768 5',
  'img_1.png', 'img_2.png']
 ```
 
-— `img_3.png`'s real pose is gone and a nonsense entry with a 201 m translation
-took its place. `pycolmap.Reconstruction.read_text` reads the same file
-correctly (3 registered images).
+— `img_3.png`'s real pose was gone and a nonsense entry with a 201 m translation
+took its place.
 
-**Action for `colsfm`:** either guarantee every written image has at least one
-observation, or read models with `pycolmap.Reconstruction.read` instead of the
-hand-rolled parser. `demo_rerun.py` is not modified here (out of scope); this is
-recorded so the exporter can be written not to trip it. `NOTES.md` decision 7
-("COLMAP model parsed by hand") was taken to avoid pulling pycolmap into the
-default environment — that reason no longer applies inside `colsfm`.
+`demo_rerun.parse_colmap_images_text` now skips only comment lines and then
+consumes strict (pose, POINTS2D) pairs, so the same file yields all three poses,
+matching `pycolmap.Reconstruction.read_text` to 1e-6. The regression test is
+`test_demo_rerun_parser_handles_images_without_observations` in this suite, with
+in-memory fixtures in `tests/test_demo_rerun.py`.
+
+**Action for `colsfm`:** none forced. `colsfm.benchmark` still reads models with
+`pycolmap.Reconstruction.read_text`, which is the right call inside an
+environment that already carries pycolmap; `NOTES.md` decision 7 ("COLMAP model
+parsed by hand") only ever applied to the default environment.
 
 ## 11. (h) GPU
 
